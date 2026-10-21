@@ -17634,6 +17634,8 @@ def check_generic_body_builtin_expect(converter, fbc, cc, work):
     source_directory.mkdir()
     source = source_directory / "expect.c"
     source.write_text(
+        "#define LIKELY(condition) __builtin_expect ((condition), 1)\n"
+        "#define UNLIKELY(condition) __builtin_expect ((condition), 0)\n"
         "static int c2fb_expected_calls;\n"
         "static int c2fb_probability_calls;\n"
         "static long c2fbExpectedValue(void) {\n"
@@ -17666,13 +17668,19 @@ def check_generic_body_builtin_expect(converter, fbc, cc, work):
         "    return __builtin_expect_with_probability(\n"
         "        (*value)++, c2fbExpectedValue(), c2fbProbabilityValue());\n"
         "}\n"
+        "long c2fbLikelyMacro(int value) {\n"
+        "    return LIKELY(value) ? 37 : -41;\n"
+        "}\n"
+        "long c2fbUnlikelyMacro(int value) {\n"
+        "    return UNLIKELY(value) ? 43 : -47;\n"
+        "}\n"
     )
     candidate = source_directory / "expect_candidates.bas"
     summary = run([
         converter, "translate-simple-generic-c", str(source),
         str(candidate), cc[0], *cc[1:],
     ])
-    assert "translated 10 simple functions; skipped 0" in summary, summary
+    assert "translated 12 simple functions; skipped 0" in summary, summary
     generated = candidate.read_text()
     assert "As c2fb_c_long" in generated, generated
     assert "Private Function __c2fb_builtin_expect(" in generated, generated
@@ -17690,6 +17698,8 @@ def check_generic_body_builtin_expect(converter, fbc, cc, work):
                                     ctypes.c_double]),
         ("c2fbExpectSideEffect", [ctypes.POINTER(ctypes.c_int)]),
         ("c2fbExpectProbabilitySideEffects", [ctypes.POINTER(ctypes.c_int)]),
+        ("c2fbLikelyMacro", [ctypes.c_int]),
+        ("c2fbUnlikelyMacro", [ctypes.c_int]),
     )
     for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
         converted_path = source_directory / f"converted-{backend}.so"
@@ -17723,6 +17733,15 @@ def check_generic_body_builtin_expect(converter, fbc, cc, work):
             ) == converted.c2fbExpectProbability(
                 value, expected, probability
             ) == value
+
+        for name, true_value, false_value in (
+            ("c2fbLikelyMacro", 37, -41),
+            ("c2fbUnlikelyMacro", 43, -47),
+        ):
+            for value in (-3, 0, 8):
+                expected = true_value if value else false_value
+                assert getattr(reference, name)(value) == \
+                    getattr(converted, name)(value) == expected
 
         for name, expected_calls, probability_calls in (
             ("c2fbExpectSideEffect", 1, 0),

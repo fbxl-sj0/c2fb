@@ -1747,6 +1747,11 @@ calls lower to width-specific mask-and-shift expressions. C2FB materializes the
 operand once before reusing it for each output byte, and keeps the C width
 without relying on host byte order.
 
+GCC's `__builtin_expect` and `__builtin_expect_with_probability` lower through
+private helpers with C `long` results. The helpers evaluate each operand once,
+including operands with side effects, then discard the branch hint because
+FreeBASIC has no matching probability annotation.
+
 The C symbol catalog resolves simple typedef chains and records procedure
 return and parameter types. This makes declared integer call results usable in
 division and casts, and preserves known floating-to-integer call conversions.

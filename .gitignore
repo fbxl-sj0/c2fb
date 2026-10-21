@@ -1,0 +1,14 @@
+# C2FB build products and test caches.
+/build/
+__pycache__/
+*.pyc
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.asm
+*.fbc-*.c
+gmon.out
+
+# end of .gitignore

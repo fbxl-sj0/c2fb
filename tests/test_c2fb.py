@@ -11563,6 +11563,55 @@ def check_generic_body_global_definitions(converter, fbc, cc, work):
             assert re.search(rf"^{re.escape(c_name)} [A-Z] ", symbols, re.M), symbols
 
 
+def check_source_unit_global_definitions_keep_static_storage_with_body(
+    converter, fbc, cc, work
+):
+    # With global definitions enabled, the body module owns source static data.
+    source_directory = work / "source-unit-global-definitions-static-storage"
+    source_directory.mkdir()
+    source = source_directory / "static-storage.c"
+    source.write_text(
+        "static int c2fb_private_values[3] = {4, 7, 11};\n"
+        "int c2fbReadPrivateValue(int index) {\n"
+        "    return c2fb_private_values[index];\n"
+        "}\n"
+    )
+    candidate = source_directory / "static-storage_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    result = subprocess.run(
+        [
+            sys.executable, str(source_unit_tool), str(source), str(candidate),
+            "--converter", converter, "--compiler", cc[0],
+            "--body-option=--include-global-definitions",
+        ],
+        cwd=source_directory, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    type_context = candidate.with_name("static-storage_candidates_types.bi")
+    type_context_text = type_context.read_text()
+    generated = candidate.read_text()
+    assert "c2fb_private_values" not in type_context_text, type_context_text
+    assert "Private Dim Shared c2fb_global_c2fb_private_values(0 To 2)" \
+        in generated, generated
+
+    reference_path = source_directory / "reference.so"
+    run(cc + ["-shared", "-fPIC", str(source), "-o", str(reference_path)],
+        cwd=source_directory)
+    reference = ctypes.CDLL(str(reference_path))
+    reference.c2fbReadPrivateValue.argtypes = [ctypes.c_int]
+    reference.c2fbReadPrivateValue.restype = ctypes.c_int
+    for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
+        converted_path = source_directory / f"converted-{backend}.so"
+        run(fbc + flags + ["-w", "all", "-dll", str(candidate), "-x",
+                           str(converted_path)], cwd=source_directory)
+        converted = ctypes.CDLL(str(converted_path))
+        converted.c2fbReadPrivateValue.argtypes = [ctypes.c_int]
+        converted.c2fbReadPrivateValue.restype = ctypes.c_int
+        for index, expected in enumerate((4, 7, 11)):
+            assert reference.c2fbReadPrivateValue(index) == \
+                converted.c2fbReadPrivateValue(index) == expected
+
+
 def check_generic_body_parameter_matches_tag(converter, fbc, cc, work):
     # Tags occupy a separate C namespace. A parameter can have the same name
     # as its enum tag, as in Coreutils' enum backup_type backup_type.
@@ -17579,6 +17628,123 @@ def check_generic_body_huge_value_builtins(converter, fbc, cc, work):
             )
 
 
+def check_generic_body_builtin_expect(converter, fbc, cc, work):
+    # GCC's branch-hint builtins return C long and still evaluate every operand.
+    source_directory = work / "generic-body-builtin-expect"
+    source_directory.mkdir()
+    source = source_directory / "expect.c"
+    source.write_text(
+        "static int c2fb_expected_calls;\n"
+        "static int c2fb_probability_calls;\n"
+        "static long c2fbExpectedValue(void) {\n"
+        "    ++c2fb_expected_calls;\n"
+        "    return 17;\n"
+        "}\n"
+        "static double c2fbProbabilityValue(void) {\n"
+        "    ++c2fb_probability_calls;\n"
+        "    return 0.625;\n"
+        "}\n"
+        "void c2fbResetExpectCalls(void) {\n"
+        "    c2fb_expected_calls = 0;\n"
+        "    c2fb_probability_calls = 0;\n"
+        "}\n"
+        "int c2fbExpectedCalls(void) { return c2fb_expected_calls; }\n"
+        "int c2fbProbabilityCalls(void) { return c2fb_probability_calls; }\n"
+        "long c2fbExpectInt(int value, int expected) {\n"
+        "    return __builtin_expect(value, expected);\n"
+        "}\n"
+        "long c2fbExpectLongLong(long long value, int expected) {\n"
+        "    return __builtin_expect(value, expected);\n"
+        "}\n"
+        "long c2fbExpectProbability(long long value, int expected, double probability) {\n"
+        "    return __builtin_expect_with_probability(value, expected, probability);\n"
+        "}\n"
+        "long c2fbExpectSideEffect(int *value) {\n"
+        "    return __builtin_expect((*value)++, c2fbExpectedValue());\n"
+        "}\n"
+        "long c2fbExpectProbabilitySideEffects(int *value) {\n"
+        "    return __builtin_expect_with_probability(\n"
+        "        (*value)++, c2fbExpectedValue(), c2fbProbabilityValue());\n"
+        "}\n"
+    )
+    candidate = source_directory / "expect_candidates.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), cc[0], *cc[1:],
+    ])
+    assert "translated 10 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert "As c2fb_c_long" in generated, generated
+    assert "Private Function __c2fb_builtin_expect(" in generated, generated
+    assert "Private Function __c2fb_builtin_expect_with_probability(" \
+        in generated, generated
+
+    reference_path = source_directory / "reference.so"
+    run(cc + ["-std=c99", "-shared", "-fPIC", str(source),
+              "-o", str(reference_path)], cwd=source_directory)
+    reference = ctypes.CDLL(str(reference_path))
+    function_signatures = (
+        ("c2fbExpectInt", [ctypes.c_int, ctypes.c_int]),
+        ("c2fbExpectLongLong", [ctypes.c_longlong, ctypes.c_int]),
+        ("c2fbExpectProbability", [ctypes.c_longlong, ctypes.c_int,
+                                    ctypes.c_double]),
+        ("c2fbExpectSideEffect", [ctypes.POINTER(ctypes.c_int)]),
+        ("c2fbExpectProbabilitySideEffects", [ctypes.POINTER(ctypes.c_int)]),
+    )
+    for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
+        converted_path = source_directory / f"converted-{backend}.so"
+        run(fbc + flags + ["-w", "all", "-dll", str(candidate),
+                           "-x", str(converted_path)], cwd=source_directory)
+        converted = ctypes.CDLL(str(converted_path))
+        for library in (reference, converted):
+            for name, argument_types in function_signatures:
+                function = getattr(library, name)
+                function.argtypes = argument_types
+                function.restype = ctypes.c_long
+            library.c2fbResetExpectCalls.argtypes = []
+            library.c2fbResetExpectCalls.restype = None
+            library.c2fbExpectedCalls.argtypes = []
+            library.c2fbExpectedCalls.restype = ctypes.c_int
+            library.c2fbProbabilityCalls.argtypes = []
+            library.c2fbProbabilityCalls.restype = ctypes.c_int
+
+        for value, expected in ((-19, 0), (0, 1), (23, -4)):
+            assert reference.c2fbExpectInt(value, expected) == \
+                converted.c2fbExpectInt(value, expected) == value
+        for value, expected in ((-4294967303, 1), (0, 0),
+                                (4294967311, 18)):
+            assert reference.c2fbExpectLongLong(value, expected) == \
+                converted.c2fbExpectLongLong(value, expected) == value
+        for value, expected, probability in (
+            (-4294967303, 1, 0.25), (0, -2, 0.625), (4294967311, 9, 0.875),
+        ):
+            assert reference.c2fbExpectProbability(
+                value, expected, probability
+            ) == converted.c2fbExpectProbability(
+                value, expected, probability
+            ) == value
+
+        for name, expected_calls, probability_calls in (
+            ("c2fbExpectSideEffect", 1, 0),
+            ("c2fbExpectProbabilitySideEffects", 1, 1),
+        ):
+            for library in (reference, converted):
+                library.c2fbResetExpectCalls()
+            initial = ctypes.c_int(31)
+            c_result = getattr(reference, name)(ctypes.byref(initial))
+            c_state = (c_result, initial.value,
+                       reference.c2fbExpectedCalls(),
+                       reference.c2fbProbabilityCalls())
+            initial = ctypes.c_int(31)
+            fb_result = getattr(converted, name)(ctypes.byref(initial))
+            fb_state = (fb_result, initial.value,
+                        converted.c2fbExpectedCalls(),
+                        converted.c2fbProbabilityCalls())
+            assert c_state == fb_state == (
+                31, 32, expected_calls, probability_calls
+            ), (backend, name, c_state, fb_state)
+
+
 def check_generic_body_crt_math_declarations(converter, fbc, work):
     # CRT math names such as sin_ need the declaration supplied by math.bi.
     source_directory = work / "generic-body-crt-math"
@@ -21494,6 +21660,8 @@ def main():
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_global_definitions(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_source_unit_global_definitions_keep_static_storage_with_body(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_parameter_matches_tag(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_header_record_trailing_declarators(
@@ -21693,6 +21861,8 @@ def main():
         check_generic_body_isfinite_builtin(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_huge_value_builtins(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_builtin_expect(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_crt_math_declarations(
             converter, shlex.split(args.fbc), work)

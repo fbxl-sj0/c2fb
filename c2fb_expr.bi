@@ -946,6 +946,7 @@ Private Function ParseSimpleCallValue( _
     Dim isAtomicIsLockFree As Long = _
         CInt(procedureName = "__atomic_is_lock_free")
     Dim isFiniteBuiltin As Long = CBodyFiniteTestBuiltin(procedureName)
+    Dim builtinExpectKind As Long = CBodyBuiltinExpectKind(procedureName)
     Dim builtinInfinityType As String = _
         CBodyBuiltinInfinityType(procedureName)
     Dim callbackType As String = value.typeName
@@ -967,6 +968,10 @@ Private Function ParseSimpleCallValue( _
     If builtinInfinityType <> "" Then
         expectedCount = 0
         returnType = builtinInfinityType
+    ElseIf builtinExpectKind <> 0 Then
+        expectedCount = 2
+        If builtinExpectKind = 2 Then expectedCount = 3
+        returnType = "c2fb_c_long"
     ElseIf CBodyBuiltinType(procedureName) <> "" Then
         expectedCount = 1
         returnType = CBodyBuiltinType(procedureName)
@@ -1116,6 +1121,22 @@ Private Function ParseSimpleCallValue( _
             End If
         End Select
         If explainAdapter = "" Then Return 0
+    End If
+    If builtinExpectKind <> 0 Then
+        If parser.unevaluated = 0 AndAlso argumentCount <> expectedCount Then Return 0
+        For argumentIndex As Long = 0 To argumentCount - 1
+            Dim argumentKind As Long = SimpleArithmeticKind( _
+                parser.catalog[0], arguments(argumentIndex).typeName)
+            If argumentKind < 1 OrElse argumentKind > 6 Then Return 0
+        Next
+        targetTypes(0) = "c2fb_c_long"
+        targetTypes(1) = "c2fb_c_long"
+        If builtinExpectKind = 1 Then
+            explainAdapter = "__c2fb_builtin_expect"
+        Else
+            targetTypes(2) = "Double"
+            explainAdapter = "__c2fb_builtin_expect_with_probability"
+        End If
     End If
     If Mid(parser.sourceText, parser.position, 1) <> ")" Then Return 0
     parser.position += 1
@@ -2350,9 +2371,12 @@ Private Function ParseSimpleUnaryValue( _
                         parser.translation[0].body.atomicMutexRuntime <> 0)
                     Dim isFiniteBuiltin As Long = _
                         CBodyFiniteTestBuiltin(identifier)
+                    Dim builtinExpectKind As Long = _
+                        CBodyBuiltinExpectKind(identifier)
                     Dim isBuiltinCall As Long = CInt( _
                         CBodyBuiltinType(identifier) <> "" OrElse _
                         CBodyBuiltinInfinityType(identifier) <> "" OrElse _
+                        builtinExpectKind <> 0 OrElse _
                         isVaStart <> 0 OrElse isVaEnd <> 0 OrElse _
                         identifier = "__builtin_alloca" OrElse _
                         isFiniteBuiltin <> 0 OrElse _
@@ -2387,6 +2411,8 @@ Private Function ParseSimpleUnaryValue( _
                     End If
                     If isVaStart <> 0 OrElse isVaEnd <> 0 Then
                         value.typeName = "void"
+                    ElseIf builtinExpectKind <> 0 Then
+                        value.typeName = "c2fb_c_long"
                     Else
                         value.typeName = CBodyReturnType( _
                             parser.translation[0], parser.catalog[0], identifier)

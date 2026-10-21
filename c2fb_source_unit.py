@@ -325,15 +325,22 @@ def run_source_unit(arguments, output_messages=None):
                 *arguments.header_options,
                 "--exclude=*",
                 "--preserve-type-dependencies",
-                "--include-static-objects",
-                "--private-static-objects",
+            ]
+            # The body pass writes its own source objects after function
+            # declarations, which keeps callback initializers callable.
+            if "--include-global-definitions" not in arguments.body_options:
+                header_command.extend([
+                    "--include-static-objects",
+                    "--private-static-objects",
+                ])
+            header_command.extend([
                 "--emit-source=" + source_pattern,
                 # Keep pointer fields in selected records valid when their
                 # tags are completed in a filtered or unselected header.
                 "--forward-decl=*",
                 arguments.compiler,
                 *arguments.header_compiler_options,
-            ]
+            ])
             if arguments.include_header_types:
                 # Body candidates can access records defined by included
                 # headers. The default source filter keeps unrelated header

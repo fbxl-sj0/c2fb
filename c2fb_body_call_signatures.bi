@@ -86,6 +86,14 @@ Private Function CBodyBuiltinType(ByVal procedureName As String) As String
     Return ""
 End Function
 
+Private Function CBodyBuiltinExpectKind(ByVal procedureName As String) As Long
+    Select Case procedureName
+    Case "__builtin_expect": Return 1
+    Case "__builtin_expect_with_probability": Return 2
+    End Select
+    Return 0
+End Function
+
 Private Function CBodyBuiltinInfinityType( _
     ByVal procedureName As String _
 ) As String

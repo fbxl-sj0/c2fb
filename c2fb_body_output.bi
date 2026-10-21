@@ -1190,10 +1190,17 @@ Private Sub WriteCBodyDeclarations( _
 )
     Dim singleUsed As Long = 0
     Dim doubleUsed As Long = 0
+    Dim builtinExpectUsed As Long = 0
+    Dim builtinExpectProbabilityUsed As Long = 0
     For i As Long = 0 To candidateCount - 1
         If C2fbBodyCandidateWillBeEmitted(candidates(i)) = 0 Then Continue For
         If InStr(candidates(i).source, "__c2fb_single_value(") <> 0 Then singleUsed = -1
         If InStr(candidates(i).source, "__c2fb_double_value(") <> 0 Then doubleUsed = -1
+        If InStr(candidates(i).source, "__c2fb_builtin_expect(") <> 0 Then _
+            builtinExpectUsed = -1
+        If InStr(candidates(i).source, _
+                 "__c2fb_builtin_expect_with_probability(") <> 0 Then _
+            builtinExpectProbabilityUsed = -1
     Next
     If singleUsed <> 0 Then
         WriteC2fbOutputLine( _
@@ -1204,6 +1211,18 @@ Private Sub WriteCBodyDeclarations( _
     If doubleUsed <> 0 Then
         WriteC2fbOutputLine( _
             outputFile, "Private Function __c2fb_double_value(ByVal value As Double) As Double")
+        WriteC2fbOutputLine(outputFile, "    Return value")
+        WriteC2fbOutputLine(outputFile, "End Function")
+    End If
+    If builtinExpectUsed <> 0 Then
+        WriteC2fbOutputLine(outputFile, _
+            "Private Function __c2fb_builtin_expect(ByVal value As c2fb_c_long, ByVal expected As c2fb_c_long) As c2fb_c_long")
+        WriteC2fbOutputLine(outputFile, "    Return value")
+        WriteC2fbOutputLine(outputFile, "End Function")
+    End If
+    If builtinExpectProbabilityUsed <> 0 Then
+        WriteC2fbOutputLine(outputFile, _
+            "Private Function __c2fb_builtin_expect_with_probability(ByVal value As c2fb_c_long, ByVal expected As c2fb_c_long, ByVal probability As Double) As c2fb_c_long")
         WriteC2fbOutputLine(outputFile, "    Return value")
         WriteC2fbOutputLine(outputFile, "End Function")
     End If

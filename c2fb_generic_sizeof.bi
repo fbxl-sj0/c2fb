@@ -13,6 +13,7 @@
 
         - Read scalar and pointer widths from predefined C ABI macros.
         - Resolve typedef storage through the generic-header type model.
+        - Resolve sizeof terms for modeled scalar and simple aggregate types.
         - Replace sizeof terms in array bounds only when their size is known.
         - Keep integer casts only when they preserve the resolved size value.
 
@@ -89,6 +90,7 @@ Private Function GenericHeaderFreeBasicScalarSize( _
         Return 0
     Case "single": Return 4
     Case "double": Return 8
+    Case "__bf16", "_float16": Return 2
     Case "zstring": Return 1
     Case "wstring"
         Return GenericHeaderPreprocessorSizeValue( _
@@ -97,6 +99,179 @@ Private Function GenericHeaderFreeBasicScalarSize( _
         Return GenericHeaderPreprocessorSizeValue( _
             translation, "__SIZEOF_LONG_DOUBLE__")
     End Select
+    Return 0
+End Function
+
+Private Function GenericHeaderCLongDoubleAlignmentBytes( _
+    ByRef translation As C2fbTranslationContext _
+) As Long
+    Dim longDoubleSize As Long = GenericHeaderPreprocessorSizeValue( _
+        translation, "__SIZEOF_LONG_DOUBLE__")
+    Dim pointerSize As Long = GenericHeaderPreprocessorSizeValue( _
+        translation, "__SIZEOF_POINTER__")
+
+    Select Case longDoubleSize
+    Case 16
+        ' The x86-64 C ABI aligns its 16-byte long double to 16 bytes.
+        If pointerSize = 8 AndAlso _
+           GenericHeaderPreprocessorSizeValue(translation, "__x86_64__") <> 0 Then _
+            Return 16
+    Case 8
+        ' On 64-bit targets where long double is double-sized, its alignment
+        ' matches the native 64-bit integer carrier used by FreeBASIC.
+        If pointerSize = 8 Then Return 8
+    Case 12
+        ' The x86 32-bit ABI stores the extended value in 12 bytes and aligns
+        ' it to the four-byte word boundary.
+        If pointerSize = 4 AndAlso _
+           GenericHeaderPreprocessorSizeValue(translation, "__i386__") <> 0 Then _
+            Return 4
+    End Select
+    Return 0
+End Function
+
+Private Function GenericHeaderFreeBasicScalarAlignment( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal freeBasicType As String, ByVal scalarSize As Long _
+) As Long
+    If Left(freeBasicType, 6) = "Const " Then _
+        freeBasicType = Mid(freeBasicType, 7)
+    Dim storedType As String = GenericHeaderTypeAliasStorageTypeInHeader( _
+        translation.genericC.header, freeBasicType, 0)
+    If storedType <> "" Then freeBasicType = storedType
+
+    Select Case LCase(freeBasicType)
+    Case "byte", "ubyte", "boolean", "zstring", "wstring"
+        Return 1
+    Case "short", "ushort"
+        Return 2
+    Case "long", "ulong", "single"
+        Return 4
+    Case "clong", "culong", "c2fb_c_long", "c2fb_c_ulong"
+        Return GenericHeaderPreprocessorSizeValue( _
+            translation, "__SIZEOF_LONG__")
+    Case "integer", "uinteger", "c2fb_size_t"
+        Return GenericHeaderPreprocessorSizeValue( _
+            translation, "__SIZEOF_POINTER__")
+    Case "longint", "ulongint", "double", "c2fb_int64", "c2fb_uint64"
+        Dim pointerSize As Long = GenericHeaderPreprocessorSizeValue( _
+            translation, "__SIZEOF_POINTER__")
+        If pointerSize >= 8 Then Return 8
+        Return 0
+    Case "clongdouble"
+        Return GenericHeaderCLongDoubleAlignmentBytes(translation)
+    End Select
+    If scalarSize > 0 AndAlso scalarSize <= 4 Then Return scalarSize
+    Return 0
+End Function
+
+Private Function GenericHeaderSimpleRecordSizeInBytes( _
+    ByRef translation As C2fbTranslationContext, ByVal freeBasicType As String _
+) As Long
+    ' Generic body translation has no header record-plan array. It can still
+    ' resolve scalar sizeof operands, but must leave aggregate sizes unknown.
+    If translation.genericC.header.recordPlanCount <= 0 Then Return 0
+    Dim storageType As String = GenericHeaderTypeAliasStorageTypeInHeader( _
+        translation.genericC.header, freeBasicType, 0)
+    If storageType <> "" AndAlso LCase(storageType) <> "record" Then _
+        freeBasicType = storageType
+
+    For declarationIndex As Long = 0 To _
+        translation.sourceUnit.declarationCount - 1
+        If declarationIndex >= _
+           translation.genericC.header.recordPlanCount Then Continue For
+        With translation.sourceUnit.declarations(declarationIndex)
+            If .entryKind <> C2FB_DECLARATION_RECORD OrElse _
+               (.recordKind <> C2FB_RECORD_STRUCT AndAlso _
+                .recordKind <> C2FB_RECORD_UNION) Then Continue For
+            If translation.genericC.header.recordPlans( _
+                declarationIndex).isPrepared = 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).isSupported = 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).bindingReady = 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).binding.isPacked <> 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).binding.packValue <> 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).binding.alignmentValue <> 0 OrElse _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).hasNonByteFlexibleTail <> 0 Then Continue For
+            If translation.genericC.header.recordPlans( _
+                declarationIndex).freeBasicName <> freeBasicType AndAlso _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).aliasFreeBasicName <> freeBasicType AndAlso _
+               translation.genericC.header.recordPlans( _
+                declarationIndex).implementationName <> freeBasicType Then _
+                Continue For
+            Dim offset As Long = 0
+            Dim unionSize As Long = 0
+            Dim maximumAlignment As Long = 1
+            For itemIndex As Long = 0 To _
+                translation.genericC.header.recordPlans( _
+                    declarationIndex).binding.itemCount - 1
+                With translation.genericC.header.recordPlans( _
+                    declarationIndex).binding.items(itemIndex)
+                    If .kind <> C2FB_RECORD_BINDING_ITEM_FIELD OrElse _
+                       .isBitField <> 0 OrElse .zeroArrayAccessorName <> "" OrElse _
+                       .arrayCount < 0 OrElse .packValue <> 0 Then Return 0
+                    Dim fieldType As String = .fieldType
+                    Dim fieldPointerDepth As Long = 0
+                    While Right(LCase(fieldType), 4) = " ptr"
+                        fieldType = Trim(Left(fieldType, Len(fieldType) - 4))
+                        fieldPointerDepth += 1
+                    Wend
+                    Dim fieldSize As Long
+                    Dim fieldAlignment As Long
+                    If fieldPointerDepth > 0 Then
+                        fieldSize = GenericHeaderPreprocessorSizeValue( _
+                            translation, "__SIZEOF_POINTER__")
+                        fieldAlignment = fieldSize
+                    Else
+                        fieldSize = GenericHeaderFreeBasicScalarSize( _
+                            translation, fieldType)
+                        fieldAlignment = GenericHeaderFreeBasicScalarAlignment( _
+                            translation, fieldType, fieldSize)
+                    End If
+                    If fieldSize <= 0 OrElse fieldAlignment <= 0 Then Return 0
+                    If .arrayCount > 0 Then
+                        If fieldSize > MAX_GENERIC_ARRAY_BOUND_VALUE \ .arrayCount Then _
+                            Return 0
+                        fieldSize *= .arrayCount
+                    End If
+                    If fieldAlignment > maximumAlignment Then _
+                        maximumAlignment = fieldAlignment
+
+                    If translation.genericC.header.recordPlans( _
+                        declarationIndex).binding.isUnion <> 0 Then
+                        If fieldSize > unionSize Then unionSize = fieldSize
+                    Else
+                        Dim remainder As Long = offset Mod fieldAlignment
+                        If remainder <> 0 Then
+                            Dim padding As Long = fieldAlignment - remainder
+                            If offset > MAX_GENERIC_ARRAY_BOUND_VALUE - padding Then _
+                                Return 0
+                            offset += padding
+                        End If
+                        If fieldSize > MAX_GENERIC_ARRAY_BOUND_VALUE - offset Then _
+                            Return 0
+                        offset += fieldSize
+                    End If
+                End With
+            Next
+
+            If translation.genericC.header.recordPlans( _
+                declarationIndex).binding.isUnion <> 0 Then offset = unionSize
+            Dim remainder As Long = offset Mod maximumAlignment
+            If remainder <> 0 Then
+                Dim padding As Long = maximumAlignment - remainder
+                If offset > MAX_GENERIC_ARRAY_BOUND_VALUE - padding Then Return 0
+                offset += padding
+            End If
+            Return offset
+        End With
+    Next
     Return 0
 End Function
 
@@ -140,8 +315,13 @@ Private Function GenericHeaderSizeofTypeInBytes( _
        InStr(freeBasicType, " Ptr") <> 0 Then _
         Return GenericHeaderPreprocessorSizeValue( _
             translation, "__SIZEOF_POINTER__")
-    If parsedType.isStruct <> 0 OrElse parsedType.isUnion <> 0 Then Return 0
-    Return GenericHeaderFreeBasicScalarSize(translation, freeBasicType)
+    If parsedType.isStruct <> 0 OrElse parsedType.isUnion <> 0 Then _
+        Return GenericHeaderSimpleRecordSizeInBytes( _
+            translation, freeBasicType)
+    Dim scalarSize As Long = GenericHeaderFreeBasicScalarSize( _
+        translation, freeBasicType)
+    If scalarSize > 0 Then Return scalarSize
+    Return GenericHeaderSimpleRecordSizeInBytes(translation, freeBasicType)
 End Function
 
 Private Function GenericHeaderIntegerTypeCanHoldSizeof( _

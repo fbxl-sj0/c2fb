@@ -64,6 +64,265 @@ Private Function ReadSimpleStaticStringArray( _
 End Function
 
 
+Private Function ReadSimpleStaticStringMatrix( _
+    ByVal initializerText As String, ByVal rowWidth As Long, _
+    ByRef values As String, ByRef rowCount As Long, _
+    ByRef byteCount As Long _
+) As Long
+    values = ""
+    rowCount = 0
+    byteCount = 0
+    initializerText = Trim(initializerText)
+    If rowWidth < 1 OrElse Left(initializerText, 1) <> "{" OrElse _
+       Right(initializerText, 1) <> "}" Then Return 0
+
+    Dim initialText As String = Trim(Mid( _
+        initializerText, 2, Len(initializerText) - 2))
+    If Right(initialText, 1) = "," Then _
+        initialText = RTrim(Left(initialText, Len(initialText) - 1))
+    Dim rows() As String
+    If SplitSimpleCList(initialText, rows(), rowCount) = 0 OrElse _
+       rowCount < 1 OrElse rowCount > MAX_SIMPLE_ARRAY_COUNT OrElse _
+       rowCount > MAX_SIMPLE_ARRAY_COUNT \ rowWidth Then Return 0
+
+    For rowIndex As Long = 0 To rowCount - 1
+        Dim rowValues As String
+        Dim rowByteCount As Long
+        If ReadSimpleStaticStringArray( _
+            Trim(rows(rowIndex)), rowValues, rowByteCount) = 0 OrElse _
+           rowByteCount > rowWidth Then Return 0
+        If values <> "" Then values &= ", "
+        values &= rowValues
+        For columnIndex As Long = rowByteCount To rowWidth - 1
+            values &= ", 0"
+        Next
+    Next
+    byteCount = rowCount * rowWidth
+    Return -1
+End Function
+
+
+
+' Local enum values use the same bounded integer grammar as generic headers.
+' Resolve visible body constants first so a local name can shadow a header enum.
+Private Function EvaluateSimpleBodyEnumIntegerExpression( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceExpression As String, _
+    locals() As SimpleLocalVariable, ByVal localCount As Long, _
+    parameterNames() As String, ByVal parameterCount As Long, _
+    ByRef integerValue As Long _
+) As Long
+    Dim numericExpression As String
+    Dim position As Long = 1
+    While position <= Len(sourceExpression)
+        Dim currentByte As Long = Asc(sourceExpression, position)
+        If IsIdentifierStart(currentByte) <> 0 Then
+            Dim tokenStart As Long = position
+            position += 1
+            While position <= Len(sourceExpression) AndAlso _
+                  IsIdentifierPart(Asc(sourceExpression, position)) <> 0
+                position += 1
+            Wend
+            Dim sourceName As String = Mid( _
+                sourceExpression, tokenStart, position - tokenStart)
+            Dim visibleSymbol As Long = -1
+            For symbolIndex As Long = parameterCount - 1 To 0 Step -1
+                If parameterNames(symbolIndex) = sourceName Then
+                    visibleSymbol = symbolIndex
+                    Exit For
+                End If
+            Next
+            If visibleSymbol >= 0 Then
+                Dim localIndex As Long = -1
+                For candidateIndex As Long = localCount - 1 To 0 Step -1
+                    If locals(candidateIndex).name = sourceName Then
+                        localIndex = candidateIndex
+                        Exit For
+                    End If
+                Next
+                If localIndex < 0 OrElse _
+                   locals(localIndex).isIntegerConstant = 0 Then Return 0
+                numericExpression &= Trim(Str(locals(localIndex).integerValue))
+            Else
+                Dim enumIndex As Long = _
+                    GenericEnumMemberIndexInContext(translation, sourceName)
+                If enumIndex < 0 OrElse _
+                   translation.genericC.header.enumMembers( _
+                       enumIndex).integerValueKnown = 0 Then Return 0
+                numericExpression &= Trim(Str( _
+                    translation.genericC.header.enumMembers( _
+                        enumIndex).integerValue))
+            End If
+        ElseIf currentByte >= Asc("0") AndAlso currentByte <= Asc("9") Then
+            Dim tokenStart As Long = position
+            position += 1
+            While position <= Len(sourceExpression) AndAlso _
+                  IsIdentifierPart(Asc(sourceExpression, position)) <> 0
+                position += 1
+            Wend
+            numericExpression &= Mid( _
+                sourceExpression, tokenStart, position - tokenStart)
+        Else
+            numericExpression &= Chr(currentByte)
+            position += 1
+        End If
+    Wend
+
+    Dim parser As SimpleArrayBoundParser
+    parser.sourceText = numericExpression
+    parser.position = 1
+    Dim value As LongInt
+    If ReadSimpleArrayBoundShift(parser, value, 0) = 0 Then Return 0
+    SkipCSpaces(parser.sourceText, parser.position)
+    If parser.position <= Len(parser.sourceText) OrElse _
+       value < -MAX_GENERIC_ARRAY_BOUND_VALUE OrElse _
+       value > MAX_GENERIC_ARRAY_BOUND_VALUE Then Return 0
+    integerValue = CLng(value)
+    Return -1
+End Function
+
+
+' Local enums have block scope but no runtime storage. Give each enumerator a
+' private compile-time alias and retain its value for later members.
+Private Function TranslateSimpleLocalEnumDefinition( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal statementText As String, ByRef outputText As String, _
+    ByRef context As SimpleBodyContext, _
+    locals() As SimpleLocalVariable, ByRef localCount As Long, _
+    parameterNames() As String, parameterAliases() As String, _
+    parameterTypes() As String, ByRef symbolCount As Long _
+) As Long
+    outputText = ""
+    If translation.target.profile <> C2FB_TARGET_GENERIC Then Return 0
+
+    statementText = Trim(statementText)
+    If Left(statementText, Len("enum")) <> "enum" OrElse _
+       (Len(statementText) > Len("enum") AndAlso _
+        IsIdentifierPart(Asc(statementText, Len("enum") + 1)) <> 0) Then _
+        Return 0
+
+    Dim position As Long = Len("enum") + 1
+    SkipCSpaces(statementText, position)
+    If position <= Len(statementText) AndAlso _
+       Asc(statementText, position) <> Asc("{") Then
+        If IsIdentifierStart(Asc(statementText, position)) = 0 Then Return 0
+        While position <= Len(statementText) AndAlso _
+              IsIdentifierPart(Asc(statementText, position)) <> 0
+            position += 1
+        Wend
+        SkipCSpaces(statementText, position)
+    End If
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc("{") Then Return 0
+    Dim openingBrace As Long = position
+    Dim closingBrace As Long = position
+    If ScanSimpleExpressionGroup( _
+        statementText, closingBrace, Asc("{"), Asc("}")) = 0 Then Return 0
+    Dim enumBody As String = Mid( _
+        statementText, openingBrace + 1, closingBrace - openingBrace - 2)
+    position = closingBrace
+    SkipCSpaces(statementText, position)
+    If position <= Len(statementText) AndAlso _
+       Asc(statementText, position) = Asc(";") Then position += 1
+    SkipCSpaces(statementText, position)
+    If position <= Len(statementText) Then Return 0
+
+    Dim enumParts() As String
+    Dim enumPartCount As Long
+    If SplitSimpleCList( _
+        enumBody, enumParts(), enumPartCount, -1) = 0 OrElse _
+       enumPartCount < 1 OrElse enumPartCount > MAX_SIMPLE_VARIABLES Then _
+        Return 0
+
+    Dim scopeStart As Long = 0
+    If context.scopeDepth > 0 Then _
+        scopeStart = context.scopeSymbols(context.scopeDepth - 1)
+    Dim previousValue As Long = 0
+    Dim previousValueKnown As Long = -1
+    Dim previousAlias As String
+    Dim callableNames(0 To 0) As String
+    For memberIndex As Long = 0 To enumPartCount - 1
+        Dim memberText As String = Trim(enumParts(memberIndex))
+        Dim equalsPosition As Long = FindSimpleAssignmentEquals(memberText)
+        Dim memberNameText As String = memberText
+        If equalsPosition > 0 Then _
+            memberNameText = Trim(Left(memberText, equalsPosition - 1))
+
+        Dim memberTokens() As String
+        Dim memberTokenCount As Long
+        TokenizeCDeclaration( _
+            memberNameText, memberTokens(), memberTokenCount)
+        If memberTokenCount <> 1 OrElse _
+           IsIdentifierToken(memberTokens(0)) = 0 Then Return 0
+        Dim memberName As String = memberTokens(0)
+        For symbolIndex As Long = scopeStart To symbolCount - 1
+            If parameterNames(symbolIndex) = memberName Then Return 0
+        Next
+
+        Dim value As Long
+        Dim valueKnown As Long = 0
+        Dim freeBasicValue As String
+        If equalsPosition > 0 Then
+            Dim valueExpression As String = Trim( _
+                Mid(memberText, equalsPosition + 1))
+            If valueExpression = "" Then Return 0
+            If EvaluateSimpleBodyEnumIntegerExpression( _
+                translation, valueExpression, locals(), localCount, _
+                parameterNames(), symbolCount, value) <> 0 Then
+                valueKnown = -1
+                freeBasicValue = Trim(Str(value))
+            Else
+                Dim hasBooleanOperator As Long
+                Dim hasFunctionCall As Long
+                If TranslateSimpleExpression( _
+                    translation, catalog, valueExpression, freeBasicValue, _
+                    hasBooleanOperator, hasFunctionCall, callableNames(), 0, _
+                    parameterNames(), parameterAliases(), parameterTypes(), _
+                    symbolCount, "c2fb_c_int", 0, -1) = 0 OrElse _
+                   hasFunctionCall <> 0 Then Return 0
+            End If
+        ElseIf memberIndex = 0 Then
+            value = 0
+            valueKnown = -1
+            freeBasicValue = "0"
+        ElseIf previousValueKnown <> 0 Then
+            If previousValue >= MAX_GENERIC_ARRAY_BOUND_VALUE Then Return 0
+            value = previousValue + 1
+            valueKnown = -1
+            freeBasicValue = Trim(Str(value))
+        Else
+            freeBasicValue = previousAlias & " + 1"
+        End If
+
+        If context.localSerial >= MAX_SIMPLE_VARIABLES OrElse _
+           localCount >= MAX_SIMPLE_VARIABLES OrElse _
+           symbolCount >= MAX_SIMPLE_VARIABLES Then Return 0
+        Dim aliasName As String = "local" & Trim(Str(context.localSerial))
+        context.localSerial += 1
+        context.declarations &= "    Const " & aliasName & _
+            " As c2fb_c_int = " & freeBasicValue & Chr(10)
+        context.readOnlyAliases &= "|" & aliasName & "|"
+        locals(localCount).name = memberName
+        locals(localCount).typeName = "c2fb_c_int"
+        locals(localCount).isConst = -1
+        locals(localCount).sizeofBytes = CLng(SizeOf(Long))
+        locals(localCount).hasKnownSize = -1
+        locals(localCount).isIntegerConstant = valueKnown
+        locals(localCount).integerValue = value
+        localCount += 1
+        parameterNames(symbolCount) = memberName
+        parameterAliases(symbolCount) = aliasName
+        parameterTypes(symbolCount) = "c2fb_c_int"
+        symbolCount += 1
+        previousValue = value
+        previousValueKnown = valueKnown
+        previousAlias = aliasName
+    Next
+    outputText = "' C local enum constants"
+    Return -1
+End Function
+
 
 Private Function CBodySourceRecordKindInContext( _
     ByRef translation As C2fbTranslationContext, _
@@ -79,7 +338,9 @@ Private Function CBodySourceRecordKindInContext( _
     Next
     For bindingIndex As Long = 0 To translation.body.recordBindingCount - 1
         With translation.body.recordBindings(bindingIndex)
-            If .isGenerated <> 0 AndAlso .sourceName = sourceRecord Then _
+            ' Source-unit anonymous aggregates use owner.field keys.
+            If (.isGenerated <> 0 OrElse InStr(.sourceName, ".") <> 0) AndAlso _
+               .sourceName = sourceRecord Then _
                 Return .recordKind
         End With
     Next
@@ -206,6 +467,7 @@ Private Function RegisterCBodyAnonymousLocalRecord( _
                     .name = translation.body.recordFields(fieldIndex).name
                 .typeName = storedFieldType
                 .isArray = translation.body.recordFields(fieldIndex).isArray
+                .isUnionMember = 0
                 .headerName = ""
             End With
             catalog.bodyFieldCount += 1
@@ -283,23 +545,109 @@ Private Function ParseSimpleCMemberDesignator( _
     fieldInitializer = ""
     initializerText = Trim(initializerText)
     If Len(initializerText) < 4 OrElse Left(initializerText, 1) <> "." Then Return 0
-    Dim position As Long = 2
-    SkipCSpaces(initializerText, position)
-    If position > Len(initializerText) OrElse _
-       IsIdentifierStart(Asc(initializerText, position)) = 0 Then Return 0
-    Dim nameStart As Long = position
-    position += 1
-    While position <= Len(initializerText) AndAlso _
-          IsIdentifierPart(Asc(initializerText, position)) <> 0
+    Dim pathSegments(0 To MAX_TYPE_WORDS - 1) As String
+    Dim pathSegmentCount As Long = 0
+    Dim position As Long = 1
+    Dim foundInitializer As Long = 0
+    While position <= Len(initializerText)
+        If Asc(initializerText, position) <> Asc(".") Then Return 0
         position += 1
+        SkipCSpaces(initializerText, position)
+        If position > Len(initializerText) OrElse _
+           IsIdentifierStart(Asc(initializerText, position)) = 0 OrElse _
+           pathSegmentCount >= MAX_TYPE_WORDS Then Return 0
+        Dim nameStart As Long = position
+        position += 1
+        While position <= Len(initializerText) AndAlso _
+              IsIdentifierPart(Asc(initializerText, position)) <> 0
+            position += 1
+        Wend
+        pathSegments(pathSegmentCount) = _
+            Mid(initializerText, nameStart, position - nameStart)
+        pathSegmentCount += 1
+        SkipCSpaces(initializerText, position)
+        If position > Len(initializerText) Then Return 0
+        If Asc(initializerText, position) = Asc("=") Then
+            position += 1
+            fieldInitializer = Trim(Mid(initializerText, position))
+            foundInitializer = -1
+            Exit While
+        ElseIf Asc(initializerText, position) <> Asc(".") Then
+            Return 0
+        End If
     Wend
-    fieldName = Mid(initializerText, nameStart, position - nameStart)
-    SkipCSpaces(initializerText, position)
-    If position > Len(initializerText) OrElse _
-       Asc(initializerText, position) <> Asc("=") Then Return 0
-    position += 1
-    fieldInitializer = Trim(Mid(initializerText, position))
-    If fieldInitializer = "" Then Return 0
+    If foundInitializer = 0 OrElse pathSegmentCount = 0 OrElse _
+       fieldInitializer = "" Then Return 0
+
+    fieldName = pathSegments(0)
+    For pathIndex As Long = pathSegmentCount - 1 To 1 Step -1
+        fieldInitializer = "{ ." & pathSegments(pathIndex) & " = " & _
+            fieldInitializer & " }"
+    Next
+    Return -1
+End Function
+
+Private Function MergeSimpleCMemberDesignatorInitializers( _
+    ByVal firstText As String, ByVal secondText As String, _
+    ByRef mergedText As String, ByVal depth As Long = 0 _
+) As Long
+    mergedText = ""
+    If depth >= MAX_BODY_NESTING Then Return 0
+    firstText = Trim(firstText)
+    secondText = Trim(secondText)
+    If Left(firstText, 1) <> "{" OrElse Right(firstText, 1) <> "}" OrElse _
+       Left(secondText, 1) <> "{" OrElse Right(secondText, 1) <> "}" Then Return 0
+
+    Dim firstBody As String = Trim(Mid(firstText, 2, Len(firstText) - 2))
+    Dim secondBody As String = Trim(Mid(secondText, 2, Len(secondText) - 2))
+    If firstBody = "" OrElse secondBody = "" Then Return 0
+    Dim initializerLists(0 To 1) As String
+    initializerLists(0) = firstBody
+    initializerLists(1) = secondBody
+
+    Dim fieldNames(0 To MAX_TYPE_WORDS - 1) As String
+    Dim fieldValues(0 To MAX_TYPE_WORDS - 1) As String
+    Dim fieldCount As Long = 0
+    For listIndex As Long = 0 To 1
+        Dim values() As String
+        Dim valueCount As Long
+        If SplitSimpleCList( _
+            initializerLists(listIndex), values(), valueCount) = 0 Then Return 0
+        For valueIndex As Long = 0 To valueCount - 1
+            Dim fieldName As String
+            Dim fieldInitializer As String
+            If ParseSimpleCMemberDesignator( _
+                values(valueIndex), fieldName, fieldInitializer) = 0 Then Return 0
+            Dim existingField As Long = -1
+            For fieldIndex As Long = 0 To fieldCount - 1
+                If fieldNames(fieldIndex) = fieldName Then
+                    existingField = fieldIndex
+                    Exit For
+                End If
+            Next
+            If existingField >= 0 Then
+                Dim nestedInitializer As String
+                If MergeSimpleCMemberDesignatorInitializers( _
+                    fieldValues(existingField), fieldInitializer, _
+                    nestedInitializer, depth + 1) = 0 Then Return 0
+                fieldValues(existingField) = nestedInitializer
+            Else
+                If fieldCount >= MAX_TYPE_WORDS Then Return 0
+                fieldNames(fieldCount) = fieldName
+                fieldValues(fieldCount) = fieldInitializer
+                fieldCount += 1
+            End If
+        Next
+    Next
+
+    If fieldCount = 0 Then Return 0
+    mergedText = "{ "
+    For fieldIndex As Long = 0 To fieldCount - 1
+        If fieldIndex > 0 Then mergedText &= ", "
+        mergedText &= "." & fieldNames(fieldIndex) & " = " & _
+            fieldValues(fieldIndex)
+    Next
+    mergedText &= " }"
     Return -1
 End Function
 
@@ -374,16 +722,6 @@ Private Function SimpleInitializerMayHaveSideEffects( _
     Return 0
 End Function
 
-Declare Function TranslateSimpleRecordInitializer( _
-    ByRef translation As C2fbTranslationContext, _
-    ByRef catalog As C2fbProjectCatalog, _
-    ByVal initializerText As String, ByVal freeBasicType As String, _
-    ByRef translatedValue As String, ByRef context As SimpleBodyContext, _
-    callableNames() As String, ByVal callableCount As Long, _
-    parameterNames() As String, parameterAliases() As String, _
-    parameterTypes() As String, ByVal parameterCount As Long _
-) As Long
-
 Private Function TranslateSimpleRecordArrayInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -394,7 +732,8 @@ Private Function TranslateSimpleRecordArrayInitializer( _
     ByRef context As SimpleBodyContext, _
     callableNames() As String, ByVal callableCount As Long, _
     parameterNames() As String, parameterAliases() As String, _
-    parameterTypes() As String, ByVal parameterCount As Long _
+    parameterTypes() As String, ByVal parameterCount As Long, _
+    ByVal requireConstant As Long = 0 _
 ) As Long
     translatedValue = ""
     Dim arrayCount As Long
@@ -486,7 +825,8 @@ Private Function TranslateSimpleRecordArrayInitializer( _
                 If TranslateSimpleRecordInitializer( _
                     translation, catalog, "{}", elementType, elementValue, _
                     context, callableNames(), callableCount, parameterNames(), _
-                    parameterAliases(), parameterTypes(), parameterCount) = 0 Then _
+                    parameterAliases(), parameterTypes(), parameterCount, _
+                    requireConstant) = 0 Then _
                     Return 0
             ElseIf InStr(elementType, " Ptr") <> 0 OrElse _
                    IsCBodyCallbackTypeInContext(translation, elementType) <> 0 Then
@@ -499,7 +839,7 @@ Private Function TranslateSimpleRecordArrayInitializer( _
                 translation, catalog, values(valueIndex), elementType, _
                 elementValue, context, callableNames(), callableCount, _
                 parameterNames(), parameterAliases(), parameterTypes(), _
-                parameterCount) = 0 Then Return 0
+                parameterCount, requireConstant) = 0 Then Return 0
         Else
             Dim hasBoolean As Long
             Dim hasFunctionCall As Long
@@ -507,7 +847,8 @@ Private Function TranslateSimpleRecordArrayInitializer( _
                 translation, catalog, values(valueIndex), elementValue, _
                 hasBoolean, hasFunctionCall, callableNames(), callableCount, _
                 parameterNames(), parameterAliases(), parameterTypes(), _
-                parameterCount, elementType) = 0 OrElse hasFunctionCall <> 0 Then
+                parameterCount, elementType, -1, requireConstant) = 0 OrElse _
+               hasFunctionCall <> 0 Then
                 RecordSimpleBodyFailure( _
                     context, "unsupported-record-array-element", _
                     "unsupported array initializer element for " & fieldLabel & ": " & _
@@ -522,6 +863,104 @@ Private Function TranslateSimpleRecordArrayInitializer( _
     Return -1
 End Function
 
+Private Function TranslateSimpleNestedRecordValue( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal initializerText As String, ByVal freeBasicType As String, _
+    ByRef translatedValue As String, _
+    ByRef context As SimpleBodyContext, _
+    callableNames() As String, ByVal callableCount As Long, _
+    parameterNames() As String, parameterAliases() As String, _
+    parameterTypes() As String, ByVal parameterCount As Long, _
+    ByVal requireConstant As Long _
+) As Long
+    initializerText = Trim(initializerText)
+    If Left(initializerText, 1) = "{" Then _
+        Return TranslateSimpleRecordInitializer( _
+            translation, catalog, initializerText, freeBasicType, _
+            translatedValue, context, callableNames(), callableCount, _
+            parameterNames(), parameterAliases(), parameterTypes(), _
+            parameterCount, requireConstant)
+
+    ' A nested C record may be copied from an existing object. Restrict this
+    ' case to an identifier so a Basic constructor cannot reorder side effects.
+    If IsIdentifierToken(initializerText) = 0 Then Return 0
+    Dim hasBoolean As Long
+    Dim hasFunctionCall As Long
+    If TranslateSimpleExpression( _
+        translation, catalog, initializerText, translatedValue, _
+        hasBoolean, hasFunctionCall, callableNames(), callableCount, _
+        parameterNames(), parameterAliases(), parameterTypes(), _
+        parameterCount, freeBasicType, -1, requireConstant) = 0 OrElse _
+       hasFunctionCall <> 0 Then
+        Return 0
+    End If
+    Return -1
+End Function
+
+Private Function AppendSimpleBodyUnionInitializerHelper( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByRef context As SimpleBodyContext, _
+    ByVal unionType As String, ByVal fieldType As String, _
+    ByVal freeBasicFieldName As String, ByRef helperName As String _
+) As Long
+    helperName = ""
+    If unionType = "" OrElse fieldType = "" OrElse _
+       freeBasicFieldName = "" OrElse IsIdentifierToken(freeBasicFieldName) = 0 OrElse _
+       Left(unionType, 6) = "Const " Then Return 0
+
+    Dim serial As Long = translation.body.generatedAggregateInitializerSerial
+    Do
+        helperName = "c2fb_union_initializer_" & Trim(Str(serial))
+        serial += 1
+    Loop While CBodyProcedureIndex(translation, helperName) >= 0 OrElse _
+               CBodyExternalObjectIndex(translation, helperName) >= 0
+    translation.body.generatedAggregateInitializerSerial = serial
+
+    context.generatedAggregateInitializerHelpers &= _
+        "' C union initialization selects this member explicitly" & Chr(10) & _
+        "Private Function " & helperName & _
+        " (ByVal c2fb_union_value As " & fieldType & ") As " & unionType & Chr(10) & _
+        "    Dim c2fb_union_result As " & unionType & Chr(10) & _
+        "    c2fb_union_result." & freeBasicFieldName & _
+        " = c2fb_union_value" & Chr(10) & _
+        "    Return c2fb_union_result" & Chr(10) & _
+        "End Function" & Chr(10) & Chr(10)
+    Return -1
+End Function
+
+Private Function AppendSimpleBodyRecordInitializerHelper( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByRef context As SimpleBodyContext, _
+    ByVal recordType As String, _
+    ByVal parameters As String, ByVal assignments As String, _
+    ByRef helperName As String _
+) As Long
+    helperName = ""
+    If recordType = "" OrElse parameters = "" OrElse assignments = "" OrElse _
+       Left(recordType, 6) = "Const " Then Return 0
+
+    Dim serial As Long = translation.body.generatedAggregateInitializerSerial
+    Do
+        helperName = "c2fb_record_initializer_" & Trim(Str(serial))
+        serial += 1
+    Loop While CBodyProcedureIndex(translation, helperName) >= 0 OrElse _
+               CBodyExternalObjectIndex(translation, helperName) >= 0
+    translation.body.generatedAggregateInitializerSerial = serial
+
+    context.generatedAggregateInitializerHelpers &= _
+        "' C record initialization assigns union members through their active view" & Chr(10) & _
+        "Private Function " & helperName & " (" & parameters & _
+        ") As " & recordType & Chr(10) & _
+        "    Dim c2fb_record_result As " & recordType & Chr(10) & _
+        assignments & _
+        "    Return c2fb_record_result" & Chr(10) & _
+        "End Function" & Chr(10) & Chr(10)
+    Return -1
+End Function
+
 Private Function TranslateSimpleRecordInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -531,7 +970,8 @@ Private Function TranslateSimpleRecordInitializer( _
     ByRef context As SimpleBodyContext, _
     callableNames() As String, ByVal callableCount As Long, _
     parameterNames() As String, parameterAliases() As String, _
-    parameterTypes() As String, ByVal parameterCount As Long _
+    parameterTypes() As String, ByVal parameterCount As Long, _
+    ByVal requireConstant As Long = 0 _
 ) As Long
     translatedValue = ""
     initializerText = Trim(initializerText)
@@ -628,14 +1068,21 @@ Private Function TranslateSimpleRecordInitializer( _
             previousFieldOrdinal = fieldOrdinal
             Dim fieldIndex As Long = sourceFieldIndexes(fieldOrdinal)
             If designatedFields(fieldIndex) <> 0 Then
-                RecordSimpleBodyFailure( _
-                    context, "duplicate-record-initializer-field", _
-                    "record field initialized more than once: " & sourceRecord & "." & _
-                    translation.body.recordFields(fieldIndex).name)
-                Return 0
+                Dim mergedInitializer As String
+                If MergeSimpleCMemberDesignatorInitializers( _
+                    designatedValues(fieldIndex), fieldInitializer, _
+                    mergedInitializer) = 0 Then
+                    RecordSimpleBodyFailure( _
+                        context, "duplicate-record-initializer-field", _
+                        "record field initialized more than once: " & sourceRecord & "." & _
+                        translation.body.recordFields(fieldIndex).name)
+                    Return 0
+                End If
+                designatedValues(fieldIndex) = mergedInitializer
+            Else
+                designatedValues(fieldIndex) = fieldInitializer
+                designatedFields(fieldIndex) = -1
             End If
-            designatedValues(fieldIndex) = fieldInitializer
-            designatedFields(fieldIndex) = -1
         Next
         If hasInitializerReordering <> 0 Then
             For cField As Long = 0 To translation.body.recordFieldCount - 1
@@ -654,6 +1101,11 @@ Private Function TranslateSimpleRecordInitializer( _
 
     Dim fieldCount As Long = 0
     Dim resultFields As String = ""
+    Dim recordHelperParameters As String = ""
+    Dim recordHelperArguments As String = ""
+    Dim recordHelperAssignments As String = ""
+    Dim hasUnionStorageField As Long = 0
+    Dim canUseRecordHelper As Long = -1
     If sourceRecord = "FuncDef.u" Then
         If LookupFbBodyField( _
             translation, catalog, freeBasicType, "pHash") < 0 OrElse _
@@ -665,13 +1117,6 @@ Private Function TranslateSimpleRecordInitializer( _
         Return -1
     End If
     If sourceRecordKind = C2FB_RECORD_UNION Then
-        If isDesignatedInitializer <> 0 Then
-            RecordSimpleBodyFailure( _
-                context, "unsupported-union-designator", _
-                "designated C union initializers are not supported: " & _
-                sourceRecord)
-            Return 0
-        End If
         If valueCount > 1 Then
             RecordSimpleBodyFailure( _
                 context, "unsupported-static-union-initializer", _
@@ -679,17 +1124,30 @@ Private Function TranslateSimpleRecordInitializer( _
             Return 0
         End If
         Dim firstField As Long = -1
+        Dim firstUnionMember As Long = -1
+        Dim selectedFieldCount As Long = 0
         For cField As Long = 0 To translation.body.recordFieldCount - 1
             If translation.body.recordFields(cField).ownerName = sourceRecord Then
-                If isDesignatedInitializer = 0 Then
+                If firstField < 0 Then
                     firstField = cField
-                    Exit For
-                ElseIf designatedFields(cField) <> 0 Then
-                    firstField = cField
+                    firstUnionMember = cField
+                End If
+                If isDesignatedInitializer <> 0 Then
+                    If designatedFields(cField) <> 0 Then
+                        firstField = cField
+                        selectedFieldCount += 1
+                    End If
+                ElseIf firstField = cField Then
                     Exit For
                 End If
             End If
         Next
+        If isDesignatedInitializer <> 0 AndAlso selectedFieldCount <> 1 Then
+            RecordSimpleBodyFailure( _
+                context, "unsupported-union-designator", _
+                "union initializer must select exactly one member: " & sourceRecord)
+            Return 0
+        End If
         If firstField < 0 OrElse _
            translation.body.recordFields(firstField).isArray <> 0 Then
             RecordSimpleBodyFailure( _
@@ -727,7 +1185,8 @@ Private Function TranslateSimpleRecordInitializer( _
                 If TranslateSimpleRecordInitializer( _
                     translation, catalog, "{}", fieldType, unionFieldValue, _
                     context, callableNames(), callableCount, parameterNames(), _
-                    parameterAliases(), parameterTypes(), parameterCount) = 0 Then _
+                    parameterAliases(), parameterTypes(), parameterCount, _
+                    requireConstant) = 0 Then _
                     Return 0
             ElseIf InStr(fieldType, " Ptr") <> 0 OrElse _
                    IsCBodyCallbackTypeInContext(translation, fieldType) <> 0 Then
@@ -736,10 +1195,11 @@ Private Function TranslateSimpleRecordInitializer( _
                 unionFieldValue = "Cast(" & fieldType & ", 0)"
             End If
         ElseIf nestedRecord <> "" Then
-            If TranslateSimpleRecordInitializer( _
+            If TranslateSimpleNestedRecordValue( _
                 translation, catalog, unionInitializer, fieldType, unionFieldValue, _
                 context, callableNames(), callableCount, parameterNames(), _
-                parameterAliases(), parameterTypes(), parameterCount) = 0 Then _
+                parameterAliases(), parameterTypes(), parameterCount, _
+                requireConstant) = 0 Then _
                 Return 0
         Else
             Dim hasBoolean As Long
@@ -748,14 +1208,39 @@ Private Function TranslateSimpleRecordInitializer( _
                 translation, catalog, unionInitializer, unionFieldValue, hasBoolean, _
                 hasFunctionCall, callableNames(), callableCount, _
                 parameterNames(), parameterAliases(), parameterTypes(), _
-                parameterCount, fieldType) = 0 OrElse hasFunctionCall <> 0 Then _
+                parameterCount, fieldType, -1, requireConstant) = 0 OrElse _
+               hasFunctionCall <> 0 Then _
                 Return 0
         End If
         If ConvertSimpleRecordInitializerFieldStorage( _
             translation, catalog, sourceRecord, fieldName, fieldType, _
             fbFieldIndex, unionFieldValue, context) = 0 Then Return 0
-        translatedValue = "Type<" & freeBasicType & ">( " & _
-            unionFieldValue & " )"
+        If isDesignatedInitializer <> 0 Then
+            If requireConstant <> 0 Then
+                If firstField <> firstUnionMember Then
+                    RecordSimpleBodyFailure( _
+                        context, "unsupported-static-designated-union-initializer", _
+                        "static C union initializer selects a non-first member: " & _
+                        sourceRecord)
+                    Return 0
+                End If
+                translatedValue = "Type<" & freeBasicType & ">( " & _
+                    unionFieldValue & " )"
+                Return -1
+            End If
+            Dim helperName As String
+            Dim unionStorageType As String = NormalizeFbBodyType( _
+                catalog, catalog.bodyFields(fbFieldIndex).typeName)
+            If unionStorageType = "" Then Return 0
+            If AppendSimpleBodyUnionInitializerHelper( _
+                translation, catalog, context, freeBasicType, unionStorageType, _
+                catalog.bodyFields(fbFieldIndex).name, helperName) = 0 Then _
+                Return 0
+            translatedValue = helperName & "(" & unionFieldValue & ")"
+        Else
+            translatedValue = "Type<" & freeBasicType & ">( " & _
+                unionFieldValue & " )"
+        End If
         Return -1
     End If
     For cField As Long = 0 To translation.body.recordFieldCount - 1
@@ -825,6 +1310,7 @@ Private Function TranslateSimpleRecordInitializer( _
             hasFieldInitializer = -1
         End If
         If isArrayField <> 0 Then
+            canUseRecordHelper = 0
             Dim arrayInitializer As String
             If hasFieldInitializer <> 0 Then arrayInitializer = fieldInitializer
             If TranslateSimpleRecordArrayInitializer( _
@@ -833,7 +1319,7 @@ Private Function TranslateSimpleRecordInitializer( _
                 sourceRecord & "." & translation.body.recordFields(cField).name, _
                 fieldValue, context, callableNames(), callableCount, _
                 parameterNames(), parameterAliases(), parameterTypes(), _
-                parameterCount) = 0 Then Return 0
+                parameterCount, requireConstant) = 0 Then Return 0
         ElseIf hasFieldInitializer <> 0 Then
             If isFuncDefUnionStorage <> 0 Then
                 Dim funcDefUnionInitializer As String = Trim(fieldInitializer)
@@ -841,22 +1327,33 @@ Private Function TranslateSimpleRecordInitializer( _
                    funcDefUnionInitializer <> "{}" Then Return 0
                 fieldValue = "Cast(Any Ptr, 0)"
             ElseIf nestedRecord <> "" Then
-                If TranslateSimpleRecordInitializer(translation, catalog, fieldInitializer, fieldType, fieldValue, context, _
+                If TranslateSimpleNestedRecordValue(translation, catalog, _
+                    fieldInitializer, fieldType, fieldValue, context, _
                     callableNames(), callableCount, parameterNames(), parameterAliases(), _
-                    parameterTypes(), parameterCount) = 0 Then
+                    parameterTypes(), parameterCount, requireConstant) = 0 Then
                     RecordSimpleBodyFailure( _
-                        context, "unsupported-nested-static-record-initializer", _
-                        "unsupported nested static record initializer " & sourceRecord & "." & _
+                        context, "unsupported-nested-record-value-initializer", _
+                        "unsupported nested record initializer " & sourceRecord & "." & _
                         translation.body.recordFields(cField).name & " from " & fieldInitializer)
                     Return 0
                 End If
+			ElseIf IsCBodyCallbackTypeInContext(translation, fieldType) <> 0 Then
+				If TranslateCBodyCallbackInitializer( _
+				    translation, catalog, fieldInitializer, fieldType, fieldValue) = 0 Then
+					RecordSimpleBodyFailure( _
+					    context, "unsupported-static-record-callback-initializer", _
+					    "unsupported static callback initializer " & sourceRecord & "." & _
+					    translation.body.recordFields(cField).name & " from " & fieldInitializer)
+					Return 0
+				End If
             Else
                 Dim hasBoolean As Long
                 Dim hasFunctionCall As Long
                 If TranslateSimpleExpression(translation, catalog, _
                                              fieldInitializer, fieldValue, hasBoolean, hasFunctionCall, _
                                              callableNames(), callableCount, parameterNames(), _
-                                             parameterAliases(), parameterTypes(), parameterCount, fieldType) = 0 OrElse _
+                                             parameterAliases(), parameterTypes(), parameterCount, _
+                                             fieldType, -1, requireConstant) = 0 OrElse _
                    hasFunctionCall <> 0 Then
                     RecordSimpleBodyFailure( _
                         context, "unsupported-static-record-initializer", _
@@ -869,7 +1366,7 @@ Private Function TranslateSimpleRecordInitializer( _
             If nestedRecord <> "" Then
                 If TranslateSimpleRecordInitializer(translation, catalog, "{}", fieldType, fieldValue, context, _
                     callableNames(), callableCount, parameterNames(), parameterAliases(), _
-                    parameterTypes(), parameterCount) = 0 Then Return 0
+                    parameterTypes(), parameterCount, requireConstant) = 0 Then Return 0
             ElseIf IsCBodyCallbackTypeInContext(translation, fieldType) <> 0 Then
                 fieldValue = "CPtr(" & fieldType & ", 0)"
             Else
@@ -882,6 +1379,7 @@ Private Function TranslateSimpleRecordInitializer( _
             ' C aggregate initialization omits this unnamed padding member.
             If resultFields <> "" Then resultFields &= ", "
             resultFields &= "Cast(u16, 0)"
+            canUseRecordHelper = 0
         End If
         If ConvertSimpleRecordInitializerFieldStorage( _
             translation, catalog, sourceRecord, _
@@ -889,17 +1387,55 @@ Private Function TranslateSimpleRecordInitializer( _
             fbFieldIndex, fieldValue, context) = 0 Then Return 0
         If resultFields <> "" Then resultFields &= ", "
         resultFields &= fieldValue
+        Dim freeBasicFieldName As String = _
+            catalog.bodyFields(fbFieldIndex).name
+        If freeBasicFieldName = "" OrElse _
+           IsIdentifierToken(freeBasicFieldName) = 0 Then
+            canUseRecordHelper = 0
+        Else
+            Dim helperArgumentName As String = _
+                "c2fb_record_value_" & Trim(Str(fieldCount))
+            If recordHelperParameters <> "" Then
+                recordHelperParameters &= ", "
+                recordHelperArguments &= ", "
+            End If
+            recordHelperParameters &= "ByVal " & helperArgumentName & _
+                " As " & fieldType
+            recordHelperArguments &= fieldValue
+            recordHelperAssignments &= _
+                "    c2fb_record_result." & freeBasicFieldName & _
+                " = " & helperArgumentName & Chr(10)
+            If catalog.bodyFields(fbFieldIndex).isUnionMember <> 0 Then _
+                hasUnionStorageField = -1
+        End If
         fieldCount += 1
     Next
-    If fieldCount = 0 OrElse valueCount > fieldCount Then
+    Dim initializerFieldCount As Long = valueCount
+    If isDesignatedInitializer <> 0 Then
+        initializerFieldCount = 0
+        For cField As Long = 0 To translation.body.recordFieldCount - 1
+            If designatedFields(cField) <> 0 Then initializerFieldCount += 1
+        Next
+    End If
+    If fieldCount = 0 OrElse initializerFieldCount > fieldCount Then
         RecordSimpleBodyFailure( _
             context, "static-record-field-count-mismatch", _
             "static record field count mismatch " & sourceRecord & _
             ": source fields=" & Trim(Str(fieldCount)) & _
-            ", initializer values=" & Trim(Str(valueCount)))
+            ", initializer values=" & Trim(Str(initializerFieldCount)))
         Return 0
     End If
-    translatedValue = "Type<" & freeBasicType & ">( " & resultFields & " )"
+    If hasUnionStorageField <> 0 AndAlso canUseRecordHelper <> 0 AndAlso _
+       requireConstant = 0 Then
+        Dim helperName As String
+        If AppendSimpleBodyRecordInitializerHelper( _
+            translation, catalog, context, freeBasicType, _
+            recordHelperParameters, recordHelperAssignments, helperName) = 0 Then _
+            Return 0
+        translatedValue = helperName & "(" & recordHelperArguments & ")"
+    Else
+        translatedValue = "Type<" & freeBasicType & ">( " & resultFields & " )"
+    End If
     Return -1
 End Function
 
@@ -921,7 +1457,23 @@ Private Function NormalizeCInlineRecordArrayDeclaration( _
         recordKeyword = "union "
         recordKind = C2FB_RECORD_UNION
     End If
-    If recordStart = 0 Then Return declarationText
+    If recordStart = 0 Then
+        Dim aliasStart As Long = 1
+        SkipCSpaces(declarationText, aliasStart)
+        Dim aliasEnd As Long = aliasStart
+        While aliasEnd <= Len(declarationText) AndAlso _
+              IsIdentifierPart(Asc(declarationText, aliasEnd)) <> 0
+            aliasEnd += 1
+        Wend
+        If aliasEnd > aliasStart Then
+            Dim aliasType As String = SimpleBodyLocalRecordType( _
+                context, Mid(declarationText, aliasStart, aliasEnd - aliasStart))
+            Dim objectDeclaration As String = Trim(Mid(declarationText, aliasEnd))
+            If aliasType <> "" AndAlso objectDeclaration <> "" Then _
+                Return aliasType & " " & objectDeclaration
+        End If
+        Return declarationText
+    End If
     Dim tagStart As Long = recordStart + Len(recordKeyword)
     Dim tagEnd As Long = tagStart
     While tagEnd <= Len(declarationText) AndAlso _
@@ -1029,12 +1581,53 @@ End Function
 Private Function IsSupportedSimpleStaticPointerInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByVal sourceExpression As String, _
-    parameterNames() As String, ByVal symbolCount As Long _
+    parameterNames() As String, ByVal symbolCount As Long, _
+    ByVal variableType As String _
 ) As Long
     sourceExpression = GenericMacroStripOuterParentheses(Trim(sourceExpression))
     If sourceExpression = "" Then Return 0
     If GenericNullPointerConstantText(sourceExpression) <> 0 Then Return -1
     If Left(sourceExpression, 1) = Chr(34) Then Return -1
+
+    Dim targetPointeeType As String = SimplePointeeType(variableType)
+    If targetPointeeType = "Byte" OrElse targetPointeeType = "UByte" OrElse _
+       targetPointeeType = "ZString" OrElse targetPointeeType = "Const ZString" OrElse _
+       targetPointeeType = "c2fb_c_char" OrElse _
+       targetPointeeType = "c2fb_c_uchar" Then
+        Dim stringPosition As Long = InStr(sourceExpression, Chr(34))
+        If stringPosition > 0 Then
+            Dim prefix As String = Trim(Left(sourceExpression, stringPosition - 1))
+            Dim stringValues As String
+            Dim stringByteCount As Long
+            If Left(prefix, 1) = "(" AndAlso Right(prefix, 1) = ")" AndAlso _
+               ReadSimpleStaticStringArray( _
+                   Mid(sourceExpression, stringPosition), _
+                   stringValues, stringByteCount) <> 0 Then
+                Dim typeText As String = Trim( _
+                    Mid(prefix, 2, Len(prefix) - 2))
+                Dim typeTokens() As String
+                Dim typeTokenCount As Long
+                TokenizeCDeclaration(typeText, typeTokens(), typeTokenCount)
+                Dim sawCharacterType As Long = 0
+                Dim castPointerCount As Long = 0
+                Dim validCastType As Long = CInt(typeTokenCount > 0)
+                For typeIndex As Long = 0 To typeTokenCount - 1
+                    Select Case typeTokens(typeIndex)
+                    Case "char"
+                        sawCharacterType = -1
+                    Case "signed", "unsigned", "const", "volatile", _
+                         "restrict", "__restrict", "__restrict__"
+                    Case "*"
+                        castPointerCount += 1
+                    Case Else
+                        validCastType = 0
+                    End Select
+                Next
+                If validCastType <> 0 AndAlso sawCharacterType <> 0 AndAlso _
+                   castPointerCount = 1 Then Return -1
+            End If
+        End If
+    End If
 
     Dim isAddress As Long = 0
     If Left(sourceExpression, 1) = "&" Then
@@ -1084,6 +1677,99 @@ Private Function IsSupportedSimpleStaticCallbackInitializer( _
     Return 0
 End Function
 
+Private Function ParseSimpleArrayDesignator( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal initializerText As String, _
+    ByRef elementIndex As Long, _
+    ByRef elementValue As String _
+) As Long
+    initializerText = Trim(initializerText)
+    elementValue = initializerText
+    If Left(initializerText, 1) <> "[" Then Return 0
+
+    Dim bracketEnd As Long = 1
+    If ScanSimpleExpressionGroup( _
+        initializerText, bracketEnd, Asc("["), Asc("]")) = 0 Then Return 0
+    Dim indexExpression As String = Trim(Mid( _
+        initializerText, 2, bracketEnd - 3))
+    Dim position As Long = bracketEnd
+    SkipCSpaces(initializerText, position)
+    If position > Len(initializerText) OrElse _
+       Asc(initializerText, position) <> Asc("=") Then Return 0
+    position += 1
+    elementValue = Trim(Mid(initializerText, position))
+    If indexExpression = "" OrElse elementValue = "" Then Return 0
+
+    If EvaluateSimpleArrayBound( _
+           indexExpression, elementIndex, MAX_SIMPLE_ARRAY_COUNT, -1) = 0 AndAlso _
+       EvaluateGenericBodyArrayBound( _
+           translation, indexExpression, elementIndex, _
+           MAX_SIMPLE_ARRAY_COUNT) = 0 Then Return 0
+    If elementIndex < 0 OrElse _
+       elementIndex >= MAX_SIMPLE_ARRAY_COUNT Then Return 0
+    Return -1
+End Function
+
+Private Function NormalizeGenericBoundLocalSizeof( _
+    ByVal sourceExpression As String, _
+    locals() As SimpleLocalVariable, ByVal localCount As Long, _
+    ByRef normalizedExpression As String _
+) As Long
+    normalizedExpression = ""
+    Dim position As Long = 1
+    While position <= Len(sourceExpression)
+        If Mid(sourceExpression, position, Len("sizeof")) = "sizeof" AndAlso _
+           (position = 1 OrElse _
+            IsIdentifierPart(Asc(sourceExpression, position - 1)) = 0) Then
+            Dim operandPosition As Long = position + Len("sizeof")
+            If operandPosition <= Len(sourceExpression) AndAlso _
+               IsIdentifierPart(Asc(sourceExpression, operandPosition)) <> 0 Then
+                normalizedExpression &= Mid(sourceExpression, position, 1)
+                position += 1
+                Continue While
+            End If
+            SkipCSpaces(sourceExpression, operandPosition)
+            Dim operandName As String
+            Dim operandEnd As Long = operandPosition
+            If operandPosition <= Len(sourceExpression) AndAlso _
+               Asc(sourceExpression, operandPosition) = Asc("(") Then
+                If ScanSimpleExpressionGroup( _
+                    sourceExpression, operandEnd, Asc("("), Asc(")")) <> 0 Then
+                    Dim operandText As String = Trim(Mid( _
+                        sourceExpression, operandPosition + 1, _
+                        operandEnd - operandPosition - 2))
+                    If IsIdentifierToken(operandText) <> 0 Then _
+                        operandName = operandText
+                End If
+            ElseIf operandPosition <= Len(sourceExpression) AndAlso _
+                   IsIdentifierStart(Asc(sourceExpression, operandPosition)) <> 0 Then
+                operandEnd += 1
+                While operandEnd <= Len(sourceExpression) AndAlso _
+                      IsIdentifierPart(Asc(sourceExpression, operandEnd)) <> 0
+                    operandEnd += 1
+                Wend
+                operandName = Mid( _
+                    sourceExpression, operandPosition, _
+                    operandEnd - operandPosition)
+            End If
+            If operandName <> "" Then
+                For localIndex As Long = localCount - 1 To 0 Step -1
+                    If locals(localIndex).name <> operandName OrElse _
+                       locals(localIndex).hasKnownSize = 0 Then Continue For
+                    normalizedExpression &= Trim(Str( _
+                        locals(localIndex).sizeofBytes))
+                    position = operandEnd
+                    Exit For
+                Next
+                If position = operandEnd Then Continue While
+            End If
+        End If
+        normalizedExpression &= Mid(sourceExpression, position, 1)
+        position += 1
+    Wend
+    Return -1
+End Function
+
 Private Function TranslateSingleDeclarationStatementWithTokens( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -1110,7 +1796,9 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
         translation, catalog, context, declarationText)
 
     Dim tokens() As String
-    If sourceTokenCount < 2 OrElse sourceTokenCount >= MAX_TYPE_WORDS Then Return 0
+    ' Array bounds and initializers can use the full declaration token limit.
+    If sourceTokenCount < 2 OrElse _
+       sourceTokenCount >= MAX_C_DECLARATION_TOKENS Then Return 0
     ReDim tokens(0 To sourceTokenCount - 1)
     For tokenIndex As Long = 0 To sourceTokenCount - 1
         tokens(tokenIndex) = sourceTokens(tokenIndex)
@@ -1173,6 +1861,10 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
         locals(localCount).name = callbackName
         locals(localCount).typeName = callbackType
         locals(localCount).isConst = 0
+        locals(localCount).sizeofBytes = CLng(SizeOf(Any Ptr))
+        locals(localCount).hasKnownSize = -1
+        locals(localCount).isIntegerConstant = 0
+        locals(localCount).integerValue = 0
         localCount += 1
         parameterNames(symbolCount) = callbackName
         parameterAliases(symbolCount) = "local" & Trim(Str(context.localSerial))
@@ -1211,6 +1903,7 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
     Dim arrayDimensionCounts() As Long
     Dim isSymbolicArrayBound As Long = 0
     Dim isDynamicLocalArray As Long = 0
+    Dim localArrayTypedefAliasIndex As Long = -1
     Dim dynamicBoundName As String
     Dim dynamicBoundExpression As String
     Dim dynamicBoundPrelude As String
@@ -1267,6 +1960,17 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
 
         If arrayDimensionCount > 1 Then
             If isConstLocal <> 0 AndAlso isStaticLocal = 0 Then Return 0
+            Dim canInferStringRowCount As Long = CInt( _
+                arrayDimensionCount = 2 AndAlso isStaticLocal <> 0 AndAlso _
+                equalsPosition <> 0)
+            Dim hasCharElementType As Long = 0
+            For typeToken As Long = 0 To openingBracket - 1
+                If tokens(typeToken) = "char" Then hasCharElementType = -1
+                If tokens(typeToken) = "*" Then canInferStringRowCount = 0
+            Next
+            canInferStringRowCount = CInt( _
+                canInferStringRowCount <> 0 AndAlso hasCharElementType <> 0)
+            Dim hasUnsizedLeadingDimension As Long = 0
             ReDim arrayDimensionBounds(0 To arrayDimensionCount - 1)
             ReDim arrayDimensionCounts(0 To arrayDimensionCount - 1)
             Dim dimensionTextPosition As Long = bracketPosition
@@ -1281,9 +1985,17 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
                 Dim dimensionText As String = Trim(Mid( _
                     declarationText, dimensionTextPosition + 1, _
                     dimensionEndPosition - dimensionTextPosition - 2))
+                Dim normalizedDimensionText As String
+                NormalizeGenericBoundLocalSizeof( _
+                    dimensionText, locals(), localCount, normalizedDimensionText)
+                dimensionText = normalizedDimensionText
                 Dim dimensionCount As Long
-                If dimensionText = "" Then Return 0
-                If EvaluateSimpleArrayBound( _
+                If dimensionText = "" Then
+                    If dimensionIndex <> 0 OrElse canInferStringRowCount = 0 Then Return 0
+                    hasUnsizedLeadingDimension = -1
+                    arrayDimensionCounts(dimensionIndex) = 0
+                    arrayDimensionBounds(dimensionIndex) = ""
+                ElseIf EvaluateSimpleArrayBound( _
                     dimensionText, dimensionCount, MAX_GENERIC_ARRAY_COUNT) <> 0 OrElse _
                    EvaluateGenericBodyArrayBound( _
                        translation, dimensionText, dimensionCount, _
@@ -1346,6 +2058,30 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
                 arrayBound = dynamicBoundName
                 isSymbolicArrayBound = -1
                 isDynamicLocalArray = -1
+            ElseIf hasUnsizedLeadingDimension <> 0 Then
+                If arrayDimensionCounts(1) < 1 Then Return 0
+                Dim initializerText As String = Trim(Mid( _
+                    statementText, equalsPosition + 1))
+                Dim stringRowCount As Long
+                Dim stringMatrixByteCount As Long
+                If ReadSimpleStaticStringMatrix( _
+                    initializerText, arrayDimensionCounts(1), _
+                    staticStringValues, stringRowCount, _
+                    stringMatrixByteCount) = 0 Then
+                    RecordSimpleBodyFailure( _
+                        context, "unsupported-static-string-matrix", _
+                        "unsupported static string-matrix initializer: " & _
+                        Left(statementText, 160))
+                    Return 0
+                End If
+                arrayDimensionCounts(0) = stringRowCount
+                arrayDimensionBounds(0) = Trim(Str(stringRowCount)) & "ULL"
+                arrayDimensions = arrayDimensionBounds(0) & "," & _
+                                 arrayDimensionBounds(1)
+                arrayCount = stringMatrixByteCount
+                arrayBound = Trim(Str(arrayCount)) & "ULL"
+                staticStringByteCount = arrayCount
+                staticStringInitializer = -1
             ElseIf totalArrayCount <= MAX_SIMPLE_ARRAY_COUNT Then
                 arrayCount = CLng(totalArrayCount)
                 arrayBound = Trim(Str(arrayCount)) & "ULL"
@@ -1376,11 +2112,31 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
                     If Right(initialText, 1) = "," Then _
                         initialText = RTrim(Left(initialText, Len(initialText) - 1))
                     If SplitSimpleCList(initialText, initialValues(), initialValueCount) = 0 Then Return 0
-                    arrayCount = initialValueCount
+                    Dim nextElementIndex As Long = 0
+                    Dim maximumElementIndex As Long = -1
+                    For valueIndex As Long = 0 To initialValueCount - 1
+                        Dim currentElementIndex As Long = nextElementIndex
+                        Dim elementValue As String = Trim(initialValues(valueIndex))
+                        If Left(elementValue, 1) = "[" Then
+                            Dim designatedValue As String
+                            If ParseSimpleArrayDesignator( _
+                                translation, elementValue, currentElementIndex, _
+                                designatedValue) = 0 Then Return 0
+                        End If
+                        If currentElementIndex > maximumElementIndex Then _
+                            maximumElementIndex = currentElementIndex
+                        nextElementIndex = currentElementIndex + 1
+                    Next
+                    arrayCount = maximumElementIndex + 1
+                    If arrayCount <= 0 Then Return 0
                 Else
                     Return 0
                 End If
             Else
+                Dim normalizedCountText As String
+                NormalizeGenericBoundLocalSizeof( _
+                    countText, locals(), localCount, normalizedCountText)
+                countText = normalizedCountText
                 If EvaluateSimpleArrayBound(countText, arrayCount) = 0 AndAlso _
                    EvaluateGenericBodyArrayBound( _
                        translation, countText, arrayCount) = 0 Then
@@ -1453,14 +2209,78 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
         End If
         If arrayDimensionCount = 1 Then arrayDimensions = arrayBound
     End If
+    Dim localArrayTypeName As String = ""
+    Dim localArrayTypeNameIsAmbiguous As Long = 0
+    For typeIndex As Long = 0 To nameIndex - 1
+        Select Case tokens(typeIndex)
+        Case "const"
+            isConstLocal = -1
+        Case "volatile", "restrict", "__restrict", "__restrict__", _
+             "static", "auto", "register"
+            Continue For
+        Case Else
+            If localArrayTypeName <> "" Then
+                localArrayTypeNameIsAmbiguous = -1
+                Exit For
+            End If
+            localArrayTypeName = tokens(typeIndex)
+        End Select
+    Next
+    If localArrayTypeNameIsAmbiguous = 0 AndAlso _
+       localArrayTypeName <> "" Then
+        localArrayTypedefAliasIndex = _
+            CBodyArrayTypeAliasIndexInContext( _
+                translation, localArrayTypeName)
+    End If
+    If localArrayTypedefAliasIndex >= 0 Then
+        With translation.body.aliases(localArrayTypedefAliasIndex)
+            If .arrayCount < 1 OrElse _
+               .arrayCount > MAX_SIMPLE_ARRAY_COUNT Then Return 0
+            If .isConst <> 0 Then isConstLocal = -1
+            If openingBracket >= 0 Then
+                If isSymbolicArrayBound <> 0 OrElse isDynamicLocalArray <> 0 OrElse _
+                   arrayRank <= 0 OrElse arrayRank >= MAX_GENERIC_ARRAY_RANK OrElse _
+                   arrayCount <= 0 OrElse _
+                   arrayCount > MAX_SIMPLE_ARRAY_COUNT \ .arrayCount Then Return 0
+                Dim priorArrayRank As Long = arrayRank
+                ReDim Preserve arrayDimensionBounds(0 To priorArrayRank)
+                ReDim Preserve arrayDimensionCounts(0 To priorArrayRank)
+                arrayDimensionBounds(priorArrayRank) = Trim(Str(.arrayCount)) & "ULL"
+                arrayDimensionCounts(priorArrayRank) = .arrayCount
+                arrayDimensions &= "," & arrayDimensionBounds(priorArrayRank)
+                arrayCount *= .arrayCount
+                arrayRank = priorArrayRank + 1
+            Else
+                arrayCount = .arrayCount
+                arrayRank = 1
+                arrayBound = Trim(Str(.arrayCount)) & "ULL"
+                arrayDimensions = arrayBound
+                ReDim arrayDimensionBounds(0 To 0)
+                ReDim arrayDimensionCounts(0 To 0)
+                arrayDimensionBounds(0) = arrayBound
+                arrayDimensionCounts(0) = .arrayCount
+            End If
+        End With
+    End If
     If nameIndex <= 0 OrElse IsIdentifierToken(tokens(nameIndex)) = 0 OrElse _
        IsTypeOrQualifierTokenInContext(translation, tokens(nameIndex)) <> 0 Then Return 0
     For i As Long = 0 To nameIndex - 1
         If tokens(i) = "," OrElse tokens(i) = "extern" Then Return 0
     Next
     Dim resolvedVariableType As C2fbResolvedTypeModel
-    ResolveC2fbTypeModel( _
-        translation, catalog, tokens(), 0, nameIndex - 1, resolvedVariableType)
+    If localArrayTypedefAliasIndex >= 0 Then
+        With translation.body.aliases(localArrayTypedefAliasIndex)
+            resolvedVariableType.status = C2FB_TYPE_RESOLUTION_RESOLVED
+            resolvedVariableType.freeBasicType = .arrayElementType
+            resolvedVariableType.pointerCount = 0
+            resolvedVariableType.isConst = CInt( _
+                .isConst <> 0 OrElse isConstLocal <> 0) * -1
+        End With
+    Else
+        ResolveC2fbTypeModel( _
+            translation, catalog, tokens(), 0, nameIndex - 1, _
+            resolvedVariableType)
+    End If
     If resolvedVariableType.status <> C2FB_TYPE_RESOLUTION_RESOLVED Then Return 0
     Dim variableType As String = resolvedVariableType.freeBasicType
     Dim pointerCount As Long = resolvedVariableType.pointerCount
@@ -1500,22 +2320,38 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
             sourceRecordType)
         Return 0
     End If
+    ' Generated aliases can exist without a usable layout. For SQLite's
+    ' stricter size-parity policy, also allow a complete catalog Type when
+    ' the C record is not on the fixed-layout whitelist.
+    If sourceRecordType <> "" AndAlso pointerCount = 0 AndAlso _
+       variableRecord <> "" AndAlso hasExplicitSourceRecordTypeMap = 0 AndAlso _
+       CBodyRecordSizeIsKnown( _
+           translation, catalog, variableRecord) = 0 AndAlso _
+       FbBodyRecordHasFieldModel(catalog, variableType) = 0 Then
+        RecordSimpleBodyFailure( _
+            context, "incomplete-local-record-layout", _
+            "C record has no complete FreeBASIC storage layout: " & _
+            sourceRecordType)
+        Return 0
+    End If
     If arrayRank > 1 AndAlso variableRecord <> "" AndAlso _
        pointerCount = 0 Then Return 0
     If isSymbolicArrayBound <> 0 AndAlso _
        (isStaticLocal <> 0 OrElse _
         (variableRecord <> "" AndAlso pointerCount = 0)) Then Return 0
     If variableRecord <> "" AndAlso pointerCount = 0 AndAlso _
-       openingBracket < 0 AndAlso _
+       openingBracket < 0 AndAlso localArrayTypedefAliasIndex < 0 AndAlso _
        CBodyRecordSizeIsKnown( _
            translation, catalog, variableRecord) <> 0 Then
         isRecordLocal = -1
-    ElseIf variableRecord <> "" AndAlso openingBracket >= 0 AndAlso _
+    ElseIf variableRecord <> "" AndAlso _
+       (openingBracket >= 0 OrElse localArrayTypedefAliasIndex >= 0) AndAlso _
        pointerCount = 0 Then
         If arrayCount = 0 OrElse CBodyRecordSizeIsKnown( _
             translation, catalog, variableRecord) = 0 Then Return 0
         isRecordArray = -1
-    ElseIf C2fbTypeRecognitionStatusInContext( _
+    ElseIf localArrayTypedefAliasIndex < 0 AndAlso _
+       C2fbTypeRecognitionStatusInContext( _
            translation, catalog, tokens(), 0, nameIndex - 1) <> _
            C2FB_TYPE_RESOLUTION_RESOLVED AndAlso _
            pointerCount = 0 Then
@@ -1556,6 +2392,7 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
            staticPointerElementType = "c2fb_c_uchar"))))
     Dim isStaticCallbackScalar As Long = CInt( _
         isStaticLocal <> 0 AndAlso openingBracket < 0 AndAlso _
+        localArrayTypedefAliasIndex < 0 AndAlso _
         (IsCBodyCallbackTypeInContext(translation, variableType) <> 0 OrElse _
          callbackResult.status = C2FB_CALLBACK_TYPE_CONVERTED))
     If isStaticLocal <> 0 AndAlso isRecordLocal <> 0 AndAlso _
@@ -1597,13 +2434,15 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
        equalsPosition > 0 AndAlso _
        IsSupportedSimpleStaticPointerInitializer( _
            translation, Trim(Mid(statementText, equalsPosition + 1)), _
-           parameterNames(), symbolCount) = 0 Then
+           parameterNames(), symbolCount, variableType) = 0 Then
         RecordSimpleBodyFailure( _
             context, "unsupported-static-local-initializer", _
             "unsupported static pointer initializer: " & Left(statementText, 160))
         Return 0
     End If
-    Dim isStaticScalar As Long = CInt(isStaticLocal <> 0 AndAlso openingBracket < 0)
+    Dim isStaticScalar As Long = CInt( _
+        isStaticLocal <> 0 AndAlso openingBracket < 0 AndAlso _
+        localArrayTypedefAliasIndex < 0)
     Dim variableName As String = tokens(nameIndex)
     Dim scopeStart As Long = context.scopeSymbols(context.scopeDepth - 1)
     For i As Long = scopeStart To symbolCount - 1
@@ -1616,7 +2455,8 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
     Dim initializerPrelude As String
     Dim initializerSymbolCount As Long = symbolCount
     Dim initializerHasSelfName As Long = 0
-    If equalsPosition > 0 AndAlso openingBracket < 0 Then
+    If equalsPosition > 0 AndAlso openingBracket < 0 AndAlso _
+       localArrayTypedefAliasIndex < 0 Then
         ' C makes the declared name visible inside its initializer. Expose a
         ' temporary typed alias so unevaluated forms such as sizeof(*p) parse.
         parameterNames(symbolCount) = variableName
@@ -1639,7 +2479,8 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
             If TranslateSimpleRecordInitializer(translation, catalog,  _
                 initializer, variableType, translatedInitializer, context, _
                 callableNames(), callableCount, parameterNames(), _
-                parameterAliases(), parameterTypes(), symbolCount) = 0 Then
+                parameterAliases(), parameterTypes(), symbolCount, _
+                CInt(isStaticLocal <> 0)) = 0 Then
                 If initializerHasSelfName <> 0 Then _
                     symbolCount = initializerSymbolCount
                 Return 0
@@ -1647,10 +2488,13 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
         ElseIf isStaticScalar <> 0 Then
             Dim hasBoolean As Long
             Dim hasFunctionCall As Long
+            Dim requiresFloatConstant As Long = CInt( _
+                SimpleArithmeticKind(catalog, variableType) > 4)
             If TranslateSimpleExpression(translation, catalog, _
                                          initializer, translatedInitializer, hasBoolean, hasFunctionCall, _
                                          callableNames(), callableCount, parameterNames(), parameterAliases(), _
-                                         parameterTypes(), symbolCount, variableType) = 0 OrElse _
+                                         parameterTypes(), symbolCount, variableType, 0, _
+                                         requiresFloatConstant) = 0 OrElse _
                hasFunctionCall <> 0 Then
                 If initializerHasSelfName <> 0 Then _
                     symbolCount = initializerSymbolCount
@@ -1671,9 +2515,43 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
         initializer = translatedInitializer
     End If
 
+    Dim localSizeofBytes As Long
+    Dim localHasKnownSize As Long = 0
+    Dim localSourceType As String
+    For typeTokenIndex As Long = 0 To nameIndex - 1
+        Select Case tokens(typeTokenIndex)
+        Case "auto", "extern", "register", "static", "typedef"
+            Continue For
+        End Select
+        If localSourceType <> "" Then localSourceType &= " "
+        localSourceType &= tokens(typeTokenIndex)
+    Next
+    Dim localElementBytes As Long
+    If localSourceType <> "" AndAlso _
+       GenericArrayBoundTypeSizeInContext( _
+           translation, localSourceType, localElementBytes) <> 0 Then
+        Dim localObjectCount As Long = 1
+        If arrayRank > 0 Then
+            If isDynamicLocalArray <> 0 OrElse arrayCount <= 0 Then
+                localObjectCount = 0
+            Else
+                localObjectCount = arrayCount
+            End If
+        End If
+        If localObjectCount > 0 AndAlso localElementBytes > 0 AndAlso _
+           localObjectCount <= MAX_GENERIC_ARRAY_COUNT \ localElementBytes Then
+            localSizeofBytes = localObjectCount * localElementBytes
+            localHasKnownSize = -1
+        End If
+    End If
+
     locals(localCount).name = variableName
     locals(localCount).typeName = variableType
     locals(localCount).isConst = isConst
+    locals(localCount).sizeofBytes = localSizeofBytes
+    locals(localCount).hasKnownSize = localHasKnownSize
+    locals(localCount).isIntegerConstant = 0
+    locals(localCount).integerValue = 0
     localCount += 1
     parameterNames(symbolCount) = variableName
     parameterAliases(symbolCount) = "local" & Trim(Str(context.localSerial))
@@ -1768,6 +2646,62 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
                         Return 0
                     End If
                 End If
+                If arrayRank = 1 Then
+                    Dim hasArrayDesignator As Long = 0
+                    For i As Long = 0 To valueCount - 1
+                        If Left(Trim(values(i)), 1) = "[" Then
+                            hasArrayDesignator = -1
+                            Exit For
+                        End If
+                    Next
+                    If hasArrayDesignator <> 0 Then
+                        Dim sourceValues() As String
+                        Dim sourceValueCount As Long = valueCount
+                        If sourceValueCount > 0 Then
+                            ReDim sourceValues(0 To sourceValueCount - 1)
+                            For i As Long = 0 To sourceValueCount - 1
+                                sourceValues(i) = values(i)
+                            Next
+                        End If
+                        ReDim values(0 To arrayCount - 1)
+                        Dim initializedElements() As Long
+                        ReDim initializedElements(0 To arrayCount - 1)
+                        Dim nextElementIndex As Long = 0
+                        For sourceIndex As Long = 0 To sourceValueCount - 1
+                            Dim currentElementIndex As Long = nextElementIndex
+                            Dim elementValue As String = Trim(sourceValues(sourceIndex))
+                            If Left(elementValue, 1) = "[" Then
+                                Dim designatedValue As String
+                                If ParseSimpleArrayDesignator( _
+                                    translation, elementValue, currentElementIndex, _
+                                    designatedValue) = 0 Then
+                                    RecordSimpleBodyFailure( _
+                                        context, "unsupported-static-array-designator", _
+                                        "unsupported static array designator: " & _
+                                        Left(elementValue, 120))
+                                    Return 0
+                                End If
+                                elementValue = designatedValue
+                            End If
+                            If currentElementIndex < 0 OrElse _
+                               currentElementIndex >= arrayCount OrElse _
+                               initializedElements(currentElementIndex) <> 0 Then
+                                RecordSimpleBodyFailure( _
+                                    context, "invalid-static-array-designator", _
+                                    "out-of-range or repeated static array index: " & _
+                                    Trim(Str(currentElementIndex)))
+                                Return 0
+                            End If
+                            values(currentElementIndex) = elementValue
+                            initializedElements(currentElementIndex) = -1
+                            nextElementIndex = currentElementIndex + 1
+                        Next
+                        For i As Long = 0 To arrayCount - 1
+                            If initializedElements(i) = 0 Then values(i) = ""
+                        Next
+                        valueCount = arrayCount
+                    End If
+                End If
                 For i As Long = 0 To valueCount - 1
                     Dim translatedValue As String
                     If Trim(values(i)) = "" Then
@@ -1785,10 +2719,13 @@ Private Function TranslateSingleDeclarationStatementWithTokens( _
                     Else
                         Dim hasBoolean As Long
                         Dim hasCall As Long
+                        Dim requiresFloatConstant As Long = CInt( _
+                            SimpleArithmeticKind(catalog, variableType) > 4)
                         If TranslateSimpleExpression(translation, catalog, _
                                                      values(i), translatedValue, hasBoolean, hasCall, _
                                                      callableNames(), callableCount, parameterNames(), _
-                                                     parameterAliases(), parameterTypes(), symbolCount) = 0 OrElse _
+                                                     parameterAliases(), parameterTypes(), symbolCount, _
+                                                     "", -1, requiresFloatConstant) = 0 OrElse _
                            hasCall <> 0 Then
                             RecordSimpleBodyFailure( _
                                 context, "unsupported-static-array-element", _
@@ -1940,6 +2877,39 @@ Private Function TranslateSingleDeclarationStatement( _
 End Function
 
 
+Private Function StripSimpleUnusedLeadingAttribute( _
+    ByVal statementText As String _
+) As String
+    Dim parsePosition As Long = 1
+    SkipCSpaces(statementText, parsePosition)
+    Const attributeName As String = "__attribute__"
+    If Mid(statementText, parsePosition, Len(attributeName)) <> attributeName Then _
+        Return statementText
+    parsePosition += Len(attributeName)
+    If parsePosition <= Len(statementText) AndAlso _
+       IsIdentifierPart(Asc(statementText, parsePosition)) <> 0 Then _
+        Return statementText
+    SkipCSpaces(statementText, parsePosition)
+    If parsePosition > Len(statementText) OrElse _
+       Asc(statementText, parsePosition) <> Asc("(") Then Return statementText
+
+    Dim attributeEnd As Long = parsePosition
+    If ScanSimpleExpressionGroup( _
+        statementText, attributeEnd, Asc("("), Asc(")")) = 0 Then _
+        Return statementText
+    Dim attributeContents As String
+    For position As Long = parsePosition + 1 To attributeEnd - 2
+        If IsSpaceByte(Asc(statementText, position)) = 0 Then _
+            attributeContents &= LCase(Mid(statementText, position, 1))
+    Next
+    If attributeContents <> "(__unused__)" AndAlso _
+       attributeContents <> "(unused)" Then Return statementText
+
+    Dim declarationText As String = Trim(Mid(statementText, attributeEnd))
+    If declarationText = "" Then Return statementText
+    Return declarationText
+End Function
+
 Private Function TranslateSimpleDeclarationStatement( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -1949,6 +2919,7 @@ Private Function TranslateSimpleDeclarationStatement( _
     parameterNames() As String, parameterAliases() As String, parameterTypes() As String, _
     ByRef symbolCount As Long _
 ) As Long
+    statementText = StripSimpleUnusedLeadingAttribute(statementText)
     Dim parts() As String
     Dim partCount As Long
     If SplitSimpleCList(statementText, parts(), partCount) = 0 Then Return 0

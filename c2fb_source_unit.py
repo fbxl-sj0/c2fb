@@ -14,6 +14,7 @@ Purpose:
     - Apply shared and per-source compiler options in tree mode.
     - Bound concurrent work while keeping per-file outputs independent.
     - Filter tree inputs by source-relative patterns when requested.
+    - Filter indexed FreeBASIC bindings by source-relative patterns when requested.
     - Combine that binding with an optional FreeBASIC source index in a
       temporary overlay.
     - Translate and publish a C body candidate plus its type context.
@@ -40,23 +41,42 @@ import tempfile
 BODY_SOURCE_SUFFIXES = {".bas", ".bi"}
 SKIP_DIRECTORY_NAMES = {"build", "out", ".git", "node_modules"}
 MAX_SOURCE_TREE_FILES = 32768
+MAX_INDEXED_BODY_SOURCE_FILES = 32768
 # Bound compiler fan-out so large trees cannot launch unbounded workers.
 MAX_SOURCE_TREE_JOBS = 32
+SOURCE_UNIT_SUMMARY_RE = re.compile(
+    r"translated (\d+) simple functions; skipped (\d+) "
+    r"unsupported or duplicate candidates"
+)
+FREEBASIC_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include(?:\s+once)?\s+"([^"\r\n]+)"', re.IGNORECASE
+)
 UNIT_OPTION_KEYS = (
     "header_options",
     "body_options",
     "header_compiler_options",
     "body_compiler_options",
 )
+SOURCE_INDEX_PROFILE_KEYS = (
+    "fb_source_patterns",
+    "fb_source_recursive",
+    "fb_source_include_closure",
+)
 MANAGED_BODY_OPTIONS = (
     "--fb-source-directory",
     "--fb-source-dir",
     "--fb-source-recursive",
+    "--fb-source-pattern",
+    "--fb-source-include-closure",
 )
 STATIC_OBJECT_BINDING = re.compile(
     r"^' c2fb static-object: ([A-Za-z_][A-Za-z_0-9]*)="
     r"([A-Za-z_][A-Za-z_0-9]*)$",
     re.MULTILINE,
+)
+FREEBASIC_CALLBACK_TYPE = re.compile(
+    r"^\s*Type\s+([A-Za-z_][A-Za-z_0-9]*)\s+As\s+(?:Function|Sub)\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 THREAD_LOCAL_OBJECT_SKIP = re.compile(
     r"^' c2fb skipped [^\r\n]*thread-local[^\r\n]*: "
@@ -92,6 +112,18 @@ def path_is_within(path, root):
         return False
 
 
+def normalize_binding_pattern(value, label):
+    normalized = value.replace("\\", "/").strip()
+    if not normalized or normalized.startswith("/") or \
+       re.match(r"^[A-Za-z]:", normalized) is not None or \
+       ".." in normalized.split("/"):
+        raise ValueError(
+            f"{label} must be a non-empty path relative to the indexed "
+            "FreeBASIC source directory"
+        )
+    return normalized
+
+
 def load_unit_manifest(value):
     if value is None:
         return []
@@ -111,7 +143,7 @@ def load_unit_manifest(value):
         raise ValueError("source-unit manifest profiles must be a list")
 
     normalized_profiles = []
-    allowed_keys = {"pattern", *UNIT_OPTION_KEYS}
+    allowed_keys = {"pattern", *UNIT_OPTION_KEYS, *SOURCE_INDEX_PROFILE_KEYS}
     for profile_index, profile in enumerate(profiles):
         label = f"source-unit profile {profile_index}"
         if not isinstance(profile, dict) or "pattern" not in profile:
@@ -125,6 +157,26 @@ def load_unit_manifest(value):
         if pattern.startswith("/") or ".." in pattern.split("/"):
             raise ValueError(f"{label} pattern must be relative to the source tree")
         normalized = {"pattern": pattern}
+        source_patterns = profile.get("fb_source_patterns", [])
+        if not isinstance(source_patterns, list) or any(
+            not isinstance(item, str) or not item or
+            "\0" in item or "\n" in item or "\r" in item
+            for item in source_patterns
+        ):
+            raise ValueError(
+                f"{label} fb_source_patterns must be a list of path patterns"
+            )
+        normalized["fb_source_patterns"] = [
+            normalize_binding_pattern(item, f"{label} FreeBASIC source pattern")
+            for item in source_patterns
+        ]
+        for option_key in (
+            "fb_source_recursive", "fb_source_include_closure",
+        ):
+            option_value = profile.get(option_key, False)
+            if not isinstance(option_value, bool):
+                raise ValueError(f"{label} {option_key} must be true or false")
+            normalized[option_key] = option_value
         for option_key in UNIT_OPTION_KEYS:
             values = profile.get(option_key, [])
             if not isinstance(values, list) or any(
@@ -151,12 +203,26 @@ def load_unit_manifest(value):
 def options_for_source_unit(relative_path, profiles):
     source_name = relative_path.as_posix()
     options = {key: [] for key in UNIT_OPTION_KEYS}
+    source_index_options = {
+        "fb_source_patterns": [],
+        "fb_source_recursive": False,
+        "fb_source_include_closure": False,
+    }
     for profile in profiles:
         if not fnmatch.fnmatchcase(source_name, profile["pattern"]):
             continue
         for option_key in UNIT_OPTION_KEYS:
             options[option_key].extend(profile[option_key])
-    return options
+        source_index_options["fb_source_patterns"].extend(
+            profile["fb_source_patterns"]
+        )
+        for option_key in (
+            "fb_source_recursive", "fb_source_include_closure",
+        ):
+            source_index_options[option_key] = (
+                source_index_options[option_key] or profile[option_key]
+            )
+    return options, source_index_options
 
 
 def resolve_converter(value):
@@ -191,21 +257,137 @@ def copy_or_link(source, target):
         shutil.copy2(source, target)
 
 
-def stage_binding_sources(base_directory, overlay_directory,
-                          local_type_context, recursive):
-    overlay_directory.mkdir(parents=True, exist_ok=True)
-    if base_directory is not None:
-        iterator = (
-            base_directory.rglob("*")
-            if recursive
-            else base_directory.iterdir()
+def binding_source_matches(relative_path, patterns):
+    if not patterns:
+        return True
+    relative_name = relative_path.as_posix()
+    return any(fnmatch.fnmatchcase(relative_name, pattern) for pattern in patterns)
+
+
+def indexed_body_source_path(path, base_directory):
+    try:
+        indexed_path = Path(os.path.abspath(os.fspath(path)))
+        resolved = indexed_path.resolve(strict=True)
+        relative = indexed_path.relative_to(base_directory)
+        resolved_relative = resolved.relative_to(base_directory)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved.is_file() or indexed_path.suffix.lower() not in BODY_SOURCE_SUFFIXES:
+        return None
+    if any(part in SKIP_DIRECTORY_NAMES for part in relative.parts) or \
+       any(part in SKIP_DIRECTORY_NAMES for part in resolved_relative.parts):
+        return None
+    return indexed_path
+
+
+def freebasic_include_dependencies(source, base_directory):
+    try:
+        source_text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise ValueError(
+            f"cannot read indexed FreeBASIC source {source}: {error}"
+        ) from error
+
+    dependencies = []
+    for line in source_text.splitlines():
+        match = FREEBASIC_INCLUDE_RE.match(line)
+        if match is None:
+            continue
+        include_path = Path(match.group(1))
+        if include_path.is_absolute():
+            candidates = (include_path,)
+        else:
+            candidates = (source.parent / include_path, base_directory / include_path)
+        for candidate in candidates:
+            dependency = indexed_body_source_path(candidate, base_directory)
+            if dependency is not None:
+                dependencies.append(dependency)
+                break
+    return dependencies
+
+
+def freebasic_module_body(interface, base_directory):
+    """Return the matching implementation when an interface owns one."""
+    if interface.suffix.casefold() != ".bi":
+        return None
+    implementation = indexed_body_source_path(
+        interface.with_suffix(".bas"), base_directory
+    )
+    if implementation is None:
+        return None
+    if interface not in freebasic_include_dependencies(
+        implementation, base_directory
+    ):
+        return None
+    return implementation
+
+
+def collect_binding_sources(base_directory, recursive, patterns=(), include_closure=False):
+    if base_directory is None:
+        return (), 0, 0
+
+    base_directory = Path(base_directory).resolve()
+    iterator = base_directory.rglob("*") if recursive else base_directory.iterdir()
+    selected = {}
+    pattern_match_count = 0
+    for source in iterator:
+        indexed_source = indexed_body_source_path(source, base_directory)
+        if indexed_source is None:
+            continue
+        relative = indexed_source.relative_to(base_directory)
+        if not binding_source_matches(relative, patterns):
+            continue
+        selected[relative.as_posix()] = indexed_source
+        pattern_match_count += 1
+        if len(selected) > MAX_INDEXED_BODY_SOURCE_FILES:
+            raise ValueError(
+                "indexed FreeBASIC sources exceed the configured source limit "
+                f"of {MAX_INDEXED_BODY_SOURCE_FILES}"
+            )
+
+    if patterns and pattern_match_count == 0:
+        raise ValueError(
+            "--fb-source-pattern did not match any indexed .bas or .bi files"
         )
-        for source in sorted(iterator):
-            if not source.is_file() or source.suffix.lower() not in BODY_SOURCE_SUFFIXES:
-                continue
+
+    initial_count = len(selected)
+    if include_closure:
+        pending = list(selected.values())
+        visited = set(selected.values())
+        while pending:
+            source = pending.pop()
+            dependencies = freebasic_include_dependencies(source, base_directory)
+            module_body = freebasic_module_body(source, base_directory)
+            if module_body is not None:
+                dependencies.append(module_body)
+            for dependency in dependencies:
+                if dependency in visited:
+                    continue
+                visited.add(dependency)
+                relative = dependency.relative_to(base_directory)
+                selected[relative.as_posix()] = dependency
+                pending.append(dependency)
+                if len(selected) > MAX_INDEXED_BODY_SOURCE_FILES:
+                    raise ValueError(
+                        "FreeBASIC include closure exceeds the configured source limit "
+                        f"of {MAX_INDEXED_BODY_SOURCE_FILES}"
+                    )
+
+    ordered_sources = tuple(selected[name] for name in sorted(selected))
+    return ordered_sources, initial_count, len(ordered_sources) - initial_count
+
+
+def stage_binding_sources(base_directory, overlay_directory,
+                          local_type_context, recursive, patterns=(),
+                          include_closure=False):
+    overlay_directory.mkdir(parents=True, exist_ok=True)
+    selected_sources, selected_count, dependency_count = collect_binding_sources(
+        base_directory, recursive, patterns, include_closure
+    )
+    if base_directory is not None:
+        base_directory = Path(base_directory).resolve()
+        for source in selected_sources:
             relative = source.relative_to(base_directory)
-            if any(part in SKIP_DIRECTORY_NAMES for part in relative.parts):
-                continue
             if source.name == local_type_context.name:
                 raise ValueError(
                     "local type-context filename conflicts with an existing "
@@ -220,6 +402,7 @@ def stage_binding_sources(base_directory, overlay_directory,
             f"{local_target.name}"
         )
     copy_or_link(local_type_context, local_target)
+    return selected_count, dependency_count
 
 
 def ensure_type_context_include(candidate_path, type_context_name):
@@ -246,6 +429,81 @@ def ensure_type_context_include(candidate_path, type_context_name):
         include_position = comment_end + 1
     lines.insert(include_position, include_line + "\n")
     candidate_path.write_text("".join(lines), encoding="utf-8")
+
+
+def move_callback_static_objects_to_body(type_context_path):
+    """Move private callback tables to bodies that define their callbacks.
+
+    A type-context initializer is compiled before the body module's Declare
+    statements. Callback addresses therefore cannot refer to private functions
+    defined by that body. Keep the callback typedef in the type context, and
+    let the body emitter place the table after its forward declarations.
+    """
+    source = type_context_path.read_text(encoding="utf-8", errors="replace")
+    callback_types = {
+        name.lower() for name in FREEBASIC_CALLBACK_TYPE.findall(source)
+    }
+    if not callback_types:
+        return ()
+
+    lines = source.splitlines(keepends=True)
+    removed_lines = set()
+    moved_names = []
+    for marker_index, line in enumerate(lines):
+        marker = STATIC_OBJECT_BINDING.match(line.rstrip("\r\n"))
+        if marker is None:
+            continue
+        source_name, freebasic_name = marker.groups()
+        declaration_index = None
+        declaration_type = None
+        is_direct_callback = False
+        for candidate_index in range(marker_index + 1, len(lines)):
+            candidate_line = lines[candidate_index].strip()
+            if not candidate_line or candidate_line.startswith("'"):
+                continue
+            declaration_prefix = re.compile(
+                r"^(?:Private\s+)?Dim\s+Shared\s+"
+                + re.escape(freebasic_name)
+                + r"(?:\s*\(|\s)"
+            )
+            if declaration_prefix.match(candidate_line) is None:
+                break
+            is_direct_callback = re.search(
+                r"\bAs\s+(?:Const\s+)?(?:Function|Sub)\b",
+                candidate_line,
+                re.IGNORECASE,
+            ) is not None
+            type_match = re.search(
+                r"\bAs\s+(?:Const\s+)?([A-Za-z_][A-Za-z_0-9]*)\b",
+                candidate_line,
+                re.IGNORECASE,
+            )
+            if type_match is not None:
+                declaration_index = candidate_index
+                declaration_type = type_match.group(1).lower()
+            break
+
+        if declaration_index is None or not (
+                is_direct_callback or declaration_type in callback_types):
+            continue
+
+        removed_lines.add(marker_index)
+        removed_lines.add(declaration_index)
+        for candidate_index, candidate_line in enumerate(lines):
+            if candidate_index == marker_index:
+                continue
+            if ("c2fb skipped unsupported module-static initializer" in candidate_line
+                    and source_name in candidate_line):
+                removed_lines.add(candidate_index)
+        moved_names.append(source_name)
+
+    if removed_lines:
+        type_context_path.write_text(
+            "".join(line for index, line in enumerate(lines)
+                    if index not in removed_lines),
+            encoding="utf-8",
+        )
+    return tuple(moved_names)
 
 
 def static_object_bindings(type_context_path):
@@ -326,9 +584,15 @@ def run_source_unit(arguments, output_messages=None):
                 "--exclude=*",
                 "--preserve-type-dependencies",
             ]
-            # The body pass writes its own source objects after function
-            # declarations, which keeps callback initializers callable.
-            if "--include-global-definitions" not in arguments.body_options:
+            # Included C bodies can refer to file-static objects that do not
+            # belong to the root source's body index. Keep their private
+            # storage in the shared type context; reuse bindings prevent the
+            # body pass from emitting duplicate objects.
+            include_static_objects_in_header = (
+                "--include-global-definitions" not in arguments.body_options
+                or "--include-included-c-source-bodies" in arguments.body_options
+            )
+            if include_static_objects_in_header:
                 header_command.extend([
                     "--include-static-objects",
                     "--private-static-objects",
@@ -354,6 +618,22 @@ def run_source_unit(arguments, output_messages=None):
             if not staged_type_context.is_file() or \
                staged_type_context.stat().st_size == 0:
                 raise ValueError("C2FB produced no local type context")
+            if ("--include-global-definitions" in arguments.body_options and
+                    "--include-included-c-source-bodies" in arguments.body_options):
+                moved_callback_objects = move_callback_static_objects_to_body(
+                    staged_type_context
+                )
+                if moved_callback_objects:
+                    message = (
+                        "c2fb source unit: moved private callback tables to body: "
+                        + ", ".join(moved_callback_objects)
+                        + "\n"
+                    )
+                    if output_messages is None:
+                        sys.stdout.write(message)
+                        sys.stdout.flush()
+                    else:
+                        output_messages.append((message, ""))
             object_bindings = static_object_bindings(staged_type_context)
             unsupported_thread_locals = unsupported_thread_local_objects(
                 staged_type_context
@@ -370,10 +650,23 @@ def run_source_unit(arguments, output_messages=None):
                 else:
                     output_messages.append((message, ""))
 
-            stage_binding_sources(
+            selected_source_count, dependency_source_count = stage_binding_sources(
                 base_directory, overlay, staged_type_context,
                 arguments.fb_source_recursive,
+                arguments.fb_source_patterns,
+                arguments.fb_source_include_closure,
             )
+            if arguments.fb_source_include_closure:
+                message = (
+                    "c2fb source unit: indexed "
+                    f"{selected_source_count} selected and "
+                    f"{dependency_source_count} included FreeBASIC source files\n"
+                )
+                if output_messages is None:
+                    sys.stdout.write(message)
+                    sys.stdout.flush()
+                else:
+                    output_messages.append((message, ""))
             body_command = [
                 str(converter),
                 "translate-simple-generic-c",
@@ -388,7 +681,7 @@ def run_source_unit(arguments, output_messages=None):
                 *arguments.body_compiler_options,
                 "--fb-source-directory=" + str(overlay),
             ]
-            if arguments.fb_source_recursive:
+            if arguments.fb_source_recursive or arguments.fb_source_include_closure:
                 body_command.append("--fb-source-recursive")
             result = subprocess.run(
                 body_command, capture_output=True, text=True, check=False
@@ -444,12 +737,24 @@ def run_source_tree(arguments):
     for pattern in arguments.source_patterns:
         normalized = pattern.replace("\\", "/").strip()
         if not normalized or normalized.startswith("/") or \
+           re.match(r"^[A-Za-z]:", normalized) is not None or \
            ".." in normalized.split("/"):
             raise ValueError(
                 "source patterns must be non-empty paths relative to the source tree"
             )
         source_patterns.append(normalized)
     unit_profiles = load_unit_manifest(arguments.unit_manifest)
+    has_source_index_profile = any(
+        profile["fb_source_patterns"] or
+        profile["fb_source_recursive"] or
+        profile["fb_source_include_closure"]
+        for profile in unit_profiles
+    )
+    if has_source_index_profile and not arguments.fb_source_directory:
+        raise ValueError(
+            "FreeBASIC source-index profile options require "
+            "--fb-source-directory"
+        )
     if path_is_within(output_directory, source_directory) or \
        path_is_within(source_directory, output_directory):
         raise ValueError(
@@ -517,12 +822,26 @@ def run_source_tree(arguments):
         unit_arguments.source = source
         unit_arguments.candidate = candidate
         unit_arguments.type_context = None
-        profile_options = options_for_source_unit(relative, unit_profiles)
+        profile_options, profile_source_index_options = options_for_source_unit(
+            relative, unit_profiles
+        )
         for option_key in UNIT_OPTION_KEYS:
             setattr(
                 unit_arguments, option_key,
                 [*getattr(arguments, option_key), *profile_options[option_key]],
             )
+        unit_arguments.fb_source_patterns = [
+            *arguments.fb_source_patterns,
+            *profile_source_index_options["fb_source_patterns"],
+        ]
+        unit_arguments.fb_source_recursive = (
+            arguments.fb_source_recursive or
+            profile_source_index_options["fb_source_recursive"]
+        )
+        unit_arguments.fb_source_include_closure = (
+            arguments.fb_source_include_closure or
+            profile_source_index_options["fb_source_include_closure"]
+        )
         output_messages = []
         try:
             result = run_source_unit(unit_arguments, output_messages)
@@ -535,10 +854,13 @@ def run_source_tree(arguments):
         return relative, result, output_messages
 
     def report_result(result):
-        nonlocal failures
+        nonlocal failures, translated_function_count, skipped_candidate_count
         _, return_code, output_messages = result
         for output_text, error_text in output_messages:
             if output_text:
+                for match in SOURCE_UNIT_SUMMARY_RE.finditer(output_text):
+                    translated_function_count += int(match.group(1))
+                    skipped_candidate_count += int(match.group(2))
                 sys.stdout.write(output_text)
             if error_text:
                 sys.stderr.write(error_text)
@@ -548,6 +870,8 @@ def run_source_tree(arguments):
             failures += 1
 
     failures = 0
+    translated_function_count = 0
+    skipped_candidate_count = 0
     jobs = min(arguments.jobs, len(source_files))
     if jobs == 1:
         for source in source_files:
@@ -561,7 +885,9 @@ def run_source_tree(arguments):
 
     print(
         f"c2fb source tree: processed {len(source_files)} C files; "
-        f"failed {failures}; jobs {jobs}"
+        f"failed {failures}; totals: {translated_function_count} translated "
+        f"simple functions; {skipped_candidate_count} unsupported or duplicate "
+        f"candidates skipped; jobs {jobs}"
     )
     return 1 if failures else 0
 
@@ -589,6 +915,18 @@ def main():
     )
     parser.add_argument("--fb-source-directory")
     parser.add_argument("--fb-source-recursive", action="store_true")
+    parser.add_argument(
+        "--fb-source-pattern", dest="fb_source_patterns", action="append",
+        default=[], metavar="GLOB",
+        help=(
+            "with --fb-source-directory, index only matching .bas/.bi paths "
+            "relative to that directory; repeat to add patterns"
+        ),
+    )
+    parser.add_argument(
+        "--fb-source-include-closure", action="store_true",
+        help="index local .bas/.bi files included transitively by selected sources",
+    )
     parser.add_argument(
         "--unit-manifest", type=Path,
         help="JSON per-C-file options used with --tree",
@@ -618,15 +956,10 @@ def main():
     )
     arguments = parser.parse_args()
 
-    reserved_body_options = (
-        "--fb-source-directory",
-        "--fb-source-dir",
-        "--fb-source-recursive",
-    )
     for option in arguments.body_options:
         if any(
             option == reserved or option.startswith(reserved + "=")
-            for reserved in reserved_body_options
+            for reserved in MANAGED_BODY_OPTIONS
         ):
             parser.error(
                 f"{option} is managed by c2fb_source_unit.py; use its "
@@ -638,6 +971,17 @@ def main():
         parser.error(f"--jobs must be between 1 and {MAX_SOURCE_TREE_JOBS}")
     if arguments.jobs != 1 and not arguments.tree:
         parser.error("--jobs greater than 1 requires --tree")
+    if arguments.fb_source_patterns and not arguments.fb_source_directory:
+        parser.error("--fb-source-pattern requires --fb-source-directory")
+    if arguments.fb_source_include_closure and not arguments.fb_source_directory:
+        parser.error("--fb-source-include-closure requires --fb-source-directory")
+    try:
+        arguments.fb_source_patterns = [
+            normalize_binding_pattern(pattern, "--fb-source-pattern")
+            for pattern in arguments.fb_source_patterns
+        ]
+    except ValueError as error:
+        parser.error(str(error))
     try:
         if arguments.tree:
             if arguments.type_context is not None:

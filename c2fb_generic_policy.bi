@@ -624,7 +624,7 @@ Private Const C2FB_FREEBASIC_MACRO_KEYWORDS As String = _
     "CLOSE|SEEK|PUT|GET|ACCESS|WRITE|LOCK|INPUT|WINPUT|OUTPUT|BINARY|RANDOM|APPEND|" & _
     "ENCODING|NAME|WIDTH|COLOR|PRESERVE|SPC|TAB|LINE|VIEW|UNLOCK|CHR|WCHR|ASC|LSET|RSET|" & _
     "PSET|PRESET|POINT|CIRCLE|WINDOW|PALETTE|SCREEN|PAINT|DRAW|IMAGECREATE|THREADCALL|" & _
-    "TCP|MUSIC|SFX|MIDI|DEVICE|CAPTURE|CVA_START|CVA_END|CVA_ARG|CVA_COPY|FALSE|TRUE|"
+    "TCP|MUSIC|SFX|MIDI|DEVICE|CAPTURE|CVA_START|CVA_END|CVA_ARG|CVA_COPY|FALSE|TRUE|NULL|"
 
 Private Function C2fbFreeBasicIdentifierIsKeyword( _
     ByVal identifier As String _
@@ -636,7 +636,9 @@ End Function
 
 ' FreeBASIC accepts many keywords as ordinary Type fields, including TYPE.
 ' These operator and declaration tokens are rejected by the field parser and
-' need a suffix when C2FB emits a C record member with the same name.
+' need a suffix when C2FB emits a C record member with the same name. The
+' lowercase C field `unicode` also collides with the case-insensitive UNICODE
+' preprocessor define used by Windows target profiles.
 Private Function C2fbFreeBasicFieldIdentifierNeedsEscape( _
     ByVal identifier As String _
 ) As Long
@@ -644,7 +646,7 @@ Private Function C2fbFreeBasicFieldIdentifierNeedsEscape( _
     Case "and", "or", "andalso", "orelse", "xor", "eqv", "imp", "not", _
          "mod", "shl", "shr", "new", "delete", "rem", "dim", "static", _
          "as", "declare", "const", "enum", "public", "private", _
-         "protected", "redim"
+         "protected", "redim", "unicode"
         Return -1
     Case Else
         Return 0

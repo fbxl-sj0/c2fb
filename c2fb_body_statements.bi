@@ -84,6 +84,10 @@ Declare Function ParseSimpleSwitchStatement( _
     ByRef terminatesPaths As Long _
 ) As Long
 
+Declare Function IsSimpleSwitchLabel( _
+    ByVal sourceText As String, ByVal position As Long _
+) As Long
+
 Private Function ReadSimpleReturn( _
     ByRef sourceText As String, _
     ByRef position As Long, _
@@ -921,6 +925,446 @@ Private Function ParseSimpleArrayCompoundLiteralValue( _
     Return -1
 End Function
 
+Private Function CompactSimpleAssertExpression(ByVal sourceText As String) As String
+    Dim result As String
+    Dim quoteByte As Long = 0
+    Dim escaped As Long = 0
+    For position As Long = 1 To Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            result &= Chr(currentByte)
+            If escaped <> 0 Then
+                escaped = 0
+            ElseIf currentByte = Asc(Chr(92)) Then
+                escaped = -1
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+        ElseIf currentByte = Asc(Chr(34)) OrElse _
+               currentByte = Asc("'") Then
+            quoteByte = currentByte
+            result &= Chr(currentByte)
+        ElseIf IsSpaceByte(currentByte) = 0 Then
+            result &= Chr(currentByte)
+        End If
+    Next
+    Return result
+End Function
+
+
+Private Function RewriteSimpleAssertFunctionTokens( _
+    ByVal sourceText As String, ByVal functionName As String _
+) As String
+    Dim result As String
+    Dim quoteByte As Long = 0
+    Dim escaped As Long = 0
+    Dim position As Long = 1
+    While position <= Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            result &= Chr(currentByte)
+            If escaped <> 0 Then
+                escaped = 0
+            ElseIf currentByte = Asc(Chr(92)) Then
+                escaped = -1
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+            position += 1
+        ElseIf currentByte = Asc(Chr(34)) OrElse _
+               currentByte = Asc("'") Then
+            quoteByte = currentByte
+            result &= Chr(currentByte)
+            position += 1
+        ElseIf IsIdentifierStart(currentByte) <> 0 Then
+            Dim tokenStart As Long = position
+            position += 1
+            While position <= Len(sourceText) AndAlso _
+                  IsIdentifierPart(Asc(sourceText, position)) <> 0
+                position += 1
+            Wend
+            Dim token As String = Mid(sourceText, tokenStart, position - tokenStart)
+            Select Case token
+            Case "__extension__"
+                ' GCC uses this token only to suppress diagnostics.
+            Case "__PRETTY_FUNCTION__", "__func__"
+                result &= Chr(34) & functionName & Chr(34)
+            Case Else
+                result &= token
+            End Select
+        Else
+            result &= Chr(currentByte)
+            position += 1
+        End If
+    Wend
+    Return result
+End Function
+
+
+Private Function RejectSimpleAssertExpansion( _
+    ByRef context As SimpleBodyContext, ByVal message As String _
+) As Long
+    RecordSimpleBodyFailure( _
+        context, "unsupported-assert-expansion", message)
+    Return 0
+End Function
+
+
+Private Function TranslateSimpleAssertExpansionStatement( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal statementText As String, ByRef outputText As String, _
+    ByRef context As SimpleBodyContext, _
+    callableNames() As String, ByVal callableCount As Long, _
+    parameterNames() As String, parameterAliases() As String, _
+    parameterTypes() As String, ByRef symbolCount As Long _
+) As Long
+    outputText = ""
+    statementText = Trim(statementText)
+    If Right(statementText, 1) = ";" Then _
+        statementText = RTrim(Left(statementText, Len(statementText) - 1))
+    Dim argumentMarker As Long = InStr(statementText, "__assert_single_arg")
+    Dim extensionMarker As Long = InStr(statementText, "__extension__")
+    If argumentMarker = 0 OrElse extensionMarker = 0 OrElse _
+       extensionMarker < argumentMarker Then Return 0
+
+    Dim argumentOpen As Long = argumentMarker + Len("__assert_single_arg")
+    SkipCSpaces(statementText, argumentOpen)
+    If argumentOpen > Len(statementText) OrElse _
+       Asc(statementText, argumentOpen) <> Asc("(") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert expansion has no single-argument check")
+    Dim argumentEnd As Long = argumentOpen
+    If ScanSimpleExpressionGroup( _
+        statementText, argumentEnd, Asc("("), Asc(")")) = 0 Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert single-argument check is malformed")
+    Dim probedExpression As String = Trim(Mid( _
+        statementText, argumentOpen + 1, argumentEnd - argumentOpen - 2))
+
+    Dim blockOpen As Long = InStr(extensionMarker, statementText, "{")
+    If blockOpen = 0 Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert extension block is missing")
+    Dim ifPosition As Long = InStr(blockOpen, statementText, "if")
+    If ifPosition = 0 OrElse _
+       (ifPosition > 1 AndAlso _
+        IsIdentifierPart(Asc(statementText, ifPosition - 1)) <> 0) OrElse _
+       (ifPosition + 2 <= Len(statementText) AndAlso _
+        IsIdentifierPart(Asc(statementText, ifPosition + 2)) <> 0) Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert expansion has no if statement")
+    Dim conditionOpen As Long = ifPosition + Len("if")
+    SkipCSpaces(statementText, conditionOpen)
+    If conditionOpen > Len(statementText) OrElse _
+       Asc(statementText, conditionOpen) <> Asc("(") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert if condition is not parenthesized")
+    Dim conditionEnd As Long = conditionOpen
+    If ScanSimpleExpressionGroup( _
+        statementText, conditionEnd, Asc("("), Asc(")")) = 0 Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert if condition is malformed")
+    Dim conditionText As String = Trim(Mid( _
+        statementText, conditionOpen + 1, conditionEnd - conditionOpen - 2))
+    If conditionText = "" OrElse _
+       CompactSimpleAssertExpression(probedExpression) <> _
+       CompactSimpleAssertExpression(conditionText) Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert runtime condition does not match its compile-time check")
+
+    Dim position As Long = conditionEnd
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc(";") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert if statement has no empty then branch")
+    position += 1
+    SkipCSpaces(statementText, position)
+    If Mid(statementText, position, Len("else")) <> "else" OrElse _
+       (position + Len("else") <= Len(statementText) AndAlso _
+        IsIdentifierPart(Asc(statementText, position + Len("else"))) <> 0) Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert if statement has no else branch")
+    position += Len("else")
+    SkipCSpaces(statementText, position)
+    If Mid(statementText, position, Len("__assert_fail")) <> "__assert_fail" Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert else branch does not call __assert_fail")
+    Dim failureStart As Long = position
+    position += Len("__assert_fail")
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc("(") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert failure handler has no argument list")
+    Dim failureEnd As Long = position
+    If ScanSimpleExpressionGroup( _
+        statementText, failureEnd, Asc("("), Asc(")")) = 0 Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert failure argument list is malformed")
+
+    position = failureEnd
+    SkipCSpaces(statementText, position)
+    If position <= Len(statementText) AndAlso _
+       Asc(statementText, position) = Asc(";") Then position += 1
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc("}") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert extension block does not close")
+    position += 1
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc(")") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert extension parenthesis does not close")
+    position += 1
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc(")") Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert expression parenthesis does not close")
+    position += 1
+    SkipCSpaces(statementText, position)
+    If position <= Len(statementText) Then _
+        Return RejectSimpleAssertExpansion( _
+            context, "assert expression has a trailing token")
+
+    Dim translatedCondition As String
+    Dim conditionPrelude As String
+    If TranslateSequencedExpression( _
+        translation, catalog, conditionText, translatedCondition, _
+        conditionPrelude, context, callableNames(), callableCount, _
+        parameterNames(), parameterAliases(), parameterTypes(), _
+        symbolCount) = 0 Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assert-condition", _
+            "unsupported C assert condition: " & Left(conditionText, 160))
+        Return 0
+    End If
+
+    Dim failureCall As String = Mid( _
+        statementText, failureStart, failureEnd - failureStart)
+    failureCall = RewriteSimpleAssertFunctionTokens( _
+        failureCall, context.functionName)
+    ' The assertion handler returns void. Parse it as a statement expression
+    ' so the value-required sequenced-expression path does not reject the call.
+    Dim failureParser As SimpleExpressionParser
+    failureParser.sourceText = failureCall
+    failureParser.position = 1
+    failureParser.translation = @translation
+    failureParser.catalog = @catalog
+    failureParser.context = @context
+    Dim failureValue As SimpleExpressionValue
+    If ParseSimpleExpressionValue( _
+        failureParser, failureValue, 1, 0, callableNames(), callableCount, _
+        parameterNames(), parameterAliases(), parameterTypes(), symbolCount) = 0 Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assert-failure-call", _
+            "assert failure call parser stopped at byte " & _
+            Trim(Str(failureParser.position)) & ": " & _
+            Left(Mid(failureParser.sourceText, failureParser.position), 100))
+        Return 0
+    End If
+    SkipCSpaces(failureParser.sourceText, failureParser.position)
+    If failureParser.position <= Len(failureCall) OrElse _
+       failureValue.typeName <> "void" Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assert-failure-call", _
+            "assert failure call has an unsupported return type or suffix: " & _
+            failureValue.typeName & " " & _
+            Left(Mid(failureParser.sourceText, failureParser.position), 80))
+        Return 0
+    End If
+
+    outputText = RTrim(conditionPrelude, Any Chr(10))
+    If outputText <> "" Then outputText &= Chr(10)
+    outputText &= "If (" & translatedCondition & " = 0) Then" & Chr(10)
+    If failureValue.prelude <> "" Then
+        outputText &= IndentSimpleBodyText( _
+            RTrim(failureValue.prelude, Any Chr(10)), "    ") & Chr(10)
+    End If
+    outputText &= "    " & failureValue.text & Chr(10) & "End If"
+    Return -1
+End Function
+
+
+Private Function StripSimpleOuterParentheses( _
+    ByVal sourceText As String _
+) As String
+    sourceText = Trim(sourceText)
+    While Len(sourceText) >= 2 AndAlso Left(sourceText, 1) = "("
+        Dim position As Long = 1
+        If ScanSimpleExpressionGroup( _
+            sourceText, position, Asc("("), Asc(")")) = 0 OrElse _
+           position <> Len(sourceText) + 1 Then Exit While
+        sourceText = Trim(Mid(sourceText, 2, Len(sourceText) - 2))
+    Wend
+    Return sourceText
+End Function
+
+
+Private Function FindSimpleConditionalParts( _
+    ByVal sourceText As String, _
+    ByRef questionPosition As Long, _
+    ByRef colonPosition As Long _
+) As Long
+    Dim parentheses As Long = 0
+    Dim brackets As Long = 0
+    Dim braces As Long = 0
+    Dim nestedConditionals As Long = 0
+    Dim quoteByte As Long = 0
+    questionPosition = 0
+    colonPosition = 0
+
+    Dim position As Long = 1
+    While position <= Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            If currentByte = Asc(Chr(92)) Then
+                position += 2
+                Continue While
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+        ElseIf currentByte = Asc("'") OrElse currentByte = Asc(Chr(34)) Then
+            quoteByte = currentByte
+        ElseIf currentByte = Asc("(") Then
+            parentheses += 1
+        ElseIf currentByte = Asc(")") Then
+            If parentheses > 0 Then parentheses -= 1
+        ElseIf currentByte = Asc("[") Then
+            brackets += 1
+        ElseIf currentByte = Asc("]") Then
+            If brackets > 0 Then brackets -= 1
+        ElseIf currentByte = Asc("{") Then
+            braces += 1
+        ElseIf currentByte = Asc("}") Then
+            If braces > 0 Then braces -= 1
+        ElseIf parentheses = 0 AndAlso brackets = 0 AndAlso braces = 0 Then
+            If currentByte = Asc("?") Then
+                If questionPosition = 0 Then
+                    questionPosition = position
+                Else
+                    nestedConditionals += 1
+                End If
+            ElseIf currentByte = Asc(":") AndAlso questionPosition <> 0 Then
+                If nestedConditionals = 0 Then
+                    colonPosition = position
+                    Return -1
+                End If
+                nestedConditionals -= 1
+            End If
+        End If
+        position += 1
+    Wend
+    Return 0
+End Function
+
+
+Private Function TranslateSimpleUnreachableAssumption( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal statementText As String, ByRef outputText As String, _
+    ByRef context As SimpleBodyContext, _
+    callableNames() As String, ByVal callableCount As Long, _
+    parameterNames() As String, parameterAliases() As String, _
+    parameterTypes() As String, ByVal parameterCount As Long _
+) As Long
+    outputText = ""
+    statementText = Trim(statementText)
+    If Right(statementText, 1) = ";" Then _
+        statementText = RTrim(Left(statementText, Len(statementText) - 1))
+
+    Dim directText As String = CompactSimpleAssertExpression( _
+        StripSimpleOuterParentheses(statementText))
+    If directText = "__builtin_unreachable()" OrElse _
+       directText = "__builtin_trap()" Then
+        outputText = "Error 5"
+        Return -1
+    End If
+
+    ' verify.h expands assume(R) to a void conditional whose failing branch
+    ' is unreachable. Reaching that branch is undefined in C, so terminate
+    ' translated code there instead of silently discarding the assumption.
+    Dim conditionalText As String = StripSimpleOuterParentheses(statementText)
+    Dim questionPosition As Long
+    Dim colonPosition As Long
+    If FindSimpleConditionalParts( _
+        conditionalText, questionPosition, colonPosition) = 0 Then Return 0
+
+    Dim conditionText As String = Trim(Left(conditionalText, questionPosition - 1))
+    Dim trueText As String = Trim(Mid( _
+        conditionalText, questionPosition + 1, _
+        colonPosition - questionPosition - 1))
+    Dim falseText As String = Trim(Mid(conditionalText, colonPosition + 1))
+    Dim compactTrue As String = CompactSimpleAssertExpression( _
+        StripSimpleOuterParentheses(trueText))
+    Dim compactFalse As String = CompactSimpleAssertExpression( _
+        StripSimpleOuterParentheses(falseText))
+    Dim unreachableWhenTrue As Long
+    Select Case compactTrue
+    Case "(void)0"
+        If compactFalse = "__builtin_unreachable()" OrElse _
+           compactFalse = "__builtin_trap()" Then
+            unreachableWhenTrue = 0
+        Else
+            Return 0
+        End If
+    Case "__builtin_unreachable()", "__builtin_trap()"
+        If compactFalse <> "(void)0" Then Return 0
+        unreachableWhenTrue = -1
+    Case Else
+        Return 0
+    End Select
+
+    Dim parser As SimpleExpressionParser
+    parser.sourceText = conditionText
+    parser.position = 1
+    parser.translation = @translation
+    parser.catalog = @catalog
+    parser.context = @context
+    Dim conditionValue As SimpleExpressionValue
+    If ParseSimpleExpressionValue( _
+        parser, conditionValue, 1, 0, callableNames(), callableCount, _
+        parameterNames(), parameterAliases(), parameterTypes(), parameterCount) = 0 Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assumption-condition", _
+            "could not translate unreachable-assumption condition: " & _
+            Left(conditionText, 160))
+        Return 0
+    End If
+    SkipCSpaces(parser.sourceText, parser.position)
+    ' GNU statement-expression lowering can change the parsed source length.
+    If parser.position <= Len(parser.sourceText) Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assumption-condition", _
+            "assumption condition has an unsupported suffix: " & _
+            Left(Mid(parser.sourceText, parser.position), 120))
+        Return 0
+    End If
+
+    Dim truthCondition As String = SimpleScalarTruthCondition( _
+        translation, catalog, conditionValue)
+    If truthCondition = "" Then
+        RecordSimpleBodyFailure( _
+            context, "unsupported-assumption-condition", _
+            "assumption condition is not a supported scalar: " & _
+            Left(conditionText, 160))
+        Return 0
+    End If
+    outputText = RTrim(conditionValue.prelude, Any Chr(10))
+    If outputText <> "" Then outputText &= Chr(10)
+    If unreachableWhenTrue <> 0 Then
+        outputText &= "If (" & truthCondition & ") <> 0 Then Error 5"
+    Else
+        outputText &= "If (" & truthCondition & ") = 0 Then Error 5"
+    End If
+    Return -1
+End Function
+
+
 Private Function TranslateSimpleAssignmentStatement( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -936,6 +1380,16 @@ Private Function TranslateSimpleAssignmentStatement( _
         outputText = "' empty C statement"
         Return -1
     End If
+    If TranslateSimpleAssertExpansionStatement( _
+        translation, catalog, text, outputText, context, callableNames(), _
+        callableCount, parameterNames(), parameterAliases(), parameterTypes(), _
+        symbolCount) <> 0 Then Return -1
+    If context.failureMessage <> "" Then Return 0
+    If TranslateSimpleUnreachableAssumption( _
+        translation, catalog, text, outputText, context, callableNames(), _
+        callableCount, parameterNames(), parameterAliases(), parameterTypes(), _
+        symbolCount) <> 0 Then Return -1
+    If context.failureMessage <> "" Then Return 0
     Dim compactText As String = ""
     For textIndex As Long = 1 To Len(text)
         If IsSpaceByte(Asc(text, textIndex)) = 0 Then _
@@ -970,7 +1424,7 @@ Private Function TranslateSimpleAssignmentStatement( _
         Return 0
     End If
     SkipCSpaces(parser.sourceText, parser.position)
-    If parser.position <= Len(text) Then
+    If parser.position <= Len(parser.sourceText) Then
         RecordSimpleBodyFailure( _
             context, "unsupported-assignment-suffix", _
             "assignment parser left an unsupported suffix at byte " & _
@@ -990,14 +1444,63 @@ Private Function TranslateSimpleAssignmentStatement( _
 End Function
 
 Private Function SimpleCConditionAlwaysTrue( _
-    ByVal conditionText As String _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal conditionText As String, _
+    parameterNames() As String, parameterAliases() As String, _
+    ByVal parameterCount As Long _
 ) As Long
+    conditionText = Trim(conditionText)
+    If conditionText = "true" Then
+        If ParameterAlias( _
+            parameterNames(), parameterAliases(), parameterCount, "true") <> "" OrElse _
+           CBodyExternalObjectIndex(translation, "true") >= 0 OrElse _
+           CBodyProcedureIndex(translation, "true") >= 0 Then Return 0
+        Return -1
+    End If
     Dim conditionValue As Long
     If EvaluateSimpleArrayBound( _
         conditionText, conditionValue, MAX_GENERIC_ARRAY_COUNT, -1) = 0 Then _
         Return 0
     Return CInt(conditionValue <> 0)
 End Function
+
+Private Function SimpleBlockContainsSwitchLabel( _
+    ByVal sourceText As String, ByVal openingPosition As Long _
+) As Long
+    If openingPosition < 1 OrElse openingPosition > Len(sourceText) OrElse _
+       Asc(sourceText, openingPosition) <> Asc("{") Then Return 0
+
+    Dim braceDepth As Long = 1
+    Dim quoteByte As Long = 0
+    Dim escaped As Long = 0
+    Dim position As Long = openingPosition + 1
+    While position <= Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            If escaped <> 0 Then
+                escaped = 0
+            ElseIf currentByte = Asc(Chr(92)) Then
+                escaped = -1
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+        ElseIf currentByte = Asc(Chr(34)) OrElse currentByte = Asc("'") Then
+            quoteByte = currentByte
+        ElseIf currentByte = Asc("{") Then
+            braceDepth += 1
+        ElseIf currentByte = Asc("}") Then
+            braceDepth -= 1
+            If braceDepth = 0 Then Return 0
+        ElseIf braceDepth = 1 AndAlso _
+               (currentByte = Asc("c") OrElse currentByte = Asc("d")) AndAlso _
+               IsSimpleSwitchLabel(sourceText, position) <> 0 Then
+            Return -1
+        End If
+        position += 1
+    Wend
+    Return 0
+End Function
+
 
 Private Function ParseSimpleCBlock( _
     ByRef translation As C2fbTranslationContext, _
@@ -1022,6 +1525,15 @@ Private Function ParseSimpleCBlock( _
     terminatesPaths = 0
     SkipCSpaces(sourceText, position)
     If position > Len(sourceText) OrElse Asc(sourceText, position) <> Asc("{") Then Return 0
+    If context.frameCount > 0 AndAlso _
+       context.frames(context.frameCount - 1).isSwitch <> 0 AndAlso _
+       SimpleBlockContainsSwitchLabel(sourceText, position) <> 0 Then
+        position += 1
+        If PushSimpleBodyScope(context, symbolCount, localCount) = 0 Then Return 0
+        context.frames(context.frameCount - 1).nestedCaseBlockDepth += 1
+        outputText = indentText & "' C nested switch-case scope"
+        Return -1
+    End If
     position += 1
     Dim statementCount As Long = 0
     If PushSimpleBodyScope(context, symbolCount, localCount) = 0 Then Return 0
@@ -1060,23 +1572,44 @@ Private Function ParseSimpleFallthroughAnnotation( _
 ) As Long
     Dim parsePosition As Long = position
     SkipCSpaces(sourceText, parsePosition)
-    If Mid(sourceText, parsePosition, 13) <> "__attribute__" Then Return 0
-    If parsePosition + 13 <= Len(sourceText) AndAlso _
-       IsIdentifierPart(Asc(sourceText, parsePosition + 13)) <> 0 Then Return 0
-
-    parsePosition += 13
-    SkipCSpaces(sourceText, parsePosition)
-    If parsePosition > Len(sourceText) OrElse _
-       Asc(sourceText, parsePosition) <> Asc("(") Then Return 0
-    Dim attributeStart As Long = parsePosition + 1
-    If ScanSimpleExpressionGroup(sourceText, parsePosition, Asc("("), Asc(")")) = 0 Then Return 0
-
     Dim attributeText As String
-    For i As Long = attributeStart To parsePosition - 2
-        If IsSpaceByte(Asc(sourceText, i)) = 0 Then attributeText &= LCase(Mid(sourceText, i, 1))
-    Next
-    If attributeText <> "(fallthrough)" AndAlso _
-       attributeText <> "(__fallthrough__)" Then Return 0
+    If Mid(sourceText, parsePosition, 2) = "[[" Then
+        ' GCC preprocessing can normalize this GNU attribute to C23 spelling.
+        Dim attributeStart As Long = parsePosition + 2
+        Dim attributeEnd As Long = InStr(attributeStart, sourceText, "]]")
+        If attributeEnd = 0 Then Return 0
+        For i As Long = attributeStart To attributeEnd - 1
+            If IsSpaceByte(Asc(sourceText, i)) = 0 Then _
+                attributeText &= LCase(Mid(sourceText, i, 1))
+        Next
+        Select Case attributeText
+        Case "fallthrough", "__fallthrough__", _
+             "gnu::fallthrough", "gnu::__fallthrough__", _
+             "__gnu__::fallthrough", "__gnu__::__fallthrough__"
+            parsePosition = attributeEnd + 2
+        Case Else
+            Return 0
+        End Select
+    Else
+        If Mid(sourceText, parsePosition, 13) <> "__attribute__" Then Return 0
+        If parsePosition + 13 <= Len(sourceText) AndAlso _
+           IsIdentifierPart(Asc(sourceText, parsePosition + 13)) <> 0 Then Return 0
+
+        parsePosition += 13
+        SkipCSpaces(sourceText, parsePosition)
+        If parsePosition > Len(sourceText) OrElse _
+           Asc(sourceText, parsePosition) <> Asc("(") Then Return 0
+        Dim attributeStart As Long = parsePosition + 1
+        If ScanSimpleExpressionGroup( _
+            sourceText, parsePosition, Asc("("), Asc(")")) = 0 Then Return 0
+
+        For i As Long = attributeStart To parsePosition - 2
+            If IsSpaceByte(Asc(sourceText, i)) = 0 Then _
+                attributeText &= LCase(Mid(sourceText, i, 1))
+        Next
+        If attributeText <> "(fallthrough)" AndAlso _
+           attributeText <> "(__fallthrough__)" Then Return 0
+    End If
 
     SkipCSpaces(sourceText, parsePosition)
     If parsePosition > Len(sourceText) OrElse _
@@ -1207,6 +1740,111 @@ Private Function TranslateSimpleLocalRecordTypeDefinition( _
     Return -1
 End Function
 
+Private Function TranslateSimpleLocalRecordTypedef( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal statementText As String, _
+    ByRef outputText As String, _
+    ByRef context As SimpleBodyContext _
+) As Long
+    statementText = Trim(statementText)
+    If Right(statementText, 1) = ";" Then _
+        statementText = RTrim(Left(statementText, Len(statementText) - 1))
+    Dim typeTokens() As String
+    Dim typeTokenCount As Long
+    TokenizeCDeclaration(statementText, typeTokens(), typeTokenCount)
+    If typeTokenCount <> 4 OrElse typeTokens(0) <> "typedef" OrElse _
+       (typeTokens(1) <> "struct" AndAlso typeTokens(1) <> "union") OrElse _
+       IsIdentifierToken(typeTokens(2)) = 0 OrElse _
+       IsIdentifierToken(typeTokens(3)) = 0 Then Return 0
+
+    Dim freeBasicType As String = SimpleBodyLocalRecordType( _
+        context, typeTokens(2))
+    If freeBasicType = "" Then _
+        freeBasicType = MappedFbBodyRecord(translation, catalog, typeTokens(2))
+    If freeBasicType = "" OrElse _
+       RegisterSimpleBodyLocalRecordTag( _
+           context, typeTokens(3), freeBasicType) = 0 Then Return 0
+    outputText = "' C block-local record typedef"
+    Return -1
+End Function
+
+Private Function IsSimpleCallableExpressionStatement( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal statementText As String _
+) As Long
+    Dim position As Long = 1
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       IsIdentifierStart(Asc(statementText, position)) = 0 Then Return 0
+
+    Dim statementName As String
+    While position <= Len(statementText) AndAlso _
+          IsIdentifierPart(Asc(statementText, position)) <> 0
+        statementName &= Mid(statementText, position, 1)
+        position += 1
+    Wend
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc("(") Then Return 0
+    Return CInt(IsTypeOrQualifierTokenInContext(translation, statementName) = 0)
+End Function
+
+Private Function SimpleCStatementAlwaysTerminates( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal statementText As String, _
+    parameterNames() As String, parameterAliases() As String, _
+    ByVal parameterCount As Long _
+) As Long
+    statementText = Trim(statementText)
+    If Right(statementText, 1) = ";" Then _
+        statementText = RTrim(Left(statementText, Len(statementText) - 1))
+    statementText = StripSimpleOuterParentheses(statementText)
+    Dim nameEnd As Long = 1
+    While nameEnd <= Len(statementText) AndAlso _
+          IsIdentifierPart(Asc(statementText, nameEnd)) <> 0
+        nameEnd += 1
+    Wend
+    If nameEnd <= 1 Then Return 0
+    Dim procedureName As String = Left(statementText, nameEnd - 1)
+    If ParameterAlias( _
+        parameterNames(), parameterAliases(), parameterCount, _
+        procedureName) <> "" OrElse _
+       CBodyExternalObjectIndex(translation, procedureName) >= 0 Then Return 0
+    Dim position As Long = nameEnd
+    SkipCSpaces(statementText, position)
+    If position > Len(statementText) OrElse _
+       Asc(statementText, position) <> Asc("(") Then Return 0
+
+    Select Case procedureName
+    Case "abort", "exit", "_Exit", "_exit", "quick_exit", _
+         "__builtin_trap", "__builtin_unreachable"
+        Return -1
+    Case "error", "error_at_line"
+        Dim callEnd As Long = position
+        If ScanSimpleExpressionGroup( _
+            statementText, callEnd, Asc("("), Asc(")")) = 0 OrElse _
+           Trim(Mid(statementText, callEnd)) <> "" Then Return 0
+        Dim argumentsText As String = Trim(Mid( _
+            statementText, position + 1, callEnd - position - 2))
+        Dim arguments() As String
+        Dim argumentCount As Long
+        If SplitSimpleCList(argumentsText, arguments(), argumentCount) = 0 OrElse _
+           argumentCount = 0 Then Return 0
+        Dim statusText As String = Trim(arguments(0))
+        If Left(statusText, 1) = "-" Then statusText = Trim(Mid(statusText, 2))
+        Dim statusValue As Long
+        If EvaluateSimpleArrayBound( _
+            statusText, statusValue, MAX_GENERIC_ARRAY_COUNT, -1) = 0 AndAlso _
+           EvaluateGenericBodyArrayBound( _
+               translation, statusText, statusValue, _
+               MAX_GENERIC_ARRAY_COUNT) = 0 Then Return 0
+        ' GNU error() and error_at_line() exit when STATUS is nonzero.
+        Return CInt(statusValue <> 0)
+    End Select
+    Return 0
+End Function
+
 Private Function ParseSimpleCStatement( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -1247,6 +1885,13 @@ Private Function ParseSimpleCStatement( _
         If labelName = "" Then Return 0
         outputText = indentText & labelName & ":"
         position = following + 1
+        Return -1
+    End If
+
+    If wordText = "_Static_assert" OrElse wordText = "static_assert" Then
+        Dim assertionText As String
+        If ReadSimpleCStatement(sourceText, position, assertionText) = 0 Then Return 0
+        outputText = indentText & "' C compile-time assertion checked by the C compiler"
         Return -1
     End If
 
@@ -1495,7 +2140,8 @@ Private Function ParseSimpleCStatement( _
                      indentText & breakLabel & ":"
         terminatesPaths = CInt(loopTerminates <> 0 OrElse _
             (hasBreak = 0 AndAlso conditionPrelude = "" AndAlso _
-             SimpleCConditionAlwaysTrue(conditionText) <> 0))
+             SimpleCConditionAlwaysTrue(translation, conditionText, _
+                 parameterNames(), parameterAliases(), symbolCount) <> 0))
         Return -1
     End If
 
@@ -1667,7 +2313,8 @@ Private Function ParseSimpleCStatement( _
         outputText &= Chr(10) & indentText & continueLabel & ":" & _
                       Chr(10) & indentText & IIf(conditionPrelude <> "", "Loop", "Wend") & Chr(10) & indentText & breakLabel & ":"
         If hasBreak = 0 AndAlso conditionPrelude = "" AndAlso _
-           SimpleCConditionAlwaysTrue(conditionText) <> 0 Then _
+           SimpleCConditionAlwaysTrue(translation, conditionText, _
+               parameterNames(), parameterAliases(), symbolCount) <> 0 Then _
             terminatesPaths = -1
         Return -1
     End If
@@ -1691,6 +2338,19 @@ Private Function ParseSimpleCStatement( _
 
     Dim simpleText As String
     If ReadSimpleCStatement(sourceText, position, simpleText) = 0 Then Return 0
+    simpleText = StripSimpleUnusedLeadingAttribute(simpleText)
+    If IsSimpleCallableExpressionStatement(translation, simpleText) <> 0 Then
+        Dim translatedCall As String
+        If TranslateSimpleAssignmentStatement( _
+            translation, catalog, simpleText, translatedCall, context, _
+            callableNames(), callableCount, parameterNames(), _
+            parameterAliases(), parameterTypes(), symbolCount) = 0 Then Return 0
+        outputText = IndentSimpleBodyText(translatedCall, indentText)
+        terminatesPaths = SimpleCStatementAlwaysTerminates( _
+            translation, simpleText, parameterNames(), parameterAliases(), _
+            symbolCount)
+        Return -1
+    End If
     If IsUnusedLocalRecordDefinition( _
         simpleText, Mid(sourceText, position)) <> 0 Then
         outputText = indentText & "' unused local record definition"
@@ -1700,6 +2360,19 @@ Private Function ParseSimpleCStatement( _
     If TranslateSimpleLocalRecordTypeDefinition( _
         translation, catalog, simpleText, localRecordOutput, context) <> 0 Then
         outputText = indentText & localRecordOutput
+        Return -1
+    End If
+    If TranslateSimpleLocalRecordTypedef( _
+        translation, catalog, simpleText, localRecordOutput, context) <> 0 Then
+        outputText = indentText & localRecordOutput
+        Return -1
+    End If
+    Dim localEnumOutput As String
+    If TranslateSimpleLocalEnumDefinition( _
+        translation, catalog, simpleText, localEnumOutput, context, locals(), _
+        localCount, parameterNames(), parameterAliases(), parameterTypes(), _
+        symbolCount) <> 0 Then
+        outputText = indentText & localEnumOutput
         Return -1
     End If
     If IsSimpleUnusedParameterStatement(simpleText) <> 0 OrElse IsSimpleVoidZeroStatement(simpleText) <> 0 Then
@@ -1717,6 +2390,9 @@ Private Function ParseSimpleCStatement( _
                                           callableCount, parameterNames(), parameterAliases(), parameterTypes(), _
                                           symbolCount) = 0 Then Return 0
     outputText = IndentSimpleBodyText(translatedStatement, indentText)
+    terminatesPaths = SimpleCStatementAlwaysTerminates( _
+        translation, simpleText, parameterNames(), parameterAliases(), _
+        symbolCount)
     Return -1
 End Function
 

@@ -123,6 +123,22 @@ Private Sub WriteCBodyCallbackDeclarations( _
     Dim callbackUsedByExternalDeclaration(Any) As Long
     ReDim callbackUsedByExternalDeclaration( _
         0 To translation.body.callbackCount - 1)
+    ' Index callback type spellings once; large system headers can contain
+    ' thousands of aliases, and linear lookup inside dependency closure scales
+    ' poorly for those translation units.
+    Dim callbackIndexByType As C2fbStringIndexMapModel
+    ResetC2fbStringIndexMap(callbackIndexByType)
+    For callbackIndex As Long = 0 To translation.body.callbackCount - 1
+        With translation.body.callbacks(callbackIndex)
+            If AddC2fbStringIndexMapEntry( _
+                callbackIndexByType, .fbType, callbackIndex) = 0 Then _
+                ReportError("callback type index exceeds its configured limit")
+            If .declaration <> .fbType AndAlso _
+               AddC2fbStringIndexMapEntry( _
+                   callbackIndexByType, .declaration, callbackIndex) = 0 Then _
+                ReportError("callback declaration index exceeds its configured limit")
+        End With
+    Next
     For procedureIndex As Long = 0 To _
         translation.symbolTable.symbolCount - 1
         With translation.symbolTable.symbols(procedureIndex)
@@ -148,98 +164,151 @@ Private Sub WriteCBodyCallbackDeclarations( _
             Next
             If procedureIsUsed = 0 Then Continue For
 
-            Dim returnCallbackIndex As Long = CBodyCallbackIndexInContext( _
-                translation, .body.returnType)
+            Dim returnCallbackIndex As Long = _
+                C2fbStringIndexMapLookup( _
+                    callbackIndexByType, .body.returnType)
             If returnCallbackIndex >= 0 Then _
                 callbackUsedByExternalDeclaration(returnCallbackIndex) = -1
             For parameterIndex As Long = 0 To .body.parameterCount - 1
-                Dim parameterCallbackIndex As Long = CBodyCallbackIndexInContext( _
-                    translation, CBodyParameterType( _
-                        translation, catalog, .sourceName, parameterIndex))
+                Dim parameterCallbackIndex As Long = _
+                    C2fbStringIndexMapLookup( _
+                        callbackIndexByType, CBodyParameterType( _
+                            translation, catalog, .sourceName, parameterIndex))
                 If parameterCallbackIndex >= 0 Then _
                     callbackUsedByExternalDeclaration(parameterCallbackIndex) = -1
             Next
         End With
     Next
 
-    For callbackIndex As Long = 0 To translation.body.callbackCount - 1
-        Dim isUsed As Long = callbackUsedByExternalDeclaration(callbackIndex)
-        If isUsed = 0 AndAlso _
-           translation.body.includeGlobalDefinitions <> 0 Then
-            For objectIndex As Long = 0 To _
-                translation.body.externalObjectCount - 1
-                With translation.body.externalObjects(objectIndex)
-                    If .isAmbiguous = 0 AndAlso .isReused = 0 AndAlso _
-                       .isDefinition <> 0 AndAlso _
-                       .freeBasicType = translation.body.callbacks(callbackIndex).fbType Then
-                        isUsed = -1
-                        Exit For
-                    End If
-                End With
-            Next
-        End If
-        If isUsed = 0 AndAlso _
-           translation.body.includeGlobalDefinitions <> 0 Then
-            For objectIndex As Long = 0 To _
-                translation.body.externalObjectCount - 1
-                With translation.body.externalObjects(objectIndex)
-                    If .isAmbiguous = 0 AndAlso .isReused = 0 AndAlso _
-                       .isDefinition <> 0 AndAlso _
-                       .freeBasicType = translation.body.callbacks(callbackIndex).fbType Then
-                        isUsed = -1
-                        Exit For
-                    End If
-                End With
-            Next
-        End If
-        For candidateIndex As Long = 0 To candidateCount - 1
-            If C2fbBodyCandidateWillBeEmitted( _
-                candidates(candidateIndex)) = 0 Then Continue For
+    ' Callback aliases used by candidate signatures can depend on other
+    ' callback aliases. Seed directly from emitted declarations, globals, and
+    ' used generated records before walking those dependencies.
+    For candidateIndex As Long = 0 To candidateCount - 1
+        If C2fbBodyCandidateWillBeEmitted( _
+            candidates(candidateIndex)) = 0 Then Continue For
+        For callbackIndex As Long = 0 To translation.body.callbackCount - 1
             If InStr(candidates(candidateIndex).source, _
-                     translation.body.callbacks(callbackIndex).fbType) <> 0 Then
-                isUsed = -1
-                Exit For
-            End If
-            For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
-                With translation.body.externalObjects(objectIndex)
-                    If .freeBasicType = translation.body.callbacks(callbackIndex).fbType AndAlso _
-                       (InStr(candidates(candidateIndex).source, .freeBasicName) <> 0 OrElse _
-                        CBodyUsesIdentifier(candidates(candidateIndex).source, .sourceName) <> 0) Then
-                        isUsed = -1
-                        Exit For
-                    End If
-                End With
-            Next
-            If isUsed <> 0 Then Exit For
+                     translation.body.callbacks(callbackIndex).fbType) <> 0 Then _
+                callbackUsedByExternalDeclaration(callbackIndex) = -1
         Next
-        If isUsed = 0 Then
-            For bindingIndex As Long = 0 To _
-                translation.body.recordBindingCount - 1
-                If generatedRecordIsUsed(bindingIndex) = 0 OrElse _
-                   translation.body.recordBindings(bindingIndex).isGenerated = 0 OrElse _
-                   (translation.body.recordBindings(bindingIndex).recordKind <> _
-                        C2FB_RECORD_STRUCT AndAlso _
-                    translation.body.recordBindings(bindingIndex).recordKind <> _
-                        C2FB_RECORD_UNION) Then Continue For
-                For fieldIndex As Long = 0 To translation.body.recordFieldCount - 1
-                    With translation.body.recordFields(fieldIndex)
-                        Dim fieldCallbackType As String = .callbackType
-                        If fieldCallbackType = "" Then _
-                            fieldCallbackType = LookupCBodyCallbackTypeAlias( _
-                                translation, .sourceType)
-                        If .ownerName = translation.body.recordBindings( _
-                            bindingIndex).sourceName AndAlso _
-                           fieldCallbackType = translation.body.callbacks( _
-                            callbackIndex).fbType Then
-                            isUsed = -1
-                            Exit For
-                        End If
-                    End With
-                Next
-                If isUsed <> 0 Then Exit For
-            Next
+    Next
+
+    If translation.body.includeGlobalDefinitions <> 0 Then
+        For objectIndex As Long = 0 To _
+            translation.body.externalObjectCount - 1
+            With translation.body.externalObjects(objectIndex)
+                If .isAmbiguous <> 0 OrElse .isReused <> 0 OrElse _
+                   .isDefinition = 0 Then Continue For
+                Dim callbackIndex As Long = C2fbStringIndexMapLookup( _
+                    callbackIndexByType, .freeBasicType)
+                If callbackIndex >= 0 Then _
+                    callbackUsedByExternalDeclaration(callbackIndex) = -1
+            End With
+        Next
+    End If
+
+    For candidateIndex As Long = 0 To candidateCount - 1
+        If C2fbBodyCandidateWillBeEmitted( _
+            candidates(candidateIndex)) = 0 Then Continue For
+        For objectIndex As Long = 0 To _
+            translation.body.externalObjectCount - 1
+            With translation.body.externalObjects(objectIndex)
+                Dim callbackIndex As Long = C2fbStringIndexMapLookup( _
+                    callbackIndexByType, .freeBasicType)
+                If callbackIndex < 0 Then Continue For
+                If InStr(candidates(candidateIndex).source, .freeBasicName) <> 0 OrElse _
+                   CBodyUsesIdentifier( _
+                       candidates(candidateIndex).source, .sourceName) <> 0 Then _
+                    callbackUsedByExternalDeclaration(callbackIndex) = -1
+            End With
+        Next
+    Next
+
+    Dim generatedRecordBindingByName As C2fbStringIndexMapModel
+    ResetC2fbStringIndexMap(generatedRecordBindingByName)
+    For bindingIndex As Long = 0 To _
+        translation.body.recordBindingCount - 1
+        With translation.body.recordBindings(bindingIndex)
+            If generatedRecordIsUsed(bindingIndex) = 0 OrElse _
+               .isGenerated = 0 OrElse _
+               (.recordKind <> C2FB_RECORD_STRUCT AndAlso _
+                .recordKind <> C2FB_RECORD_UNION) Then Continue For
+            If AddC2fbStringIndexMapEntry( _
+                generatedRecordBindingByName, .sourceName, bindingIndex) = 0 Then _
+                ReportError("generated callback-record index exceeds its configured limit")
+        End With
+    Next
+    For fieldIndex As Long = 0 To translation.body.recordFieldCount - 1
+        With translation.body.recordFields(fieldIndex)
+            Dim bindingIndex As Long = C2fbStringIndexMapLookup( _
+                generatedRecordBindingByName, .ownerName)
+            If bindingIndex < 0 Then Continue For
+            Dim fieldCallbackType As String = .callbackType
+            If fieldCallbackType = "" Then _
+                fieldCallbackType = LookupCBodyCallbackTypeAlias( _
+                    translation, .sourceType)
+            Dim callbackIndex As Long = C2fbStringIndexMapLookup( _
+                callbackIndexByType, fieldCallbackType)
+            If callbackIndex >= 0 Then _
+                callbackUsedByExternalDeclaration(callbackIndex) = -1
+        End With
+    Next
+
+    ' Walk only aliases reached from declarations instead of rescanning the
+    ' complete callback catalog once per dependency layer.
+    Dim callbackDependencyQueue(Any) As Long
+    ReDim callbackDependencyQueue(0 To translation.body.callbackCount - 1)
+    Dim callbackQueueCount As Long = 0
+    Dim callbackQueueRead As Long = 0
+    For callbackIndex As Long = 0 To translation.body.callbackCount - 1
+        If callbackUsedByExternalDeclaration(callbackIndex) = 0 Then Continue For
+        callbackDependencyQueue(callbackQueueCount) = callbackIndex
+        callbackQueueCount += 1
+    Next
+    While callbackQueueRead < callbackQueueCount
+        Dim callbackIndex As Long = _
+            callbackDependencyQueue(callbackQueueRead)
+        callbackQueueRead += 1
+        Dim dependencyIndex As Long = C2fbStringIndexMapLookup( _
+            callbackIndexByType, _
+            translation.body.callbacks(callbackIndex).returnType)
+        If dependencyIndex >= 0 AndAlso _
+           callbackUsedByExternalDeclaration(dependencyIndex) = 0 Then
+            callbackUsedByExternalDeclaration(dependencyIndex) = -1
+            If callbackQueueCount >= translation.body.callbackCount Then
+                ReportError("callback dependency queue exceeds its configured limit")
+                Exit Sub
+            End If
+            callbackDependencyQueue(callbackQueueCount) = dependencyIndex
+            callbackQueueCount += 1
         End If
-        If isUsed = 0 Then Continue For
+        For parameterIndex As Long = 0 To _
+            translation.body.callbacks(callbackIndex).parameterCount - 1
+            Dim parameterType As String = _
+                CBodyCallbackParameterTypeAtIndexInContext( _
+                    translation, callbackIndex, parameterIndex)
+            While Right(parameterType, 4) = " Ptr"
+                parameterType = Left(parameterType, Len(parameterType) - 4)
+            Wend
+            If Left(parameterType, 6) = "Const " Then _
+                parameterType = Mid(parameterType, 7)
+            dependencyIndex = C2fbStringIndexMapLookup( _
+                callbackIndexByType, parameterType)
+            If dependencyIndex >= 0 AndAlso _
+               callbackUsedByExternalDeclaration(dependencyIndex) = 0 Then
+                callbackUsedByExternalDeclaration(dependencyIndex) = -1
+                If callbackQueueCount >= translation.body.callbackCount Then
+                    ReportError("callback dependency queue exceeds its configured limit")
+                    Exit Sub
+                End If
+                callbackDependencyQueue(callbackQueueCount) = dependencyIndex
+                callbackQueueCount += 1
+            End If
+        Next
+    Wend
+
+    For callbackIndex As Long = 0 To translation.body.callbackCount - 1
+        If callbackUsedByExternalDeclaration(callbackIndex) = 0 Then Continue For
         Dim requiresGeneratedRecord As Long = _
             C2fbCallbackUsesGeneratedRecordByValue( _
                 translation, callbackIndex, generatedRecordIsUsed())
@@ -355,6 +424,12 @@ Private Sub IndexCBodyGeneratedLocalRecordUsage( _
                                .freeBasicType, _
                                translation.body.recordBindings( _
                                    bindingIndex).fbName) = 0 Then Continue For
+                        If translation.body.includeGlobalDefinitions <> 0 AndAlso _
+                           .isDefinition <> 0 AndAlso .isStatic = 0 AndAlso _
+                           InStr(.freeBasicType, " Ptr") = 0 Then
+                            generatedRecordIsUsed(bindingIndex) = -1
+                            Exit For
+                        End If
                         For candidateIndex As Long = 0 To candidateCount - 1
                             If C2fbBodyCandidateWillBeEmitted( _
                                 candidates(candidateIndex)) <> 0 AndAlso _
@@ -461,9 +536,11 @@ Private Sub IndexC2fbCandidateIncludedDeclarations( _
     For entryIndex As Long = 0 To preamble.entryCount - 1
         With preamble.entries(entryIndex)
             If .kind <> C2FB_FILE_PREAMBLE_INCLUDE_ONCE Then Continue For
-            Dim fileName As String = FileNameOnly(.value)
+            Dim fileName As String = .value
             If LCase(Right(fileName, 3)) <> ".bi" Then Continue For
             Dim headerPath As String = sourceDirectory & "/" & fileName
+            If FileLengthIfPresent(headerPath) < 0 Then _
+                headerPath = sourceDirectory & "/" & FileNameOnly(fileName)
             If FileLengthIfPresent(headerPath) < 0 Then Continue For
 
             Dim lineReader As C2fbTextFileLineReaderModel
@@ -494,14 +571,11 @@ Private Sub WriteCandidateDeclarations( _
     ByVal sourceDirectory As String, _
     candidates() As C2fbBodyCandidateModel, _
     ByVal candidateCount As Long, _
-    ByRef preamble As C2fbGeneratedFilePreambleModel _
+    ByRef includedDeclarationNames As C2fbNameSetModel _
 )
     Dim declarationFiles(0 To 1) As String
     declarationFiles(0) = "sqlite3_api_declarations.bi"
     declarationFiles(1) = "sqlite3_internal_api_declarations.bi"
-    Dim includedDeclarationNames As C2fbNameSetModel
-    IndexC2fbCandidateIncludedDeclarations( _
-        preamble, sourceDirectory, includedDeclarationNames)
     Dim emittedNames() As String
     ReDim emittedNames(0 To 255)
     Dim emittedCount As Long = 0
@@ -548,6 +622,12 @@ Private Sub WriteCandidateDeclarations( _
                     includedDeclarationNames, declarationAlias) = 0) AndAlso _
                C2fbNameListContains(emittedNames(), emittedCount, procedureName) = 0 Then
                 WriteC2fbOutputLine(outputFile, sourceLine)
+                If AddC2fbNameSet( _
+                    includedDeclarationNames, procedureName) = 0 Then _
+                    ReportError("candidate declaration index exceeds its configured limit")
+                If declarationAlias <> "" AndAlso AddC2fbNameSet( _
+                    includedDeclarationNames, declarationAlias) = 0 Then _
+                    ReportError("candidate declaration index exceeds its configured limit")
                 If emittedCount >= UBound(emittedNames) Then _
                     ReDim Preserve emittedNames(0 To UBound(emittedNames) * 2 + 1)
                 emittedNames(emittedCount) = procedureName
@@ -561,71 +641,23 @@ End Sub
 Private Sub WriteExistingBodyDeclarations( _
     ByRef catalog As C2fbProjectCatalog, _
     ByRef outputFile As C2fbGeneratedFileOutputModel, _
-    ByVal sourceDirectory As String, _
-    existingDeclarations() As String, _
-    ByVal existingDeclarationCount As Long, _
+    ByRef includedDeclarationNames As C2fbNameSetModel, _
     candidates() As C2fbBodyCandidateModel, _
     ByVal candidateCount As Long _
 )
-    Dim hasCandidateBody As Long = 0
+    Dim candidateDefinitionNames As C2fbNameSetModel
+    ResetC2fbNameSet(candidateDefinitionNames)
     For candidateIndex As Long = 0 To candidateCount - 1
-        If candidates(candidateIndex).source <> "" AndAlso _
-           candidates(candidateIndex).duplicate = 0 AndAlso _
-           candidates(candidateIndex).skipMessage = "" Then
-            hasCandidateBody = -1
-            Exit For
-        End If
-    Next
-    If hasCandidateBody = 0 Then Exit Sub
-
-    ' Existing declarations and body signatures are indexed before candidate
-    ' emission. Reuse those records instead of rescanning every module here.
-    Dim declaredNames() As String
-    ReDim declaredNames(0 To 255)
-    Dim declaredCount As Long = 0
-    For declarationIndex As Long = 0 To existingDeclarationCount - 1
-        If C2fbNameListContains(declaredNames(), declaredCount, _
-                       existingDeclarations(declarationIndex)) = 0 Then
-            If declaredCount > UBound(declaredNames) Then _
-                ReDim Preserve declaredNames(0 To UBound(declaredNames) * 2 + 1)
-            declaredNames(declaredCount) = existingDeclarations(declarationIndex)
-            declaredCount += 1
-        End If
-    Next
-
-    ' These API declarations are emitted by WriteCandidateDeclarations.
-    ' Record them here to avoid emitting a second prototype from a .bas body.
-    Dim apiDeclarationFiles(0 To 1) As String
-    apiDeclarationFiles(0) = "sqlite3_api_declarations.bi"
-    apiDeclarationFiles(1) = "sqlite3_internal_api_declarations.bi"
-    For fileIndex As Long = 0 To UBound(apiDeclarationFiles)
-        Dim declarationPath As String = _
-            sourceDirectory & "/" & apiDeclarationFiles(fileIndex)
-        Dim declarationReader As C2fbTextFileLineReaderModel
-        If OpenC2fbTextFileLineReader( _
-            declarationReader, declarationPath) <> 0 Then
-            Dim declarationLine As String
-            While ReadC2fbTextFileLine( _
-                declarationReader, declarationLine) <> 0
-                Dim declaredName As String = FbDeclarationName(declarationLine)
-                If declaredName <> "" AndAlso _
-                   C2fbNameListContains(declaredNames(), declaredCount, declaredName) = 0 Then
-                    If declaredCount > UBound(declaredNames) Then _
-                        ReDim Preserve declaredNames(0 To UBound(declaredNames) * 2 + 1)
-                    declaredNames(declaredCount) = declaredName
-                    declaredCount += 1
-                End If
-                Dim declaredAlias As String = FbDeclarationAliasName(declarationLine)
-                If declaredAlias <> "" AndAlso _
-                   C2fbNameListContains(declaredNames(), declaredCount, declaredAlias) = 0 Then
-                    If declaredCount > UBound(declaredNames) Then _
-                        ReDim Preserve declaredNames(0 To UBound(declaredNames) * 2 + 1)
-                    declaredNames(declaredCount) = declaredAlias
-                    declaredCount += 1
-                End If
-            Wend
-            CloseC2fbTextFileLineReader(declarationReader)
-        End If
+        If C2fbBodyCandidateWillBeEmitted( _
+            candidates(candidateIndex)) = 0 Then Continue For
+        If AddC2fbNameSet( _
+            candidateDefinitionNames, candidates(candidateIndex).name) = 0 Then _
+            ReportError("candidate definition index exceeds its configured limit")
+        If candidates(candidateIndex).procedureBinding.freeBasicName <> "" AndAlso _
+           AddC2fbNameSet( _
+               candidateDefinitionNames, _
+               candidates(candidateIndex).procedureBinding.freeBasicName) = 0 Then _
+            ReportError("candidate definition index exceeds its configured limit")
     Next
 
     Dim emittedNames() As String
@@ -634,8 +666,14 @@ Private Sub WriteExistingBodyDeclarations( _
     For signatureIndex As Long = 0 To catalog.bodyCallSignatureCount - 1
         With catalog.bodyCallSignatures(signatureIndex)
             If .canDeclare = 0 OrElse .declaration = "" OrElse .parameterCount < 0 Then Continue For
-            If C2fbNameListContains(declaredNames(), declaredCount, .fbName) <> 0 OrElse _
-               C2fbNameListContains(declaredNames(), declaredCount, .name) <> 0 OrElse _
+            If C2fbNameSetContains( _
+                   includedDeclarationNames, .fbName) <> 0 OrElse _
+               C2fbNameSetContains( _
+                   includedDeclarationNames, .name) <> 0 OrElse _
+               C2fbNameSetContains( _
+                   candidateDefinitionNames, .fbName) <> 0 OrElse _
+               C2fbNameSetContains( _
+                   candidateDefinitionNames, .name) <> 0 OrElse _
                C2fbNameListContains(emittedNames(), emittedCount, .fbName) <> 0 OrElse _
                C2fbNameListContains(emittedNames(), emittedCount, .name) <> 0 Then Continue For
 
@@ -666,6 +704,11 @@ Private Sub WriteExistingBodyDeclarations( _
             Else
                 WriteC2fbOutputLine(outputFile, "Declare " & declarationText)
             End If
+            If (.fbName <> "" AndAlso _
+                AddC2fbNameSet(includedDeclarationNames, .fbName) = 0) OrElse _
+               (.name <> "" AndAlso _
+                AddC2fbNameSet(includedDeclarationNames, .name) = 0) Then _
+                ReportError("candidate declaration index exceeds its configured limit")
 
             If emittedCount > UBound(emittedNames) Then _
                 ReDim Preserve emittedNames(0 To UBound(emittedNames) * 2 + 1)
@@ -738,6 +781,67 @@ Private Function CBodyReusedObjectDeclaredOnLine( _
     Return 0
 End Function
 
+Private Function CBodyUsesCrtMemory( _
+    ByRef translation As C2fbTranslationContext, _
+    candidates() As C2fbBodyCandidateModel, ByVal candidateCount As Long _
+) As Long
+    ' Header-selected function bodies can contain ordinary C memory calls
+    ' after filtering removed their declarations from the FreeBASIC context.
+    For candidateIndex As Long = 0 To candidateCount - 1
+        If C2fbBodyCandidateWillBeEmitted( _
+            candidates(candidateIndex)) = 0 Then Continue For
+        For procedureNameIndex As Long = 0 To 3
+            Dim procedureName As String
+            Select Case procedureNameIndex
+            Case 0: procedureName = "memcmp"
+            Case 1: procedureName = "memcpy"
+            Case 2: procedureName = "memmove"
+            Case 3: procedureName = "memset"
+            End Select
+            If CBodyProcedureIndex(translation, procedureName) < 0 AndAlso _
+               CBodyUsesProcedure( _
+                   candidates(candidateIndex).source, procedureName) <> 0 Then _
+                Return -1
+        Next
+    Next
+
+    For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
+        With translation.body.externalObjects(objectIndex)
+            If .initializerText = "" OrElse .isAmbiguous <> 0 OrElse _
+               .isReused <> 0 Then Continue For
+            Dim objectInitializerIsUsed As Long = 0
+            If .isStatic <> 0 Then
+                For candidateIndex As Long = 0 To candidateCount - 1
+                    If C2fbBodyCandidateWillBeEmitted( _
+                        candidates(candidateIndex)) <> 0 AndAlso _
+                       CBodyUsesIdentifier( _
+                           candidates(candidateIndex).source, _
+                           .freeBasicName) <> 0 Then
+                        objectInitializerIsUsed = -1
+                        Exit For
+                    End If
+                Next
+            ElseIf translation.body.includeGlobalDefinitions <> 0 AndAlso _
+                   .isDefinition <> 0 Then
+                objectInitializerIsUsed = -1
+            End If
+            If objectInitializerIsUsed = 0 Then Continue For
+            For procedureNameIndex As Long = 0 To 3
+                Dim procedureName As String
+                Select Case procedureNameIndex
+                Case 0: procedureName = "memcmp"
+                Case 1: procedureName = "memcpy"
+                Case 2: procedureName = "memmove"
+                Case 3: procedureName = "memset"
+                End Select
+                If CBodyUsesProcedure( _
+                    .initializerText, procedureName) <> 0 Then Return -1
+            Next
+        End With
+    Next
+    Return 0
+End Function
+
 Private Sub WriteCandidateIncludes( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -756,6 +860,20 @@ Private Sub WriteCandidateIncludes( _
             Exit For
         End If
     Next
+    If hasCandidateBody = 0 AndAlso _
+       translation.body.includeGlobalDefinitions <> 0 Then
+        For objectIndex As Long = 0 To _
+            translation.body.externalObjectCount - 1
+            With translation.body.externalObjects(objectIndex)
+                If .isDefinition <> 0 AndAlso .isStatic = 0 AndAlso _
+                   .isAmbiguous = 0 AndAlso .isReused = 0 AndAlso _
+                   .initializerText <> "" Then
+                    hasCandidateBody = -1
+                    Exit For
+                End If
+            End With
+        Next
+    End If
     If hasCandidateBody = 0 Then Exit Sub
     Dim isSqliteTarget As Long = CInt(targetProfile = C2FB_TARGET_SQLITE)
 
@@ -831,6 +949,19 @@ Private Sub WriteCandidateIncludes( _
             End With
         End If
     Next
+    If translation.body.includeGlobalDefinitions <> 0 Then
+        For objectIndex As Long = 0 To _
+            translation.body.externalObjectCount - 1
+            With translation.body.externalObjects(objectIndex)
+                If .isDefinition = 0 OrElse .isStatic <> 0 OrElse _
+                   .isAmbiguous <> 0 OrElse .isReused <> 0 OrElse _
+                   .initializerText = "" Then Continue For
+                AddFbBodyCalledProcedureNames( _
+                    calledProcedureNameMap, calledProcedureNameCount, _
+                    .initializerText)
+            End With
+        Next
+    End If
     For symbolIndex As Long = 0 To translation.symbolTable.symbolCount - 1
         With translation.symbolTable.symbols(symbolIndex)
             If .body.isDeclared = 0 Then Continue For
@@ -1181,11 +1312,18 @@ Private Function C2fbBodyUsesRuntimeMath( _
     Return 0
 End Function
 
+Declare Function TranslateCBodyModuleStaticInitializer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal freeBasicType As String, ByVal isArray As Long, _
+    ByVal initializerText As String, ByRef translatedText As String _
+) As Long
+
 Private Sub WriteCBodyDeclarations( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     ByRef outputFile As C2fbGeneratedFileOutputModel, candidates() As C2fbBodyCandidateModel, ByVal candidateCount As Long, _
-    existingDeclarations() As String, ByVal existingDeclarationCount As Long, _
+    ByRef includedDeclarationNames As C2fbNameSetModel, _
     ByVal keepUnresolvedDependencies As Long _
 )
     Dim singleUsed As Long = 0
@@ -1230,12 +1368,11 @@ Private Sub WriteCBodyDeclarations( _
         If candidates(i).duplicate <> 0 OrElse _
            (candidates(i).source <> "" AndAlso _
             candidates(i).skipMessage <> "") Then Continue For
-        If C2fbNameListContains( _
-            existingDeclarations(), existingDeclarationCount, _
-            candidates(i).name) <> 0 OrElse _
+        If C2fbNameSetContains( _
+            includedDeclarationNames, candidates(i).name) <> 0 OrElse _
            (candidates(i).procedureBinding.freeBasicName <> "" AndAlso _
-            C2fbNameListContains( _
-                existingDeclarations(), existingDeclarationCount, _
+            C2fbNameSetContains( _
+                includedDeclarationNames, _
                 candidates(i).procedureBinding.freeBasicName) <> 0) Then Continue For
         If candidates(i).source = "" Then
             If keepUnresolvedDependencies = 0 OrElse _
@@ -1258,18 +1395,11 @@ Private Sub WriteCBodyDeclarations( _
             Next
             If isReferenced = 0 Then Continue For
         End If
-        Dim existingSignatureIndex As Long = _
-            FbBodyCallSignatureIndex(catalog, candidates(i).name)
-        If existingSignatureIndex < 0 Then
-            existingSignatureIndex = FbBodyCallSignatureIndex( _
-                catalog, candidates(i).procedureBinding.freeBasicName)
-        End If
-        If existingSignatureIndex >= 0 AndAlso _
-           catalog.bodyCallSignatures(existingSignatureIndex).canDeclare <> 0 Then _
-            Continue For
-        ' DECLARE has no Private qualifier. A following Private definition
-        ' supplies the visibility; parser-proc.bas accepts this declaration.
-        EmitProcedureBinding(outputFile, candidates(i).procedureBinding)
+        ' Preserve source linkage for skipped helpers. A static C helper has
+        ' no external alias for other translation units to bind against.
+        Dim unresolvedBinding As C2fbProcedureBindingModel = _
+            candidates(i).procedureBinding
+        EmitProcedureBinding(outputFile, unresolvedBinding)
     Next
     For p As Long = 0 To translation.symbolTable.symbolCount - 1
         With translation.symbolTable.symbols(p)
@@ -1289,22 +1419,50 @@ Private Sub WriteCBodyDeclarations( _
                 For objectIndex As Long = 0 To _
                     translation.body.externalObjectCount - 1
                     With translation.body.externalObjects(objectIndex)
-                        If .isArray = 0 OrElse .isStatic = 0 OrElse _
-                           .initializerText = "" OrElse _
-                           CBodyUsesIdentifier( _
-                               candidates(candidateIndex).source, _
-                               .freeBasicName) = 0 OrElse _
+                        If .initializerText = "" OrElse _
+                           .isAmbiguous <> 0 OrElse .isReused <> 0 Then _
+                            Continue For
+                        Dim objectInitializerIsUsed As Long = 0
+                        If .isStatic <> 0 Then
+                            If CBodyUsesIdentifier( _
+                                candidates(candidateIndex).source, _
+                                .freeBasicName) <> 0 Then _
+                                objectInitializerIsUsed = -1
+                        ElseIf translation.body.includeGlobalDefinitions <> 0 AndAlso _
+                               .isDefinition <> 0 Then
+                            objectInitializerIsUsed = -1
+                        End If
+                        If objectInitializerIsUsed = 0 OrElse _
                            CBodyUsesIdentifier( _
                                .initializerText, _
                                CBodySymbolFreeBasicName( _
-                                   translation, catalog, p)) = 0 Then _
-                            Continue For
+                                   translation, catalog, p)) = 0 Then Continue For
                         isUsed = -1
                         Exit For
                     End With
                 Next
                 If isUsed <> 0 Then Exit For
             Next
+            If isUsed = 0 AndAlso _
+               translation.body.includeGlobalDefinitions <> 0 Then
+                ' A file-scope callback initializer is a use even when its C
+                ' translation unit contains no function candidates.
+                For objectIndex As Long = 0 To _
+                    translation.body.externalObjectCount - 1
+                    With translation.body.externalObjects(objectIndex)
+                        If .initializerText = "" OrElse _
+                           .isAmbiguous <> 0 OrElse .isReused <> 0 OrElse _
+                           .isStatic <> 0 OrElse .isDefinition = 0 Then _
+                            Continue For
+                        If CBodyUsesIdentifier( _
+                            .initializerText, CBodySymbolFreeBasicName( _
+                                translation, catalog, p)) <> 0 Then
+                            isUsed = -1
+                            Exit For
+                        End If
+                    End With
+                Next
+            End If
             If isUsed = 0 Then Continue For
             Dim parameters As String
             For i As Long = 0 To .body.parameterCount - 1
@@ -1333,8 +1491,21 @@ Private Sub WriteCBodyDeclarations( _
                .ambiguous <> 0 Then Continue For
             Dim freeBasicName As String = _
                 CBodySymbolFreeBasicName(translation, catalog, p)
-            If C2fbNameListContains( _
-                existingDeclarations(), existingDeclarationCount, freeBasicName) <> 0 Then _
+            ' A selected inline body replaces the same C external symbol.
+            Dim hasCandidateDefinition As Long = 0
+            For candidateIndex As Long = 0 To candidateCount - 1
+                If C2fbBodyCandidateWillBeEmitted( _
+                    candidates(candidateIndex)) = 0 Then Continue For
+                If candidates(candidateIndex).name = .sourceName OrElse _
+                   (candidates(candidateIndex).procedureBinding.freeBasicName <> "" AndAlso _
+                    candidates(candidateIndex).procedureBinding.freeBasicName = freeBasicName) Then
+                    hasCandidateDefinition = -1
+                    Exit For
+                End If
+            Next
+            If hasCandidateDefinition <> 0 Then Continue For
+            If C2fbNameSetContains( _
+                includedDeclarationNames, freeBasicName) <> 0 Then _
                 Continue For
             Dim isUsed As Long = 0
             For candidateIndex As Long = 0 To candidateCount - 1
@@ -1352,14 +1523,22 @@ Private Sub WriteCBodyDeclarations( _
                 For objectIndex As Long = 0 To _
                     translation.body.externalObjectCount - 1
                     With translation.body.externalObjects(objectIndex)
-                        If .isArray = 0 OrElse .isStatic = 0 OrElse _
-                           .initializerText = "" OrElse _
-                           CBodyUsesIdentifier( _
-                               candidates(candidateIndex).source, _
-                               .freeBasicName) = 0 OrElse _
-                           CBodyUsesIdentifier( _
-                               .initializerText, freeBasicName) = 0 Then _
+                        If .initializerText = "" OrElse _
+                           .isAmbiguous <> 0 OrElse .isReused <> 0 Then _
                             Continue For
+                        Dim objectInitializerIsUsed As Long = 0
+                        If .isStatic <> 0 Then
+                            If CBodyUsesIdentifier( _
+                                candidates(candidateIndex).source, _
+                                .freeBasicName) <> 0 Then _
+                                objectInitializerIsUsed = -1
+                        ElseIf translation.body.includeGlobalDefinitions <> 0 AndAlso _
+                               .isDefinition <> 0 Then
+                            objectInitializerIsUsed = -1
+                        End If
+                        If objectInitializerIsUsed = 0 OrElse _
+                           CBodyUsesIdentifier( _
+                               .initializerText, freeBasicName) = 0 Then Continue For
                         isUsed = -1
                         Exit For
                     End With
@@ -1410,24 +1589,139 @@ Private Sub WriteCBodyDeclarations( _
         End With
     Next
 
+    If translation.body.generatedStaticDeclarations <> "" Then
+        ' C file-scope compound literals require distinct storage before any
+        ' global pointer initializer that refers to their address.
+        WriteC2fbOutputLine( _
+            outputFile, "' C backing storage for static char-array literals")
+        WriteC2fbOutputText( _
+            outputFile, translation.body.generatedStaticDeclarations)
+        WriteC2fbOutputLine(outputFile, "")
+    End If
+
+    Dim externalObjectIsUsed(Any) As Long
+    If translation.body.externalObjectCount > 0 Then
+        ReDim externalObjectIsUsed( _
+            0 To translation.body.externalObjectCount - 1)
+    End If
     For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
         With translation.body.externalObjects(objectIndex)
             If .isAmbiguous <> 0 OrElse .isReused <> 0 Then Continue For
-            Dim isGlobalDefinition As Long = CInt( _
+            externalObjectIsUsed(objectIndex) = CInt( _
                 translation.body.includeGlobalDefinitions <> 0 AndAlso _
                 .isDefinition <> 0 AndAlso .isStatic = 0) * -1
-            Dim isUsed As Long = isGlobalDefinition
             For candidateIndex As Long = 0 To candidateCount - 1
                 If C2fbBodyCandidateWillBeEmitted( _
                     candidates(candidateIndex)) = 0 Then Continue For
                 If CBodyUsesIdentifier( _
                     candidates(candidateIndex).source, .freeBasicName) <> 0 Then
-                    isUsed = -1
+                    externalObjectIsUsed(objectIndex) = -1
                     Exit For
                 End If
             Next
-            If isUsed = 0 OrElse C2fbNameListContains( _
-                existingDeclarations(), existingDeclarationCount, .freeBasicName) <> 0 Then _
+        End With
+    Next
+    ' A private object can be needed only by another object's constant
+    ' initializer. Include those dependencies before emitting storage.
+    Dim dependencyAdded As Long
+    Do
+        dependencyAdded = 0
+        For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
+            If externalObjectIsUsed(objectIndex) = 0 Then Continue For
+            With translation.body.externalObjects(objectIndex)
+                If .initializerText = "" Then Continue For
+                For dependencyIndex As Long = 0 To _
+                    translation.body.externalObjectCount - 1
+                    If externalObjectIsUsed(dependencyIndex) <> 0 Then Continue For
+                    With translation.body.externalObjects(dependencyIndex)
+                        If .isAmbiguous <> 0 OrElse .isReused <> 0 Then Continue For
+                        If CBodyUsesIdentifier( _
+                            translation.body.externalObjects(objectIndex).initializerText, _
+                            .freeBasicName) = 0 Then Continue For
+                        externalObjectIsUsed(dependencyIndex) = -1
+                        dependencyAdded = -1
+                    End With
+                Next
+            End With
+        Next
+        If dependencyAdded = 0 Then Exit Do
+    Loop
+
+    ' File-scope initializers can point at private arrays declared later in
+    ' the C source. Emit those dependencies first because FreeBASIC requires
+    ' a backing object to be declared before its address appears in a static
+    ' initializer.
+    Dim externalObjectEmissionOrder(Any) As Long
+    Dim externalObjectWasEmitted(Any) As Long
+    If translation.body.externalObjectCount > 0 Then
+        ReDim externalObjectEmissionOrder( _
+            0 To translation.body.externalObjectCount - 1)
+        ReDim externalObjectWasEmitted( _
+            0 To translation.body.externalObjectCount - 1)
+    End If
+    Dim externalObjectEmissionCount As Long = 0
+    Do
+        Dim emittedObjectThisPass As Long = 0
+        For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
+            If externalObjectIsUsed(objectIndex) = 0 OrElse _
+               externalObjectWasEmitted(objectIndex) <> 0 Then Continue For
+            With translation.body.externalObjects(objectIndex)
+                If .isAmbiguous <> 0 OrElse .isReused <> 0 Then Continue For
+                Dim dependenciesReady As Long = -1
+                If .initializerText <> "" Then
+                    For dependencyIndex As Long = 0 To _
+                        translation.body.externalObjectCount - 1
+                        If dependencyIndex = objectIndex OrElse _
+                           externalObjectIsUsed(dependencyIndex) = 0 OrElse _
+                           externalObjectWasEmitted(dependencyIndex) <> 0 Then _
+                            Continue For
+                        With translation.body.externalObjects(dependencyIndex)
+                            If .isAmbiguous <> 0 OrElse .isReused <> 0 OrElse _
+                               .freeBasicName = "" Then Continue For
+                            If CBodyUsesIdentifier( _
+                                translation.body.externalObjects(objectIndex).initializerText, _
+                                .freeBasicName) <> 0 Then
+                                dependenciesReady = 0
+                                Exit For
+                            End If
+                        End With
+                    Next
+                End If
+                If dependenciesReady = 0 Then Continue For
+                externalObjectEmissionOrder(externalObjectEmissionCount) = objectIndex
+                externalObjectEmissionCount += 1
+                externalObjectWasEmitted(objectIndex) = -1
+                emittedObjectThisPass = -1
+            End With
+        Next
+        If emittedObjectThisPass = 0 Then Exit Do
+    Loop
+
+    ' Keep any cyclic constant-address initializers deterministic. C2FB does
+    ' not synthesize mutable startup code for them, so the backend can report
+    ' a forward declaration problem if FreeBASIC cannot resolve the cycle.
+    For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
+        If externalObjectIsUsed(objectIndex) = 0 OrElse _
+           externalObjectWasEmitted(objectIndex) <> 0 Then Continue For
+        With translation.body.externalObjects(objectIndex)
+            If .isAmbiguous <> 0 OrElse .isReused <> 0 Then Continue For
+        End With
+        externalObjectEmissionOrder(externalObjectEmissionCount) = objectIndex
+        externalObjectEmissionCount += 1
+        externalObjectWasEmitted(objectIndex) = -1
+    Next
+
+    For emissionIndex As Long = 0 To externalObjectEmissionCount - 1
+        Dim emissionObjectIndex As Long = _
+            externalObjectEmissionOrder(emissionIndex)
+        With translation.body.externalObjects(emissionObjectIndex)
+            If .isAmbiguous <> 0 OrElse .isReused <> 0 Then Continue For
+            Dim isGlobalDefinition As Long = CInt( _
+                translation.body.includeGlobalDefinitions <> 0 AndAlso _
+                .isDefinition <> 0 AndAlso .isStatic = 0) * -1
+            Dim isUsed As Long = externalObjectIsUsed(emissionObjectIndex)
+            If isUsed = 0 OrElse C2fbNameSetContains( _
+                includedDeclarationNames, .freeBasicName) <> 0 Then _
                 Continue For
             Dim arrayBounds As String
             If .isArray <> 0 AndAlso .isUnsizedArray = 0 Then
@@ -1440,21 +1734,38 @@ Private Sub WriteCBodyDeclarations( _
                     .isArray <> 0 AndAlso _
                     CBodyCallbackIndexInContext( _
                         translation, .freeBasicType) >= 0) * -1
+                Dim isConstRecord As Long = 0
+                If .isConst <> 0 AndAlso .isArray = 0 AndAlso _
+                   InStr(.freeBasicType, " Ptr") = 0 AndAlso _
+                   CBodyRecordName( _
+                       translation, catalog, .freeBasicType) <> "" Then _
+                    isConstRecord = -1
                 If isCallbackArray <> 0 Then
+                    ' FreeBASIC cannot qualify a procedure-pointer alias as Const.
+                    ' C constness remains tracked when lowering writes to this object.
                     Dim arrayElementType As String = .freeBasicType
-                    If .isConst <> 0 Then _
-                        arrayElementType = "Const " & arrayElementType
                     storageDeclaration = "Private Dim Shared " & .freeBasicName & _
                         arrayBounds & " As " & arrayElementType
-                ElseIf .isConst <> 0 Then
+                ElseIf .isConst <> 0 AndAlso isConstRecord = 0 Then
                     storageDeclaration = "Private Const " & .freeBasicName & arrayBounds & _
                         " As " & .freeBasicType
                 Else
+                    If isConstRecord <> 0 Then
+                        ' FreeBASIC Const values cannot provide addressable UDT storage.
+                        ' The body model still rejects writes to this C const object.
+                        WriteC2fbOutputLine(outputFile, _
+                            "' C const record uses private addressable storage.")
+                    End If
                     storageDeclaration = "Private Dim Shared " & .freeBasicName & arrayBounds & _
                         " As " & .freeBasicType
                 End If
-                If .initializerText <> "" Then _
-                    storageDeclaration &= " = " & .initializerText
+                If .initializerText <> "" Then
+                    Dim translatedInitializer As String
+                    TranslateCBodyModuleStaticInitializer( _
+                        translation, catalog, .freeBasicType, .isArray, _
+                        .initializerText, translatedInitializer)
+                    storageDeclaration &= " = " & translatedInitializer
+                End If
                 WriteC2fbOutputLine(outputFile, storageDeclaration)
                 Continue For
             End If
@@ -1466,8 +1777,13 @@ Private Sub WriteCBodyDeclarations( _
                     "Dim Shared " & .freeBasicName & arrayBounds & _
                     " Alias " & Chr(34) & .cName & Chr(34) & _
                     " As " & globalType
-                If .initializerText <> "" Then _
-                    globalStorageDeclaration &= " = " & .initializerText
+                If .initializerText <> "" Then
+                    Dim translatedInitializer As String
+                    TranslateCBodyModuleStaticInitializer( _
+                        translation, catalog, .freeBasicType, .isArray, _
+                        .initializerText, translatedInitializer)
+                    globalStorageDeclaration &= " = " & translatedInitializer
+                End If
                 WriteC2fbOutputLine( _
                     outputFile, "' c2fb global definition " & .cName & "=" & _
                     .freeBasicName)
@@ -1601,6 +1917,53 @@ Private Sub WriteC2fbBodyRenameReport( _
     End If
 End Sub
 
+Private Function TranslateCBodyModuleStaticInitializer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal freeBasicType As String, ByVal isArray As Long, _
+    ByVal initializerText As String, ByRef translatedText As String _
+) As Long
+    translatedText = initializerText
+    initializerText = Trim(initializerText)
+    If initializerText = "" OrElse isArray <> 0 Then Return -1
+
+    If Left(initializerText, 1) = "{" AndAlso _
+       CBodyRecordName(translation, catalog, freeBasicType) <> "" Then
+        Dim context As SimpleBodyContext
+        Dim callableNames(0 To 0) As String
+        Dim parameterNames(0 To 0) As String
+        Dim parameterAliases(0 To 0) As String
+        Dim parameterTypes(0 To 0) As String
+        Dim recordInitializer As String
+        If TranslateSimpleRecordInitializer( _
+            translation, catalog, initializerText, freeBasicType, _
+            recordInitializer, context, callableNames(), 0, parameterNames(), _
+            parameterAliases(), parameterTypes(), 0) <> 0 Then
+            translatedText = recordInitializer
+            Return -1
+        End If
+    End If
+
+    If LCase(Left(initializerText, 6)) = "sizeof" Then
+        Dim callableNames(0 To 0) As String
+        Dim parameterNames(0 To 0) As String
+        Dim parameterAliases(0 To 0) As String
+        Dim parameterTypes(0 To 0) As String
+        Dim hasBooleanOperator As Long
+        Dim hasFunctionCall As Long
+        Dim scalarInitializer As String
+        If TranslateSimpleExpression( _
+            translation, catalog, initializerText, scalarInitializer, _
+            hasBooleanOperator, hasFunctionCall, callableNames(), 0, _
+            parameterNames(), parameterAliases(), parameterTypes(), 0, _
+            freeBasicType, -1, -1) <> 0 AndAlso hasFunctionCall = 0 Then
+            translatedText = scalarInitializer
+        End If
+    End If
+    Return -1
+End Function
+
+
 Private Sub WriteC2fbBodyCandidateFile( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -1720,6 +2083,12 @@ Private Sub WriteC2fbBodyCandidateFile( _
             filePreamble, "crt/math.bi") = 0 Then _
             ReportError("body candidate preamble exceeds its configured limit")
     End If
+    If CBodyUsesCrtMemory( _
+        translation, candidates(), candidateCount) <> 0 Then
+        If AddC2fbGeneratedFileIncludeOnce( _
+            filePreamble, "crt/mem.bi") = 0 Then _
+            ReportError("body candidate preamble exceeds its configured limit")
+    End If
     If AddC2fbGeneratedFilePreambleBlank(filePreamble) = 0 Then _
         ReportError("body candidate preamble exceeds its configured limit")
     If Len(outputModel.fbSourceDirectory) <> 0 Then
@@ -1729,6 +2098,9 @@ Private Sub WriteC2fbBodyCandidateFile( _
         If AddC2fbGeneratedFilePreambleBlank(filePreamble) = 0 Then _
             ReportError("body candidate preamble exceeds its configured limit")
     End If
+    Dim includedDeclarationNames As C2fbNameSetModel
+    IndexC2fbCandidateIncludedDeclarations( _
+        filePreamble, outputModel.fbSourceDirectory, includedDeclarationNames)
     WriteC2fbGeneratedFilePreamble(fileOutput, fileComment, filePreamble)
     WriteCBodyAbiTypeAliases(translation, fileOutput)
     If Len(outputModel.fbSourceDirectory) <> 0 Then
@@ -1736,10 +2108,9 @@ Private Sub WriteC2fbBodyCandidateFile( _
         If translation.target.profile = C2FB_TARGET_SQLITE Then _
             WriteCandidateDeclarations( _
                 fileOutput, outputModel.fbSourceDirectory, _
-                candidates(), candidateCount, filePreamble)
+                candidates(), candidateCount, includedDeclarationNames)
         WriteExistingBodyDeclarations( _
-            catalog, fileOutput, outputModel.fbSourceDirectory, _
-            catalog.localDeclarationNames(), catalog.localDeclarationNameCount, _
+            catalog, fileOutput, includedDeclarationNames, _
             candidates(), candidateCount)
         WriteC2fbGeneratedFileLine(fileOutput, "")
     End If
@@ -1757,7 +2128,7 @@ Private Sub WriteC2fbBodyCandidateFile( _
         generatedRecordIsUsed(), -1)
     WriteCBodyDeclarations( _
         translation, catalog, fileOutput, candidates(), candidateCount, _
-        catalog.localDeclarationNames(), catalog.localDeclarationNameCount, _
+        includedDeclarationNames, _
         outputModel.keepUnresolvedDependencies)
 
     Dim conversionSummary As C2fbConversionSummaryModel

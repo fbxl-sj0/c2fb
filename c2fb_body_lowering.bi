@@ -35,9 +35,11 @@ Private Function TranslateStructuredBody( _
     parameterNames() As String, _
     parameterAliases() As String, _
     parameterTypes() As String, _
-    ByRef symbolCount As Long _
+    ByRef symbolCount As Long, _
+    ByRef generatedAggregateInitializerHelpers As String _
 ) As Long
     translatedBody = ""
+    generatedAggregateInitializerHelpers = ""
     Dim context As SimpleBodyContext
     context.functionName = functionName
     ResetSimpleBodyFailure(context)
@@ -109,6 +111,8 @@ Private Function TranslateStructuredBody( _
     End If
     If context.declarations <> "" Then _
         translatedBody = context.declarations & Chr(10) & translatedBody
+    generatedAggregateInitializerHelpers = _
+        context.generatedAggregateInitializerHelpers
     Return -1
 End Function
 
@@ -361,7 +365,9 @@ Private Function BuildSimpleProcedure( _
                             End If
                         Next
                         If parameterUsesPointer = 0 AndAlso _
-                           InStr(parameterResult.freeBasicType, " Ptr") = 0 Then
+                           InStr(parameterResult.freeBasicType, " Ptr") = 0 AndAlso _
+                           IsCBodyCallbackTypeInContext( _
+                               translation, parameterResult.freeBasicType) = 0 Then
                             Dim parameterTypeStatus As C2fbTypeResolutionStatus = _
                                 C2fbTypeRecognitionStatusInContext( _
                                     translation, catalog, sourceItem.declaration.tokens(), _
@@ -431,12 +437,16 @@ Private Function BuildSimpleProcedure( _
     End If
 
     Dim structuredBody As String
+    Dim generatedAggregateInitializerHelpers As String
     Dim totalSymbolCount As Long = argumentCount
     If TranslateStructuredBody(translation, catalog, functionName, bodyText, structuredBody, returnType, callableNames(), _
                                callableCount, sourceParameterNames(), _
-                               sourceParameterAliases(), sourceParameterTypes(), totalSymbolCount) = 0 Then Return procedureText
+                               sourceParameterAliases(), sourceParameterTypes(), totalSymbolCount, _
+                               generatedAggregateInitializerHelpers) = 0 Then Return procedureText
 
     procedureText = FreeBasicProcedureDefinition(procedureBinding, structuredBody)
+    If generatedAggregateInitializerHelpers <> "" Then _
+        procedureText = generatedAggregateInitializerHelpers & Chr(10) & procedureText
     Return procedureText
 End Function
 /' end of c2fb_body_lowering.bi '/

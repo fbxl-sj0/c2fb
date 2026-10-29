@@ -27,6 +27,7 @@ Private Sub ParseC2fbGenericBodyOptions( _
 )
     ResetGenericTypeOverridesInPolicy(translation.genericC.policy)
     ResetGenericSymbolRenamesInPolicy(translation.genericC.policy)
+    ResetGenericSymbolExcludesInPolicy(translation.genericC.policy)
     translation.genericC.policy.procedureNamePrefix = ""
     translation.genericC.policy.procedureNamePrefixMatched = 0
     ResetC2fbReplacementRules(translation.genericC.policy)
@@ -37,6 +38,7 @@ Private Sub ParseC2fbGenericBodyOptions( _
     request.bodyRequest.translationOptions.keepUnresolvedDependencies = 0
     request.bodyRequest.translationOptions.includeExistingBodies = 0
     request.bodyRequest.translationOptions.includeHeaderInlineBodies = 0
+    request.bodyRequest.translationOptions.includeHeaderInlineBodyNames = ""
     request.bodyRequest.translationOptions.includeIncludedCSourceBodies = 0
     request.bodyRequest.translationOptions.includeGlobalDefinitions = 0
     request.bodyRequest.translationOptions.assumeSingleThreadedAtomics = 0
@@ -65,6 +67,18 @@ Private Sub ParseC2fbGenericBodyOptions( _
                "--replacement-file=" Then
             LoadC2fbReplacementRuleFile( _
                 translation.genericC.policy, Mid(argumentText, Len("--replacement-file=") + 1))
+        ElseIf argumentText = "--exclude-proc" Then
+            argumentIndex += 1
+            If argumentIndex >= expandedArguments.itemCount Then _
+                ReportError("--exclude-proc requires a C function identifier or pattern")
+            AddGenericSymbolExcludeInPolicy( _
+                translation.genericC.policy, expandedArguments.values(argumentIndex), _
+                C2FB_GENERIC_SYMBOL_EXCLUDE_PROCEDURE)
+        ElseIf Left(argumentText, Len("--exclude-proc=")) = "--exclude-proc=" Then
+            AddGenericSymbolExcludeInPolicy( _
+                translation.genericC.policy, _
+                Mid(argumentText, Len("--exclude-proc=") + 1), _
+                C2FB_GENERIC_SYMBOL_EXCLUDE_PROCEDURE)
         ElseIf argumentText = "--rename-proc-prefix" Then
             argumentIndex += 1
             If argumentIndex >= expandedArguments.itemCount Then _
@@ -170,6 +184,21 @@ Private Sub ParseC2fbGenericBodyOptions( _
             request.bodyRequest.translationOptions.includeExistingBodies = includeValue
         ElseIf argumentText = "--include-header-inline-bodies" Then
             request.bodyRequest.translationOptions.includeHeaderInlineBodies = -1
+        ElseIf Left(argumentText, Len("--include-header-inline-body=")) = _
+               "--include-header-inline-body=" Then
+            Dim inlineBodyName As String = Trim(Mid( _
+                argumentText, Len("--include-header-inline-body=") + 1))
+            If IsIdentifierToken(inlineBodyName) = 0 Then _
+                ReportError("--include-header-inline-body requires a C function name")
+            Dim inlineBodyNameKey As String = _
+                "|" & LCase(inlineBodyName) & "|"
+            If InStr( _
+                request.bodyRequest.translationOptions.includeHeaderInlineBodyNames, _
+                inlineBodyNameKey) = 0 Then _
+                request.bodyRequest.translationOptions.includeHeaderInlineBodyNames &= _
+                    inlineBodyNameKey
+            request.bodyRequest.translationOptions.sourceMapMode = _
+                C2FB_SOURCE_MAP_PREPROCESSOR_MARKERS
         ElseIf argumentText = "--include-global-definitions" Then
             request.bodyRequest.translationOptions.includeGlobalDefinitions = -1
             request.bodyRequest.translationOptions.sourceMapMode = _

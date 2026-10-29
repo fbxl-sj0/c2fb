@@ -32,6 +32,7 @@ Private Const MAX_C2FB_FB_LAYOUT_NESTING As Long = 32
 Private Type C2fbFbLayoutScanStateModel
     typeNames(0 To MAX_C2FB_FB_LAYOUT_NESTING - 1) As String
     typePrivate(0 To MAX_C2FB_FB_LAYOUT_NESTING - 1) As Long
+    typeIsUnion(0 To MAX_C2FB_FB_LAYOUT_NESTING - 1) As Long
     typeDepth As Long
 End Type
 
@@ -691,9 +692,12 @@ Private Function CBodyRecordSizeIsKnown( _
     ByRef catalog As C2fbProjectCatalog, ByVal sourceName As String _
 ) As Long
     For bindingIndex As Long = 0 To translation.body.recordBindingCount - 1
-        If translation.body.recordBindings(bindingIndex).isGenerated <> 0 AndAlso _
-           translation.body.recordBindings(bindingIndex).sourceName = sourceName Then _
-            Return -1
+        With translation.body.recordBindings(bindingIndex)
+            ' Anonymous nested records use owner.field names and already have
+            ' layouts in the current source-unit type context.
+            If (.isGenerated <> 0 OrElse InStr(.sourceName, ".") <> 0) AndAlso _
+               .sourceName = sourceName Then Return -1
+        End With
     Next
     If GenericTypeOverrideInPolicy( _
         translation.genericC.policy, sourceName) <> "" Then
@@ -1202,6 +1206,7 @@ Private Sub ResetC2fbFbLayoutFile( _
     For index As Long = 0 To MAX_C2FB_FB_LAYOUT_NESTING - 1
         state.typeNames(index) = ""
         state.typePrivate(index) = 0
+        state.typeIsUnion(index) = 0
     Next
 End Sub
 
@@ -1225,6 +1230,7 @@ Private Sub IndexC2fbFbLayoutLine( _
             state.typeDepth -= 1
             state.typeNames(state.typeDepth) = ""
             state.typePrivate(state.typeDepth) = 0
+            state.typeIsUnion(state.typeDepth) = 0
         End If
         Exit Sub
     End If
@@ -1239,7 +1245,11 @@ Private Sub IndexC2fbFbLayoutLine( _
         End If
         If typeKeywordLength > 0 Then
             Dim afterTypeKeyword As String = LCase(LTrim(Mid(lineText, typeKeywordLength + 1)))
-            If Left(afterTypeKeyword, 3) = "as " Then _
+            ' Type and Union can also be field names. A bitfield or array
+            ' declarator places its colon or opening parenthesis before As.
+            If Left(afterTypeKeyword, 3) = "as " OrElse _
+               Left(afterTypeKeyword, 1) = ":" OrElse _
+               Left(afterTypeKeyword, 1) = "(" Then _
                 recordFieldUsesTypeKeyword = -1
         End If
     End If
@@ -1299,6 +1309,8 @@ Private Sub IndexC2fbFbLayoutLine( _
             ReportError("port layout nesting exceeds the configured limit")
         state.typeNames(state.typeDepth) = owner
         state.typePrivate(state.typeDepth) = declarationIsPrivate
+        state.typeIsUnion(state.typeDepth) = CInt( _
+            lowered = "union" OrElse Left(lowered, 6) = "union ")
         state.typeDepth += 1
         Exit Sub
     End If
@@ -1350,6 +1362,7 @@ Private Sub IndexC2fbFbLayoutLine( _
         .name = fieldName
         .typeName = typeName
         .isArray = isArray
+        .isUnionMember = state.typeIsUnion(state.typeDepth - 1)
         .isPrivate = state.typePrivate(state.typeDepth - 1)
         .headerName = fileName
     End With

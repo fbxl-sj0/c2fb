@@ -81,8 +81,12 @@ Private Function SimpleConvertedValue( _
             Return value.text
         Return ""
     End If
+    Dim sourceKind As Long = SimpleArithmeticKind(catalog, value.typeName)
+    If targetKind = 7 OrElse sourceKind = 7 Then
+        Return SimpleValueCast(translation, catalog, value, normalizedTargetType)
+    End If
     Dim sourceText As String = value.text
-    If targetKind <= 4 AndAlso SimpleArithmeticKind(catalog, value.typeName) > 4 Then _
+    If targetKind <= 4 AndAlso SimpleFloatingCastNeedsFix(sourceKind) <> 0 Then _
         sourceText = "Fix(" & sourceText & ")"
     Return "Cast(" & normalizedTargetType & ", " & sourceText & ")"
 End Function
@@ -118,7 +122,21 @@ Private Function DiscardSimpleValue( _
         ' The prelude already computed this value, and the temporary is not
         ' volatile. Discarding it requires no additional evaluation.
     ElseIf value.isWholeCall <> 0 Then
-        value.prelude &= value.text & Chr(10)
+        Dim discardedText As String = value.text
+        If value.typeName = "void" Then
+            ' FreeBASIC does not allow a Sub call to be grouped as an
+            ' expression. C permits those parentheses around a void call.
+            While Len(discardedText) >= 2 AndAlso _
+                  Left(discardedText, 1) = "("
+                Dim groupEnd As Long = 1
+                If ScanSimpleExpressionGroup( _
+                    discardedText, groupEnd, Asc("("), Asc(")")) = 0 OrElse _
+                   groupEnd <> Len(discardedText) + 1 Then Exit While
+                discardedText = Trim(Mid( _
+                    discardedText, 2, Len(discardedText) - 2))
+            Wend
+        End If
+        value.prelude &= discardedText & Chr(10)
     Else
         If FreezeSimpleValue(parser, value) = 0 Then Return 0
     End If

@@ -30,12 +30,19 @@ Private Type SimpleLocalVariable
     name As String
     typeName As String
     isConst As Long
+    sizeofBytes As Long
+    hasKnownSize As Long
+    ' Retain local enumerator values for later C integer-constant expressions.
+    isIntegerConstant As Long
+    integerValue As Long
 End Type
 
 Private Type SimpleControlFrame
     breakLabel As String
     continueLabel As String
     hasBreak As Long
+    isSwitch As Long
+    nestedCaseBlockDepth As Long
 End Type
 
 Private Type SimpleBodyLabel
@@ -55,6 +62,7 @@ Private Type SimpleBodyContext
     failureCode As String
     failureMessage As String
     declarations As String
+    generatedAggregateInitializerHelpers As String
     localSerial As Long
     temporarySerial As Long
     allocaHeadName As String
@@ -73,6 +81,17 @@ Private Type SimpleBodyContext
     branchJump As Long
     labels(0 To MAX_BODY_LABELS - 1) As SimpleBodyLabel
 End Type
+
+Declare Function TranslateSimpleRecordInitializer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal initializerText As String, ByVal freeBasicType As String, _
+    ByRef translatedValue As String, ByRef context As SimpleBodyContext, _
+    callableNames() As String, ByVal callableCount As Long, _
+    parameterNames() As String, parameterAliases() As String, _
+    parameterTypes() As String, ByVal parameterCount As Long, _
+    ByVal requireConstant As Long = 0 _
+) As Long
 
 Private Function SimpleBodyLocalRecordType( _
     ByRef context As SimpleBodyContext, ByVal sourceName As String _
@@ -144,13 +163,16 @@ Private Sub PopSimpleBodyScope( _
 End Sub
 
 Private Function PushSimpleControlFrame( _
-    ByRef context As SimpleBodyContext, ByVal breakLabel As String, ByVal continueLabel As String _
+    ByRef context As SimpleBodyContext, ByVal breakLabel As String, _
+    ByVal continueLabel As String, ByVal isSwitch As Long = 0 _
 ) As Long
     If context.frameCount >= MAX_BODY_NESTING Then Return 0
     With context.frames(context.frameCount)
         .breakLabel = breakLabel
         .continueLabel = continueLabel
         .hasBreak = 0
+        .isSwitch = isSwitch
+        .nestedCaseBlockDepth = 0
     End With
     context.frameCount += 1
     Return -1

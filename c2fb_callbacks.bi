@@ -620,20 +620,35 @@ Private Function IsCBodyCallbackTypeInContext( _
                 CBodyCallbackIndexInContext(translation, fbType) >= 0)
 End Function
 
+Private Function CBodyCallbackParameterTypeAtIndexInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal callbackIndex As Long, ByVal parameterIndex As Long _
+) As String
+    If callbackIndex < 0 OrElse _
+       callbackIndex >= translation.body.callbackCount OrElse _
+       parameterIndex < 0 OrElse _
+       parameterIndex >= translation.body.callbacks(callbackIndex).parameterCount Then _
+        Return ""
+    Dim parameterTypes As String = _
+        translation.body.callbacks(callbackIndex).parameterTypes
+    Dim start As Long = 1
+    For index As Long = 0 To parameterIndex - 1
+        start = InStr(start, parameterTypes, "|") + 1
+        If start <= 1 Then Return ""
+    Next
+    Dim finish As Long = InStr(start, parameterTypes, "|")
+    If finish = 0 Then Return ""
+    Return Mid(parameterTypes, start, finish - start)
+End Function
+
 Private Function CBodyCallbackParameterTypeInContext( _
     ByRef translation As C2fbTranslationContext, _
     ByVal fbType As String, ByVal parameterIndex As Long _
 ) As String
-    Dim index As Long = CBodyCallbackIndexInContext(translation, fbType)
-    If index < 0 OrElse parameterIndex >= translation.body.callbacks(index).parameterCount Then Return ""
-    Dim start As Long = 1
-    For i As Long = 0 To parameterIndex - 1
-        start = InStr(start, translation.body.callbacks(index).parameterTypes, "|") + 1
-        If start <= 1 Then Return ""
-    Next
-    Dim finish As Long = InStr(start, translation.body.callbacks(index).parameterTypes, "|")
-    If finish = 0 Then Return ""
-    Return Mid(translation.body.callbacks(index).parameterTypes, start, finish - start)
+    Dim callbackIndex As Long = _
+        CBodyCallbackIndexInContext(translation, fbType)
+    Return CBodyCallbackParameterTypeAtIndexInContext( _
+        translation, callbackIndex, parameterIndex)
 End Function
 
 Private Function CBodyCallbackTypesCompatibleInContext( _
@@ -747,7 +762,8 @@ Private Sub ResolveCBodyCallbackTypeInContext( _
     tokens() As String, ByVal firstToken As Long, ByVal lastToken As Long, _
     ByRef result As C2fbCallbackTypeResultModel, ByVal depth As Long, _
     ByVal typeMappingKind As C2fbTypeMappingKind, _
-    ByVal allowPointerLayers As Long = 0 _
+    ByVal allowPointerLayers As Long = 0, _
+    ByVal allowFunctionParameterDecay As Long = 0 _
 )
     result.status = C2FB_CALLBACK_TYPE_NOT_CALLBACK
     result.callbackName = ""
@@ -756,8 +772,63 @@ Private Sub ResolveCBodyCallbackTypeInContext( _
     Dim opening As Long = -1
     Dim pointerClose As Long = -1
     Dim pointerCount As Long = 0
+    Dim callbackSignatureLastToken As Long = lastToken
     Dim sawCallbackDeclarator As Long = 0
+
+    If allowFunctionParameterDecay <> 0 Then
+        ' C adjusts a function parameter to a pointer before the function body
+        ' can call it. Accept both `fn (T)` and the redundant `(fn (T))` form.
+        For i As Long = firstToken + 1 To lastToken - 1
+            If IsCallbackReturnTypePrefix(tokens(), firstToken, i - 1) = 0 Then Continue For
+            Dim callbackNameIndex As Long = -1
+            Dim callbackParameterOpen As Long = -1
+            Dim hasOuterGrouping As Long = 0
+            If tokens(i) = "(" AndAlso i + 2 <= lastToken AndAlso _
+               IsIdentifierToken(tokens(i + 1)) <> 0 AndAlso _
+               tokens(i + 2) = "(" Then
+                callbackNameIndex = i + 1
+                callbackParameterOpen = i + 2
+                hasOuterGrouping = -1
+            ElseIf IsIdentifierToken(tokens(i)) <> 0 AndAlso _
+                   i + 1 <= lastToken AndAlso tokens(i + 1) = "(" Then
+                callbackNameIndex = i
+                callbackParameterOpen = i + 1
+            Else
+                Continue For
+            End If
+
+            Dim parameterNesting As Long = 1
+            Dim callbackParameterClose As Long = -1
+            For parameterToken As Long = callbackParameterOpen + 1 To lastToken
+                If tokens(parameterToken) = "(" Then
+                    parameterNesting += 1
+                ElseIf tokens(parameterToken) = ")" Then
+                    parameterNesting -= 1
+                    If parameterNesting = 0 Then
+                        callbackParameterClose = parameterToken
+                        Exit For
+                    End If
+                End If
+            Next
+            If hasOuterGrouping <> 0 Then
+                If callbackParameterClose <> lastToken - 1 OrElse _
+                   tokens(lastToken) <> ")" Then Continue For
+            ElseIf callbackParameterClose <> lastToken Then
+                Continue For
+            End If
+            opening = i
+            pointerClose = callbackNameIndex
+            pointerCount = 1
+            callbackSignatureLastToken = callbackParameterClose
+            result.pointerDepth = 1
+            result.callbackName = tokens(callbackNameIndex)
+            result.status = C2FB_CALLBACK_TYPE_UNSUPPORTED
+            Exit For
+        Next
+    End If
+
     For i As Long = firstToken To lastToken - 1
+        If opening >= 0 Then Exit For
         If tokens(i) <> "(" Then Continue For
         If HasPotentialCallbackDeclarator( _
             tokens(), i, lastToken) <> 0 Then _
@@ -864,7 +935,7 @@ Private Sub ResolveCBodyCallbackTypeInContext( _
     If depth >= 8 Then Exit Sub
     If pointerCount <= 0 OrElse _
        (pointerCount <> 1 AndAlso allowPointerLayers = 0) OrElse _
-       pointerClose + 1 > lastToken OrElse _
+       pointerClose + 1 > callbackSignatureLastToken OrElse _
        tokens(pointerClose + 1) <> "(" Then Exit Sub
     Dim parameterOpen As Long = pointerClose + 1
     Dim resolvedReturnType As C2fbResolvedTypeModel
@@ -886,7 +957,7 @@ Private Sub ResolveCBodyCallbackTypeInContext( _
     Dim nesting As Long = 0
     Dim foundEnd As Long = 0
     Dim parameterClose As Long = -1
-    For i As Long = start To lastToken
+    For i As Long = start To callbackSignatureLastToken
         If tokens(i) = "(" Then nesting += 1
         Dim atEnd As Long = CInt(tokens(i) = ")" AndAlso nesting = 0)
         If tokens(i) = ")" AndAlso nesting > 0 Then
@@ -967,7 +1038,7 @@ Private Sub ResolveCBodyCallbackTypeInContext( _
             If atEnd <> 0 Then
                 foundEnd = -1
                 parameterClose = i
-                If i <> lastToken Then Exit Sub
+                If i <> callbackSignatureLastToken Then Exit Sub
                 Exit For
             End If
         End If

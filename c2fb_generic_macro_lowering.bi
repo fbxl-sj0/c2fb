@@ -137,6 +137,14 @@ Private Function RewriteGenericMacroCharacterConstants( _
     Dim position As Long = 1
     While position <= Len(sourceExpression)
         Dim currentByte As Long = Asc(sourceExpression, position)
+        ' The accepted ASCII subset has the same value in a C wide character
+        ' constant, so remove its L prefix before decoding the character.
+        If currentByte = Asc("L") AndAlso _
+           position < Len(sourceExpression) AndAlso _
+           Asc(sourceExpression, position + 1) = Asc("'") Then
+            position += 1
+            currentByte = Asc("'")
+        End If
         If currentByte = Asc("'") Then
             Dim characterValue As Long
             If DecodeCCharacterConstant( _
@@ -229,6 +237,30 @@ Private Function FindGenericMacroTopLevelOperator( _
         position += 1
     Wend
     Return 0
+End Function
+
+Private Function FindGenericMacroTopLevelOperatorLast( _
+    ByVal sourceExpression As String, ByVal operatorText As String _
+) As Long
+    Dim nesting As Long = 0
+    Dim lastPosition As Long = 0
+    Dim position As Long = 1
+    While position <= Len(sourceExpression)
+        Select Case Mid(sourceExpression, position, 1)
+        Case "(": nesting += 1
+        Case ")"
+            nesting -= 1
+            If nesting < 0 Then Return 0
+        End Select
+        If nesting = 0 AndAlso Mid( _
+            sourceExpression, position, Len(operatorText)) = operatorText Then
+            lastPosition = position
+            position += Len(operatorText)
+        Else
+            position += 1
+        End If
+    Wend
+    Return lastPosition
 End Function
 
 Private Function SplitGenericMacroConditional( _
@@ -460,6 +492,38 @@ Private Function TranslateGenericMacroIntegerPart( _
         ' C conditional-expression operand executes.
         freeBasicExpression = "IIf(" & freeBasicCondition & ", " & _
             freeBasicTrue & ", " & freeBasicFalse & ")"
+        Return -1
+    End If
+
+    ' Translate shifts around nested conditional operands explicitly. The
+    ' general integer tokenizer cannot keep a C conditional nested inside a
+    ' shift right operand while applying C operator precedence.
+    Dim shiftLeftPosition As Long = _
+        FindGenericMacroTopLevelOperatorLast(sourceExpression, "<<")
+    Dim shiftRightPosition As Long = _
+        FindGenericMacroTopLevelOperatorLast(sourceExpression, ">>")
+    Dim shiftPosition As Long = shiftLeftPosition
+    Dim shiftOperator As String = "<<"
+    If shiftRightPosition > shiftPosition Then
+        shiftPosition = shiftRightPosition
+        shiftOperator = ">>"
+    End If
+    If shiftPosition > 0 Then
+        Dim leftSource As String = Trim(Left(sourceExpression, shiftPosition - 1))
+        Dim rightSource As String = Trim(Mid( _
+            sourceExpression, shiftPosition + Len(shiftOperator)))
+        Dim leftExpression As String
+        Dim rightExpression As String
+        If leftSource = "" OrElse rightSource = "" OrElse _
+           TranslateGenericMacroIntegerPart( _
+               translation, leftSource, leftExpression, depth + 1, _
+               integerDivisionAssumed, dynamicIntegerDivision) = 0 OrElse _
+           TranslateGenericMacroIntegerPart( _
+               translation, rightSource, rightExpression, depth + 1, _
+               integerDivisionAssumed, dynamicIntegerDivision) = 0 Then Return 0
+        Dim freeBasicOperator As String = IIf(shiftOperator = "<<", "Shl", "Shr")
+        freeBasicExpression = "(" & leftExpression & " " & freeBasicOperator & _
+            " " & rightExpression & ")"
         Return -1
     End If
 
@@ -758,8 +822,10 @@ Private Function GenericMacroExpressionContainsTypeCast( _
 End Function
 
 Private Function FindGenericMacroRightmostBinaryOperator( _
+    ByRef translation As C2fbTranslationContext, _
     ByVal sourceExpression As String, ByVal operatorGroup As Long, _
-    ByRef operatorText As String, ByRef operatorPosition As Long _
+    ByRef operatorText As String, ByRef operatorPosition As Long, _
+    parameterNames() As String, ByVal parameterCount As Long _
 ) As Long
     ' Groups follow C precedence from bitwise OR through multiplication.
     ' The rightmost operator at one precedence preserves left associativity.
@@ -809,9 +875,48 @@ Private Function FindGenericMacroRightmostBinaryOperator( _
                       IsSpaceByte(Asc(sourceExpression, previousPosition)) <> 0
                     previousPosition -= 1
                 Wend
+                Dim followsCastType As Long = 0
+                If previousPosition > 0 AndAlso _
+                   Mid(sourceExpression, previousPosition, 1) = ")" Then
+                    Dim groupDepth As Long = 0
+                    Dim castOpenPosition As Long = 0
+                    For scanPosition As Long = previousPosition To 1 Step -1
+                        Dim groupByte As String = Mid( _
+                            sourceExpression, scanPosition, 1)
+                        If groupByte = ")" Then
+                            groupDepth += 1
+                        ElseIf groupByte = "(" Then
+                            groupDepth -= 1
+                            If groupDepth = 0 Then
+                                castOpenPosition = scanPosition
+                                Exit For
+                            End If
+                        End If
+                    Next
+                    If castOpenPosition > 0 Then
+                        Dim castType As String = Trim(Mid( _
+                            sourceExpression, castOpenPosition + 1, _
+                            previousPosition - castOpenPosition - 1))
+                        Dim namesParameter As Long = 0
+                        For parameterIndex As Long = 0 To parameterCount - 1
+                            If castType = parameterNames(parameterIndex) Then
+                                namesParameter = -1
+                                Exit For
+                            End If
+                        Next
+                        If namesParameter = 0 Then
+                            Dim freeBasicCastType As String
+                            Dim isPointerCast As Long
+                            followsCastType = GenericHeaderMacroCastType( _
+                                translation, castType, freeBasicCastType, _
+                                isPointerCast)
+                        End If
+                    End If
+                End If
                 If previousPosition > 0 AndAlso _
                    InStr("(+-*/&|^~!<>=?:,", _
-                         Mid(sourceExpression, previousPosition, 1)) = 0 Then
+                         Mid(sourceExpression, previousPosition, 1)) = 0 AndAlso _
+                   followsCastType = 0 Then
                     candidate = currentText
                 End If
             End If
@@ -856,11 +961,13 @@ Private Function TranslateGenericHeaderDynamicDivisionExpression( _
             C2FB_INTEGER_IDENTIFIERS_ANY, integerDivisionAssumed, -1)
     End If
 
+    Dim noParameterNames(0 To 0) As String
     For operatorGroup As Long = 0 To 5
         Dim operatorText As String
         Dim operatorPosition As Long
         If FindGenericMacroRightmostBinaryOperator( _
-            sourceExpression, operatorGroup, operatorText, operatorPosition) = 0 Then _
+            translation, sourceExpression, operatorGroup, operatorText, _
+            operatorPosition, noParameterNames(), 0) = 0 Then _
             Continue For
         Dim leftSource As String = Trim(Left(sourceExpression, operatorPosition - 1))
         Dim rightSource As String = Trim(Mid( _
@@ -916,7 +1023,8 @@ Private Function TranslateGenericHeaderMacroCastBinaryExpression( _
         Dim operatorText As String
         Dim operatorPosition As Long
         If FindGenericMacroRightmostBinaryOperator( _
-            sourceExpression, operatorGroup, operatorText, operatorPosition) = 0 Then _
+            translation, sourceExpression, operatorGroup, operatorText, _
+            operatorPosition, parameterNames(), parameterCount) = 0 Then _
             Continue For
         Dim leftSource As String = Trim(Left(sourceExpression, operatorPosition - 1))
         Dim rightSource As String = Trim(Mid( _
@@ -1250,7 +1358,7 @@ Private Function GenericNullPointerConstantText( _
             compactValue &= LCase(Mid(sourceText, position, 1))
     Next
     Select Case compactValue
-    Case "0", "0u", "0l", "0ul", "0lu", "0ll", "0ull", "0llu", _
+    Case "0", "0u", "0l", "0ul", "0lu", "0ll", "0ull", "0llu", "null", _
          "__null", "(void*)0", "((void*)0)"
         Return -1
     End Select
@@ -1620,6 +1728,18 @@ Private Function TryTranslateGenericHeaderMacroCast( _
                 End With
             End If
         End If
+    End If
+    If operandWasResolved = 0 AndAlso _
+       GenericIntegerMacroCandidate(operand) <> 0 AndAlso _
+       GenericMacroOperandReferencesParameter( _
+        operand, parameterNames(), parameterCount) = 0 AndAlso _
+       TranslateGenericHeaderIntegerExpression( _
+        translation, operand, freeBasicOperand, depth + 1, _
+        integerDivisionAssumed, dynamicIntegerDivision) <> 0 Then
+        ' The generic macro token walker does not accept every unary integer
+        ' form, including a negative literal. Static C casts still need the
+        ' operand's C integer-constant-expression semantics.
+        operandWasResolved = -1
     End If
     If operandWasResolved = 0 AndAlso _
        TranslateGenericHeaderMacroExpressionWithParameters( _
@@ -2205,6 +2325,27 @@ Private Function TranslateGenericHeaderSizeofMacroExpression( _
     Dim operand As String = Trim(Mid( _
         sourceExpression, groupOpen + 1, groupClose - groupOpen - 2))
     If operand = "" Then Return 0
+
+    ' Module-static aggregate fields commonly use sizeof on a typedef, such
+    ' as the record aliases declared by the same source header. Resolve that
+    ' name directly before the expression parser treats it as a variable.
+    Dim operandTokens() As String
+    Dim operandTokenCount As Long
+    TokenizeCDeclaration(operand, operandTokens(), operandTokenCount)
+    If operandTokenCount = 1 AndAlso _
+       IsIdentifierToken(operandTokens(0)) <> 0 Then
+        Dim aliasIndex As Long = GenericHeaderTypeAliasIndexInHeader( _
+            translation.genericC.header, operandTokens(0), 0)
+        If aliasIndex >= 0 Then
+            Dim aliasType As String = _
+                translation.genericC.header.headerTypeAliases(aliasIndex).freeBasicName
+            If aliasType <> "" Then
+                freeBasicExpression = "SizeOf(" & aliasType & ")"
+                Return -1
+            End If
+        End If
+    End If
+
     Dim freeBasicType As String
     Dim isPointerCast As Long
     If GenericHeaderMacroCastType( _
@@ -3495,6 +3636,9 @@ Private Function GenericMacroRecordBindingText( _
         End Select
     End If
     Dim indentLevel As Long = 1
+    Dim aggregateLevel As Long = 0
+    Dim aggregateIsUnionStack(0 To recordBinding.itemCount) As Long
+    aggregateIsUnionStack(0) = recordBinding.isUnion
     If recordBinding.itemCount > 0 Then
         For itemIndex As Long = 0 To recordBinding.itemCount - 1
             With recordBinding.items(itemIndex)
@@ -3504,6 +3648,8 @@ Private Function GenericMacroRecordBindingText( _
                     If .isUnion <> 0 Then nestedName = "Union"
                     outputText &= Chr(10) & Space(indentLevel * 4) & nestedName
                     indentLevel += 1
+                    aggregateLevel += 1
+                    aggregateIsUnionStack(aggregateLevel) = .isUnion
                 Case C2FB_RECORD_BINDING_ITEM_ANONYMOUS_END
                     If indentLevel <= 1 Then Return 0
                     indentLevel -= 1
@@ -3511,19 +3657,14 @@ Private Function GenericMacroRecordBindingText( _
                     If .isUnion <> 0 Then nestedName = "Union"
                     outputText &= Chr(10) & Space(indentLevel * 4) & _
                         "End " & nestedName
+                    If aggregateLevel > 0 Then aggregateLevel -= 1
                 Case C2FB_RECORD_BINDING_ITEM_FIELD
-                    Dim fieldDeclaration As String = _
-                        Space(indentLevel * 4) & .name
-                    If .isBitField <> 0 Then _
-                        fieldDeclaration &= " : " & Trim(Str(.bitWidth))
-                    If .arrayBounds <> "" Then
-                        fieldDeclaration &= "(" & .arrayBounds & ")"
-                    ElseIf .arrayCount > 0 Then _
-                        fieldDeclaration &= "(0 To " & _
-                            Trim(Str(.arrayCount - 1)) & ")"
-                    End If
-                    fieldDeclaration &= " As " & .fieldType
-                    outputText &= Chr(10) & fieldDeclaration
+                    outputText &= Chr(10) & _
+                        C2fbRecordBindingFieldDeclarationText( _
+                            recordBinding, itemIndex, .name, .fieldType, _
+                            .arrayCount, .arrayBounds, .alignmentStorageType, _
+                            .packValue, .isBitField, .bitWidth, _
+                            aggregateIsUnionStack(aggregateLevel), indentLevel)
                 Case Else
                     ' Flexible arrays need an accessor outside the local Type scope.
                     Return 0
@@ -3533,15 +3674,11 @@ Private Function GenericMacroRecordBindingText( _
     Else
         For fieldIndex As Long = 0 To recordBinding.fieldCount - 1
             With recordBinding.fields(fieldIndex)
-                Dim fieldDeclaration As String = "    " & .name
-                If .arrayBounds <> "" Then
-                    fieldDeclaration &= "(" & .arrayBounds & ")"
-                ElseIf .arrayCount > 0 Then _
-                    fieldDeclaration &= "(0 To " & _
-                        Trim(Str(.arrayCount - 1)) & ")"
-                End If
-                fieldDeclaration &= " As " & .fieldType
-                outputText &= Chr(10) & fieldDeclaration
+                outputText &= Chr(10) & _
+                    C2fbRecordBindingFieldDeclarationText( _
+                        recordBinding, fieldIndex, .name, .fieldType, _
+                        .arrayCount, .arrayBounds, .alignmentStorageType, _
+                        0, 0, 0, recordBinding.isUnion, 1)
             End With
         Next
     End If

@@ -153,6 +153,154 @@ Private Function CBodyExternalObjectIndex( _
     Return -1
 End Function
 
+Private Function CBodyArrayTypeAliasIndexInContext( _
+    ByRef translation As C2fbTranslationContext, ByVal typeName As String _
+) As Long
+    For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+        With translation.body.aliases(aliasIndex)
+            If .name = typeName AndAlso .isArray <> 0 AndAlso _
+               .ambiguous = 0 AndAlso .arrayCount > 0 AndAlso _
+               .arrayElementType <> "" Then Return aliasIndex
+        End With
+    Next
+    Return -1
+End Function
+
+Private Sub RecordCBodyPointerToArrayParameterInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal procedureName As String, ByVal parameterIndex As Long, _
+    ByVal parameterName As String, _
+    ByVal arrayElementType As String, ByVal arrayElementCount As Long, _
+    ByVal isConst As Long _
+)
+    For entryIndex As Long = 0 To _
+        translation.body.pointerToArrayParameterCount - 1
+        With translation.body.pointerToArrayParameters(entryIndex)
+            If .procedureName <> procedureName OrElse _
+               .parameterIndex <> parameterIndex Then Continue For
+            If .arrayElementType <> arrayElementType OrElse _
+               .arrayElementCount <> arrayElementCount OrElse _
+               .isConst <> isConst Then .isAmbiguous = -1
+            Exit Sub
+        End With
+    Next
+    If translation.body.pointerToArrayParameterCount >= _
+       MAX_C2FB_BODY_TYPE_ALIASES Then _
+        ReportError("source exceeds the configured pointer-to-array parameter limit")
+    If translation.body.pointerToArrayParameterCount > _
+       UBound(translation.body.pointerToArrayParameters) Then _
+        ReDim Preserve translation.body.pointerToArrayParameters( _
+            0 To UBound(translation.body.pointerToArrayParameters) * 2 + 1)
+    With translation.body.pointerToArrayParameters( _
+        translation.body.pointerToArrayParameterCount)
+        .procedureName = procedureName
+        .parameterIndex = parameterIndex
+        .parameterName = parameterName
+        .arrayElementType = arrayElementType
+        .arrayElementCount = arrayElementCount
+        .isConst = isConst
+    End With
+    translation.body.pointerToArrayParameterCount += 1
+End Sub
+
+Private Function CBodyPointerToArrayParameterIndexInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal procedureName As String, ByVal parameterName As String _
+) As Long
+    For parameterIndex As Long = 0 To _
+        translation.body.pointerToArrayParameterCount - 1
+        With translation.body.pointerToArrayParameters(parameterIndex)
+            If .procedureName = procedureName AndAlso _
+               .parameterName = parameterName AndAlso .isAmbiguous = 0 Then _
+                Return parameterIndex
+        End With
+    Next
+    Return -1
+End Function
+
+Private Function CBodyPointerToArrayParameterIndexByPositionInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal procedureName As String, ByVal parameterIndex As Long _
+) As Long
+    For entryIndex As Long = 0 To _
+        translation.body.pointerToArrayParameterCount - 1
+        With translation.body.pointerToArrayParameters(entryIndex)
+            If .procedureName = procedureName AndAlso _
+               .parameterIndex = parameterIndex AndAlso .isAmbiguous = 0 Then _
+                Return entryIndex
+        End With
+    Next
+    Return -1
+End Function
+
+Private Function CBodyDirectPointerToArrayParameterInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    tokens() As String, ByVal firstToken As Long, ByVal lastToken As Long, _
+    ByVal parameterName As String, ByVal parameterType As String, _
+    ByRef arrayElementType As String, ByRef arrayElementCount As Long, _
+    ByRef arrayElementIsConst As Long _
+) As Long
+    arrayElementType = ""
+    arrayElementCount = 0
+    arrayElementIsConst = 0
+    Dim parameterNameIndex As Long = -1
+    For tokenIndex As Long = firstToken To lastToken
+        If tokens(tokenIndex) = parameterName Then
+            parameterNameIndex = tokenIndex
+            Exit For
+        End If
+    Next
+    If parameterNameIndex < 0 OrElse _
+       Right(parameterType, 4) <> " Ptr" Then Return 0
+
+    Dim elementType As String = SimplePointeeType(parameterType)
+    If elementType = "" Then Return 0
+    Dim parameterRank As Long = 0
+    Dim rowElementCount As LongInt = 1
+    Dim tokenPosition As Long = parameterNameIndex + 1
+    While tokenPosition <= lastToken AndAlso tokens(tokenPosition) = "["
+        Dim closingBracket As Long = -1
+        Dim nestedBracketDepth As Long = 0
+        For scanIndex As Long = tokenPosition + 1 To lastToken
+            If tokens(scanIndex) = "[" Then
+                nestedBracketDepth += 1
+            ElseIf tokens(scanIndex) = "]" Then
+                If nestedBracketDepth = 0 Then
+                    closingBracket = scanIndex
+                    Exit For
+                End If
+                nestedBracketDepth -= 1
+            End If
+        Next
+        If closingBracket < 0 Then Return 0
+        parameterRank += 1
+        If parameterRank > 1 Then
+            Dim boundText As String
+            For boundIndex As Long = tokenPosition + 1 To closingBracket - 1
+                If boundText <> "" Then boundText &= " "
+                boundText &= tokens(boundIndex)
+            Next
+            Dim dimensionCount As Long
+            If boundText = "" OrElse _
+               (EvaluateSimpleArrayBound( _
+                    boundText, dimensionCount, MAX_GENERIC_ARRAY_COUNT) = 0 AndAlso _
+                EvaluateGenericBodyArrayBound( _
+                    translation, boundText, dimensionCount, _
+                    MAX_GENERIC_ARRAY_COUNT) = 0) OrElse _
+               dimensionCount < 1 OrElse _
+               rowElementCount > _
+                   (MAX_GENERIC_ARRAY_COUNT \ dimensionCount) Then Return 0
+            rowElementCount *= dimensionCount
+        End If
+        tokenPosition = closingBracket + 1
+    Wend
+    If parameterRank < 2 Then Return 0
+    arrayElementType = elementType
+    arrayElementCount = CLng(rowElementCount)
+    arrayElementIsConst = CInt(Left(elementType, 6) = "Const ") * -1
+    Return -1
+End Function
+
 Private Function CBodyExternalObjectNameConflict( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, ByVal freeBasicName As String _
@@ -296,6 +444,25 @@ Private Function CBodyExternalArrayInitializerCount( _
     Return -1
 End Function
 
+Private Function CBodyExternalArrayInitializerCountFromText( _
+    tokens() As String, ByVal tokenCount As Long, _
+    ByVal firstToken As Long, ByVal sourceInitializer As String, _
+    ByRef arrayCount As Long _
+) As Long
+    arrayCount = 0
+    Dim sourceValues() As String
+    Dim sourceValueCount As Long
+    If SplitGenericStaticInitializerList( _
+        sourceInitializer, sourceValues(), sourceValueCount) <> 0 AndAlso _
+       sourceValueCount > 0 Then
+        arrayCount = sourceValueCount
+        Return -1
+    End If
+    ' Fall back to tokens for initializer forms outside the static-list parser.
+    Return CBodyExternalArrayInitializerCount( _
+        tokens(), tokenCount, firstToken, arrayCount)
+End Function
+
 Private Function CBodyInlineRecordArrayCount( _
     ByVal recordTail As String, ByVal sourceName As String, _
     ByRef arrayCount As Long _
@@ -422,12 +589,25 @@ Private Function CBodyFixedExternalArrayDimensions( _
         If position >= tokenCount OrElse tokens(position) <> "]" Then Return 0
         position += 1
         If boundExpression = "" Then
-            If arrayRank <> 0 OrElse _
-               (position < tokenCount AndAlso tokens(position) = "[") Then Return 0
+            If arrayRank <> 0 Then Return 0
             If sourceInitializer = "" Then
                 isUnsizedArray = -1
                 arrayRank = 1
                 Return 0
+            End If
+            Dim hasInnerDimensions As Long = CInt( _
+                position < tokenCount AndAlso tokens(position) = "[")
+            If hasInnerDimensions <> 0 Then
+                If CBodyExternalArrayInitializerCountFromText( _
+                    tokens(), tokenCount, position, sourceInitializer, _
+                    arrayCount) = 0 OrElse _
+                   arrayCount < 1 OrElse _
+                   arrayCount > MAX_GENERIC_ARRAY_COUNT Then Return 0
+                totalCount = arrayCount
+                dimensions(0) = arrayCount
+                arrayDimensions = Trim(Str(arrayCount)) & "ULL"
+                arrayRank = 1
+                Continue While
             End If
             Dim stringValues() As Long
             Dim stringValueCount As Long
@@ -435,8 +615,9 @@ Private Function CBodyFixedExternalArrayDimensions( _
                 sourceInitializer, stringValues(), stringValueCount) <> 0 Then
                 If stringValueCount >= MAX_GENERIC_ARRAY_COUNT Then Return 0
                 arrayCount = stringValueCount + 1
-            ElseIf CBodyExternalArrayInitializerCount( _
-                tokens(), tokenCount, position, arrayCount) = 0 Then
+            ElseIf CBodyExternalArrayInitializerCountFromText( _
+                tokens(), tokenCount, position, sourceInitializer, _
+                arrayCount) = 0 Then
                 Return 0
             End If
             If arrayCount < 1 OrElse arrayCount > MAX_GENERIC_ARRAY_COUNT Then Return 0
@@ -563,26 +744,31 @@ Private Function CBodyCallbackArrayTypeInContext( _
         If tokens(tokenIndex) = sourceName Then
             If tokenIndex + 1 > declaratorLastToken OrElse _
                tokens(tokenIndex + 1) <> "[" Then Return 0
-            Dim nesting As Long = 0
-            Dim closingBracket As Long = -1
-            For scanIndex As Long = tokenIndex + 1 To declaratorLastToken
-                If tokens(scanIndex) = "[" Then
-                    nesting += 1
-                ElseIf tokens(scanIndex) = "]" Then
-                    nesting -= 1
-                    If nesting = 0 Then
-                        closingBracket = scanIndex
-                        Exit For
+            Dim suffixPosition As Long = tokenIndex + 1
+            While suffixPosition <= declaratorLastToken AndAlso _
+                  tokens(suffixPosition) = "["
+                Dim nesting As Long = 0
+                Dim closingBracket As Long = -1
+                For scanIndex As Long = suffixPosition To declaratorLastToken
+                    If tokens(scanIndex) = "[" Then
+                        nesting += 1
+                    ElseIf tokens(scanIndex) = "]" Then
+                        nesting -= 1
+                        If nesting = 0 Then
+                            closingBracket = scanIndex
+                            Exit For
+                        End If
                     End If
-                End If
-            Next
-            If closingBracket < 0 Then Return 0
+                Next
+                If closingBracket < 0 Then Return 0
+                suffixPosition = closingBracket + 1
+            Wend
             foundArray = -1
-            ' The array bound is handled separately. Remove this one suffix
-            ' so the callback resolver sees the element type.
+            ' Array dimensions are handled separately. Remove all suffixes so
+            ' the callback resolver sees the element type.
             callbackTokens(callbackTokenCount) = tokens(tokenIndex)
             callbackTokenCount += 1
-            tokenIndex = closingBracket
+            tokenIndex = suffixPosition - 1
             Continue For
         End If
         callbackTokens(callbackTokenCount) = tokens(tokenIndex)
@@ -590,13 +776,43 @@ Private Function CBodyCallbackArrayTypeInContext( _
     Next
     If foundArray = 0 OrElse callbackTokenCount <= 0 Then Return 0
 
+    Dim arrayObjectNamePosition As Long = -1
+    For tokenIndex As Long = 0 To callbackTokenCount - 1
+        If callbackTokens(tokenIndex) = sourceName Then
+            arrayObjectNamePosition = tokenIndex
+            Exit For
+        End If
+    Next
+    If arrayObjectNamePosition > 0 Then
+        For typeTokenIndex As Long = 0 To arrayObjectNamePosition - 1
+            For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+                With translation.body.aliases(aliasIndex)
+                    If .name <> callbackTokens(typeTokenIndex) OrElse _
+                       .callbackType = "" OrElse .ambiguous <> 0 OrElse _
+                       CBodyCallbackIndexInContext( _
+                           translation, .callbackType) < 0 Then Continue For
+                    ' A callback typedef already includes the function-pointer
+                    ' level; use it directly as the array element type.
+                    callbackResult.status = C2FB_CALLBACK_TYPE_CONVERTED
+                    callbackResult.callbackName = sourceName
+                    callbackResult.freeBasicType = .callbackType
+                    callbackResult.pointerDepth = 1
+                    Return -1
+                End With
+            Next
+        Next
+    End If
+
     ResolveCBodyCallbackTypeInContext( _
         translation, catalog, callbackTokens(), 0, callbackTokenCount - 1, _
         callbackResult, 0, C2FB_TYPE_MAPPING_BODY)
     If callbackResult.status <> C2FB_CALLBACK_TYPE_CONVERTED OrElse _
-       callbackResult.callbackName <> sourceName OrElse _
        callbackResult.freeBasicType = "" OrElse _
-       callbackResult.pointerDepth <> 1 Then Return 0
+       CBodyCallbackIndexInContext( _
+           translation, callbackResult.freeBasicType) < 0 Then Return 0
+    ' A typedef hides the callback declarator's object name. The array
+    ' declarator above already verified that the selected object is an array.
+    ' The resolved FreeBASIC callback alias describes the array element type.
     Return -1
 End Function
 
@@ -650,7 +866,7 @@ Private Function CBodyCallbackArrayTargetMatchesInContext( _
     Return -1
 End Function
 
-Private Function TranslateCBodyCallbackArrayElementInitializer( _
+Private Function TranslateCBodyCallbackInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     ByVal sourceText As String, ByVal callbackType As String, _
@@ -680,7 +896,9 @@ Private Function TranslateCBodyCallbackArrayElementInitializer( _
            castZeroValue = 0 Then isNullPointerConstant = -1
     End If
     If isNullPointerConstant <> 0 Then
-        initialValue = "CPtr(" & callbackType & ", 0)"
+        ' The destination field supplies the callback type. A generated alias
+        ' may not be declared when an included record owns that field type.
+        initialValue = "0"
         Return -1
     End If
 
@@ -696,8 +914,16 @@ Private Function TranslateCBodyCallbackArrayElementInitializer( _
     End If
     If CBodyCallbackArrayTargetMatchesInContext( _
         translation, catalog, callbackType, functionName) = 0 Then Return 0
-    initialValue = "ProcPtr(" & CBodyCallName( _
-        translation, catalog, functionName) & ")"
+    Dim functionBindingName As String = CBodyCallName( _
+        translation, catalog, functionName)
+    Select Case functionName
+    Case "memcmp", "memcpy", "memmove", "memset"
+        ' FBC declares these C ABI procedures in crt/mem.bi. Refer to that
+        ' declaration directly so source-unit translation does not depend on
+        ' retaining a prototype from the included C string header.
+        functionBindingName = functionName
+    End Select
+    initialValue = "ProcPtr(" & functionBindingName & ")"
     Return -1
 End Function
 
@@ -705,26 +931,30 @@ Private Function TranslateCBodyStaticCallbackArrayInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     ByVal sourceText As String, ByVal callbackType As String, _
+    dimensions() As Long, ByVal arrayRank As Long, _
     ByVal arrayCount As Long, ByRef initialValue As String _
 ) As Long
     initialValue = ""
-    If arrayCount < 1 OrElse arrayCount > MAX_GENERIC_ARRAY_COUNT Then Return 0
+    If arrayRank < 1 OrElse arrayRank > MAX_GENERIC_ARRAY_RANK OrElse _
+       arrayCount < 1 OrElse _
+       arrayCount > MAX_GENERIC_STATIC_INITIALIZER_VALUES Then Return 0
 
     Dim sourceValues() As String
+    ReDim sourceValues(0 To arrayCount - 1)
     Dim sourceValueCount As Long = 0
     If Trim(sourceText) <> "" Then
-        If SplitGenericStaticInitializerList( _
-            sourceText, sourceValues(), sourceValueCount) = 0 OrElse _
-           sourceValueCount > arrayCount Then Return 0
+        If FlattenSimpleCArrayInitializer( _
+            sourceText, dimensions(), arrayRank, 0, sourceValues(), _
+            sourceValueCount, arrayCount) = 0 OrElse _
+           sourceValueCount <> arrayCount Then Return 0
     End If
 
     Dim translatedValues As String
     For elementIndex As Long = 0 To arrayCount - 1
-        Dim sourceValue As String = "0"
-        If elementIndex < sourceValueCount Then _
-            sourceValue = sourceValues(elementIndex)
+        Dim sourceValue As String = sourceValues(elementIndex)
+        If sourceValue = "" Then sourceValue = "0"
         Dim translatedValue As String
-        If TranslateCBodyCallbackArrayElementInitializer( _
+        If TranslateCBodyCallbackInitializer( _
             translation, catalog, sourceValue, callbackType, _
             translatedValue) = 0 Then Return 0
         If elementIndex > 0 Then translatedValues &= ", "
@@ -748,6 +978,13 @@ Private Sub RecordCBodyExternalObjectInContext( _
     ByVal arrayDimensions As String = "", _
     ByVal isDefinition As Long = 0 _
 )
+    If initializerText <> "" Then
+        Dim constantInitializer As String
+        If NormalizeGenericStaticSingleValueHelperCalls( _
+            initializerText, constantInitializer) <> 0 Then _
+            initializerText = constantInitializer
+    End If
+
     For existingIndex As Long = 0 To translation.body.externalObjectCount - 1
         With translation.body.externalObjects(existingIndex)
             If .sourceName = sourceName Then
@@ -861,15 +1098,33 @@ Private Function TranslateCBodyMultidimensionalStaticArrayInitializer( _
     Return -1
 End Function
 
+Private Function CBodyBuiltinCallTarget( _
+    ByVal procedureName As String _
+) As String
+    ' GCC memory builtins map to their C library calls. glibc's signbit
+    ' builtins map to math entrypoints with matching C signatures.
+    Select Case procedureName
+    Case "__builtin_memcpy": Return "memcpy"
+    Case "__builtin_memmove": Return "memmove"
+    Case "__builtin_memset": Return "memset"
+    Case "__builtin_signbit": Return "__signbit"
+    Case "__builtin_signbitf": Return "__signbitf"
+    Case "__builtin_signbitl": Return "__signbitl"
+    End Select
+    Return ""
+End Function
+
 Private Function CBodyReturnType( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, ByVal procedureName As String _
 ) As String
-    Dim index As Long = CBodyProcedureIndex(translation, procedureName)
+    Dim lookupName As String = CBodyBuiltinCallTarget(procedureName)
+    If lookupName = "" Then lookupName = procedureName
+    Dim index As Long = CBodyProcedureIndex(translation, lookupName)
     If index >= 0 AndAlso translation.symbolTable.symbols(index).ambiguous = 0 AndAlso _
        translation.symbolTable.symbols(index).body.isAmbiguous = 0 Then _
         Return translation.symbolTable.symbols(index).body.returnType
-    index = FbBodyCallSignatureIndex(catalog, procedureName)
+    index = FbBodyCallSignatureIndex(catalog, lookupName)
     If index < 0 OrElse catalog.bodyCallSignatures(index).parameterCount < 0 Then Return ""
     Return catalog.bodyCallSignatures(index).returnType
 End Function
@@ -879,7 +1134,9 @@ Private Function CBodyParameterType( _
     ByRef catalog As C2fbProjectCatalog, _
     ByVal procedureName As String, ByVal parameterIndex As Long _
 ) As String
-    Dim index As Long = CBodyProcedureIndex(translation, procedureName)
+    Dim lookupName As String = CBodyBuiltinCallTarget(procedureName)
+    If lookupName = "" Then lookupName = procedureName
+    Dim index As Long = CBodyProcedureIndex(translation, lookupName)
     Dim parameterTypes As String
     Dim parameterCount As Long
     If index >= 0 AndAlso translation.symbolTable.symbols(index).ambiguous = 0 AndAlso _
@@ -887,7 +1144,7 @@ Private Function CBodyParameterType( _
         parameterTypes = translation.symbolTable.symbols(index).body.parameterTypes
         parameterCount = translation.symbolTable.symbols(index).body.parameterCount
     Else
-        index = FbBodyCallSignatureIndex(catalog, procedureName)
+        index = FbBodyCallSignatureIndex(catalog, lookupName)
         If index < 0 OrElse catalog.bodyCallSignatures(index).parameterCount < 0 Then Return ""
         parameterTypes = catalog.bodyCallSignatures(index).parameterTypes
         parameterCount = catalog.bodyCallSignatures(index).parameterCount
@@ -1290,7 +1547,42 @@ Private Sub RecordCBodyProcedure( _
                     Dim typeEnd As Long = i - 1
                     If tokens(typeEnd) = parameterName Then typeEnd -= 1
                     Dim resolvedParameterType As C2fbResolvedTypeModel
-                    If IsCBodyCallbackTypeInContext( _
+                    Dim arrayTypedefType As String = _
+                        CBodyArrayTypedefParameterTypeInContext( _
+                            translation, tokens(), start, typeEnd)
+                    Dim pointerArrayElementType As String
+                    Dim pointerArrayElementCount As Long
+                    Dim pointerArrayElementIsConst As Long
+                    If CBodyPointerToArrayTypedefParameterInContext( _
+                        translation, tokens(), start, typeEnd, _
+                        pointerArrayElementType, pointerArrayElementCount, _
+                        pointerArrayElementIsConst) <> 0 Then
+                        RecordCBodyPointerToArrayParameterInContext( _
+                            translation, procedureName, parameterCount, _
+                            parameterName, _
+                            pointerArrayElementType, pointerArrayElementCount, _
+                            pointerArrayElementIsConst)
+                    ElseIf declaration.isFunctionDefinition <> 0 AndAlso _
+                        CBodyDirectPointerToArrayParameterInContext( _
+                            translation, tokens(), start, i - 1, parameterName, _
+                            parameterResult.freeBasicType, pointerArrayElementType, _
+                            pointerArrayElementCount, pointerArrayElementIsConst) <> 0 Then
+                        RecordCBodyPointerToArrayParameterInContext( _
+                            translation, procedureName, parameterCount, _
+                            parameterName, pointerArrayElementType, _
+                            pointerArrayElementCount, pointerArrayElementIsConst)
+                    End If
+                    If arrayTypedefType <> "" AndAlso _
+                       arrayTypedefType = parameterResult.freeBasicType Then
+                        ' ConvertParameterInContext already adjusted this C
+                        ' array typedef parameter to its element pointer. The
+                        ' ordinary type resolver sees the typedef's storage
+                        ' array, so reusing its result would hide the callable
+                        ' procedure from body-expression parsing.
+                        resolvedParameterType.status = _
+                            C2FB_TYPE_RESOLUTION_RESOLVED
+                        resolvedParameterType.freeBasicType = arrayTypedefType
+                    ElseIf IsCBodyCallbackTypeInContext( _
                         translation, parameterResult.freeBasicType) <> 0 Then
                         ' Callback declarators have already been checked by
                         ' ConvertParameterInContext. The ordinary type parser
@@ -1353,6 +1645,20 @@ Private Sub RecordCBodyProcedure( _
     translation.symbolTable.symbols(index).body.isDeclared = -1
     If declaration.isFunctionDefinition <> 0 Then _
         translation.symbolTable.symbols(index).body.hasDefinition = -1
+    If declaration.isFunctionDefinition <> 0 AndAlso _
+       declaration.isHeaderBody <> 0 AndAlso isStatic = 0 Then
+        Dim hasExternSpecifier As Long = 0
+        Dim hasInlineSpecifier As Long = 0
+        For tokenIndex As Long = 0 To _
+            declaration.functionDeclaration.declaratorStartToken - 1
+            Select Case declaration.tokens(tokenIndex)
+            Case "extern": hasExternSpecifier = -1
+            Case "inline", "__inline", "__inline__": hasInlineSpecifier = -1
+            End Select
+        Next
+        If hasExternSpecifier <> 0 AndAlso hasInlineSpecifier <> 0 Then _
+            translation.symbolTable.symbols(index).body.isExternal = -1
+    End If
     If isStatic <> 0 Then translation.symbolTable.symbols(index).body.isStatic = -1
 End Sub
 
@@ -1444,22 +1750,24 @@ Private Function CBodyCallName( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, ByVal procedureName As String _
 ) As String
-    Dim index As Long = CBodyProcedureIndex(translation, procedureName)
+    Dim lookupName As String = CBodyBuiltinCallTarget(procedureName)
+    If lookupName = "" Then lookupName = procedureName
+    Dim index As Long = CBodyProcedureIndex(translation, lookupName)
     If index >= 0 Then
         Dim freeBasicName As String = _
             CBodySymbolFreeBasicName(translation, catalog, index)
-        If IsCBodyRuntimeProcedure(procedureName) <> 0 AndAlso _
-           freeBasicName = "c2fb_crt_" & procedureName Then
+        If IsCBodyRuntimeProcedure(lookupName) <> 0 AndAlso _
+           freeBasicName = "c2fb_crt_" & lookupName Then
             Dim mappedFreeBasicName As String = _
                 translation.symbolTable.symbols(index).freeBasicName
             If mappedFreeBasicName <> "" AndAlso _
-               LCase(mappedFreeBasicName) <> LCase(procedureName) Then _
+               LCase(mappedFreeBasicName) <> LCase(lookupName) Then _
                 Return mappedFreeBasicName
             Dim signatureIndex As Long = _
-                FbBodyCallSignatureIndex(catalog, procedureName)
+                FbBodyCallSignatureIndex(catalog, lookupName)
             If signatureIndex < 0 Then _
                 signatureIndex = FbBodyCallSignatureAliasIndex( _
-                    catalog, procedureName)
+                    catalog, lookupName)
             If signatureIndex >= 0 AndAlso _
                catalog.bodyCallSignatures(signatureIndex).canDeclare <> 0 AndAlso _
                catalog.bodyCallSignatures(signatureIndex).parameterCount >= 0 Then
@@ -1470,9 +1778,9 @@ Private Function CBodyCallName( _
         End If
         Return freeBasicName
     End If
-    index = FbBodyCallSignatureIndex(catalog, procedureName)
+    index = FbBodyCallSignatureIndex(catalog, lookupName)
     If index >= 0 Then Return catalog.bodyCallSignatures(index).fbName
-    Return procedureName
+    Return lookupName
 End Function
 
 Private Sub AddCBodyCallableSymbols( _
@@ -1514,7 +1822,8 @@ Private Sub AddCBodyCallableSymbols( _
                         translation, catalog, .sourceName)
                 End If
             End If
-            If .body.hasDefinition <> 0 AndAlso alreadyAvailable = 0 Then _
+            If .body.hasDefinition <> 0 AndAlso alreadyAvailable = 0 AndAlso _
+               .body.isExternal = 0 Then _
                 .body.needsDefinition = -1
             If alreadyAvailable = 0 Then
                 If nameCount > UBound(names) Then ReDim Preserve names(0 To UBound(names) * 2 + 1)
@@ -1627,8 +1936,24 @@ Private Function CBodyUsesProcedure(ByVal bodyText As String, ByVal procedureNam
     Return 0
 End Function
 
+Private Function CBodyExistingProcedureSatisfiesDependency( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal sourceName As String _
+) As Long
+    If C2fbNameListContains( _
+        catalog.existingProcedureNames(), catalog.existingProcedureNameCount, _
+        sourceName) <> 0 Then Return -1
+    Dim freeBasicName As String = CBodyCallName(translation, catalog, sourceName)
+    If freeBasicName <> "" AndAlso C2fbNameListContains( _
+        catalog.existingProcedureNames(), catalog.existingProcedureNameCount, _
+        freeBasicName) <> 0 Then Return -1
+    Return 0
+End Function
+
 Private Function CBodyCallsMissingRequiredDefinition( _
-    ByRef translation As C2fbTranslationContext, ByVal bodyText As String, _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, ByVal bodyText As String, _
     ByRef procedureIndexByName As C2fbStringIndexMapModel, _
     ByRef candidateIndexByName As C2fbStringIndexMapModel, _
     candidates() As C2fbBodyCandidateModel, ByVal candidateCount As Long, _
@@ -1713,11 +2038,17 @@ Private Function CBodyCallsMissingRequiredDefinition( _
                                 candidateIndexByName, .sourceName)
                         If candidateIndex < 0 OrElse _
                            candidateIndex >= candidateCount Then
+                            If CBodyExistingProcedureSatisfiesDependency( _
+                                translation, catalog, .sourceName) <> 0 Then _
+                                Continue While
                             missingProcedureName = .sourceName
                             Return -1
                         End If
                         If candidates(candidateIndex).duplicate <> 0 OrElse _
                            candidates(candidateIndex).source = "" Then
+                            If CBodyExistingProcedureSatisfiesDependency( _
+                                translation, catalog, .sourceName) <> 0 Then _
+                                Continue While
                             missingProcedureName = .sourceName
                             Return -1
                         End If
@@ -1829,7 +2160,7 @@ Private Sub FilterCBodyDependencies( _
             If candidates(i).source = "" Then Continue For
             Dim missingProcedureName As String
             Dim hasMissingDefinition As Long = CBodyCallsMissingRequiredDefinition( _
-                translation, candidates(i).source, procedureIndexByName, _
+                translation, catalog, candidates(i).source, procedureIndexByName, _
                 candidateIndexByName, candidates(), candidateCount, _
                 missingProcedureName)
             If hasMissingDefinition = 0 Then
@@ -1855,6 +2186,8 @@ Private Sub IndexCBodyTypeAliasesFromDeclarations( _
 )
     ReDim translation.body.aliases(0 To 255)
     translation.body.aliasCount = 0
+    ReDim translation.body.pointerToArrayParameters(0 To 255)
+    translation.body.pointerToArrayParameterCount = 0
     For declarationIndex As Long = 0 To translation.sourceUnit.declarationCount - 1
         With translation.sourceUnit.declarations(declarationIndex)
             If .entryKind = C2FB_DECLARATION_RECORD Then
@@ -1917,9 +2250,29 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
             If declaration.isTypedef <> 0 OrElse declaration.recordTail = "" Then _
                 Continue For
             inlineRecordTail = declaration.recordTail
+            Dim recordTypePrefix As String = declaration.recordPrefix
+            If declaration.recordKind = C2FB_RECORD_ENUM AndAlso _
+               declaration.recordTag = "" AndAlso _
+               declaration.recordAlias <> "" Then
+                ' An anonymous enum has no C tag to repeat in the declarator.
+                ' C2FB emits enum storage with its C int representation, so use
+                ' that primitive while indexing the following file-scope object.
+                Dim prefixTokens() As String
+                Dim prefixTokenCount As Long
+                TokenizeCDeclaration( _
+                    declaration.recordPrefix, prefixTokens(), prefixTokenCount)
+                recordTypePrefix = ""
+                For prefixIndex As Long = 0 To prefixTokenCount - 1
+                    If prefixTokens(prefixIndex) = "enum" Then Continue For
+                    If recordTypePrefix <> "" Then recordTypePrefix &= " "
+                    recordTypePrefix &= prefixTokens(prefixIndex)
+                Next
+                If recordTypePrefix <> "" Then recordTypePrefix &= " "
+                recordTypePrefix &= "int"
+            End If
             Dim recordVariableText As String = _
                 GenericDeclaratorWithoutInitializer( _
-                    declaration.recordPrefix & " " & declaration.recordTail)
+                    recordTypePrefix & " " & declaration.recordTail)
             TokenizeCDeclaration( _
                 recordVariableText, declaration.tokens(), declaration.tokenCount)
             declaration.text = recordVariableText
@@ -1987,6 +2340,40 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
             If arrayDepth > 0 AndAlso Left(bindingOrder, 1) <> "A" Then _
                 Continue For
 
+            ' A typedef can supply the array operator without spelling
+            ' brackets on this object declarator. Keep that storage shape in
+            ' the body index so later expressions apply C array decay.
+            Dim arrayTypedefAliasIndex As Long = -1
+            Dim arrayTypedefIsConst As Long = 0
+            If pointerDepth = 0 AndAlso arrayDepth = 0 AndAlso _
+               hasFunctionOperator = 0 Then
+                Dim arrayTypedefName As String = ""
+                Dim arrayTypedefNameIsAmbiguous As Long = 0
+                For typeIndex As Long = 0 To itemCommonTypeTokenCount - 1
+                    Select Case itemTokens(typeIndex)
+                    Case "const"
+                        arrayTypedefIsConst = -1
+                    Case "volatile", "restrict", "__restrict", "__restrict__", _
+                         "static", "extern", "auto", "register", _
+                         "_Thread_local", "__thread", "thread_local"
+                        Continue For
+                    Case Else
+                        If arrayTypedefName <> "" Then
+                            arrayTypedefNameIsAmbiguous = -1
+                            Exit For
+                        End If
+                        arrayTypedefName = itemTokens(typeIndex)
+                    End Select
+                Next
+                If arrayTypedefNameIsAmbiguous = 0 AndAlso _
+                   arrayTypedefName <> "" Then
+                    arrayTypedefAliasIndex = _
+                        CBodyArrayTypeAliasIndexInContext( _
+                            translation, arrayTypedefName)
+                End If
+            End If
+            If arrayTypedefAliasIndex >= 0 Then arrayDepth = 1
+
             Dim isPrivateStatic As Long = CInt(hasStaticStorage <> 0) * -1
             Dim reusedStaticName As String = GenericStaticObjectReuseInPolicy( _
                 translation.genericC.policy, sourceName)
@@ -2006,13 +2393,21 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                 ReportError( _
                     "--reuse-static-object targets a non-static C object: " & _
                     sourceName)
+            Dim callbackArrayResult As C2fbCallbackTypeResultModel
+            Dim hasCallbackArrayType As Long = 0
+            If arrayDepth <> 0 Then
+                hasCallbackArrayType = CBodyCallbackArrayTypeInContext( _
+                    translation, catalog, itemTokens(), itemTokenCount, _
+                    sourceName, callbackArrayResult)
+            End If
             ' A fixed, private callback table has the same module lifetime as
-            ' the C object. Keep the supported form one-dimensional so each
-            ' array element has one unambiguous procedure-pointer signature.
-            If hasFunctionOperator <> 0 AndAlso arrayDepth <> 0 Then
-                If arrayDepth <> 1 OrElse pointerDepth <> 1 OrElse _
-                   (isPrivateStatic = 0 AndAlso isGlobalDefinition = 0) OrElse _
-                   reusedStaticName <> "" Then
+            ' the C object. Each dimension shares one procedure-pointer type.
+            If arrayDepth <> 0 AndAlso _
+               (hasFunctionOperator <> 0 OrElse hasCallbackArrayType <> 0) Then
+                If arrayDepth < 1 OrElse _
+                   arrayDepth > MAX_GENERIC_ARRAY_RANK OrElse _
+                   (hasFunctionOperator <> 0 AndAlso pointerDepth <> 1) OrElse _
+                       (isPrivateStatic = 0 AndAlso isGlobalDefinition = 0) Then
                     Continue For
                 End If
 
@@ -2030,16 +2425,11 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                     callbackArrayInitializer, callbackArrayDimensionCounts(), _
                     callbackArrayCount, callbackArrayRank, _
                     callbackArrayDimensions, callbackArrayIsUnsized) = 0 OrElse _
-                   callbackArrayCount <= 0 OrElse callbackArrayRank <> 1 Then
+                   callbackArrayCount <= 0 OrElse _
+                   callbackArrayRank <> arrayDepth Then
                     Continue For
                 End If
 
-                Dim callbackArrayResult As C2fbCallbackTypeResultModel
-                If CBodyCallbackArrayTypeInContext( _
-                    translation, catalog, itemTokens(), itemTokenCount, _
-                    sourceName, callbackArrayResult) = 0 Then
-                    Continue For
-                End If
                 Dim callbackArrayConst As Long = 0
                 Dim callbackArrayNamePosition As Long = -1
                 Dim callbackArrayPointerPosition As Long = -1
@@ -2058,20 +2448,29 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                         If itemTokens(tokenIndex) = "const" Then _
                             callbackArrayConst = -1
                     Next
+                ElseIf callbackArrayNamePosition >= 0 Then
+                    For tokenIndex As Long = 0 To callbackArrayNamePosition - 1
+                        If itemTokens(tokenIndex) = "const" Then _
+                            callbackArrayConst = -1
+                    Next
                 End If
 
                 Dim callbackArrayInitialValue As String
-                If TranslateCBodyStaticCallbackArrayInitializer( _
-                    translation, catalog, callbackArrayInitializer, _
-                    callbackArrayResult.freeBasicType, callbackArrayCount, _
-                    callbackArrayInitialValue) = 0 Then
-                    Continue For
+                If reusedStaticName = "" Then
+                    If TranslateCBodyStaticCallbackArrayInitializer( _
+                        translation, catalog, callbackArrayInitializer, _
+                        callbackArrayResult.freeBasicType, _
+                        callbackArrayDimensionCounts(), callbackArrayRank, _
+                        callbackArrayCount, callbackArrayInitialValue) = 0 Then
+                        Continue For
+                    End If
                 End If
                 RecordCBodyExternalObjectInContext( _
                     translation, catalog, sourceName, sourceName, _
                     callbackArrayResult.freeBasicType, callbackArrayCount, _
                     -1, callbackArrayConst, isPrivateStatic, _
-                    callbackArrayInitialValue, 0, callbackArrayIsUnsized, _
+                    callbackArrayInitialValue, _
+                    CInt(reusedStaticName <> "") * -1, callbackArrayIsUnsized, _
                     callbackArrayRank, callbackArrayDimensions, _
                     isGlobalDefinition)
                 Continue For
@@ -2082,8 +2481,20 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                 ' a procedure declaration. Keep its callback signature for
                 ' body calls through the object name.
                 Dim callbackResult As C2fbCallbackTypeResultModel
+                Dim callbackDeclaratorLastToken As Long = itemTokenCount - 1
+                Dim callbackAssignmentToken As Long
+                If FindC2fbTopLevelAssignmentToken( _
+                    itemTokens(), 0, itemTokenCount - 1, _
+                    callbackAssignmentToken) <> 0 AndAlso _
+                   callbackAssignmentToken >= 0 Then
+                    ' The callback resolver accepts a C declarator, not its
+                    ' initializer. Keep the initializer for the storage pass
+                    ' below, but do not let it hide a direct function pointer.
+                    callbackDeclaratorLastToken = callbackAssignmentToken - 1
+                End If
                 ResolveCBodyCallbackTypeInContext( _
-                    translation, catalog, itemTokens(), 0, itemTokenCount - 1, _
+                    translation, catalog, itemTokens(), 0, _
+                    callbackDeclaratorLastToken, _
                     callbackResult, 0, C2FB_TYPE_MAPPING_BODY)
                 If callbackResult.status <> C2FB_CALLBACK_TYPE_CONVERTED OrElse _
                    callbackResult.callbackName <> sourceName OrElse _
@@ -2119,15 +2530,12 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                         If CBodySourceObjectInitializer( _
                             declaration.text, sourceName, callbackInitializer) = 0 Then _
                             Continue For
-                        Dim scalarArrayCount As Long = 0
-                        If TranslateGenericModuleStaticInitializer( _
-                            translation, callbackInitializer, _
-                            callbackResult.freeBasicType, 0, -1, -1, _
-                            0, 0, 0, scalarArrayCount, _
+                        If TranslateCBodyCallbackInitializer( _
+                            translation, catalog, callbackInitializer, _
+                            callbackResult.freeBasicType, _
                             callbackInitialValue) = 0 Then Continue For
                     ElseIf callbackConstObject <> 0 Then
-                        callbackInitialValue = _
-                            "CPtr(" & callbackResult.freeBasicType & ", 0)"
+                        callbackInitialValue = "0"
                     End If
                 End If
                 RecordCBodyExternalObjectInContext( _
@@ -2147,7 +2555,15 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
             Dim arrayInitializerText As String
             CBodySourceObjectInitializer( _
                 declaration.text, sourceName, arrayInitializerText)
-            If arrayDepth > 0 AndAlso CBodyFixedExternalArrayDimensions( _
+            If arrayTypedefAliasIndex >= 0 Then
+                With translation.body.aliases(arrayTypedefAliasIndex)
+                    arrayCount = .arrayCount
+                    arrayRank = 1
+                    arrayDimensions = Trim(Str(.arrayCount)) & "ULL"
+                    ReDim arrayDimensionCounts(0 To 0)
+                    arrayDimensionCounts(0) = .arrayCount
+                End With
+            ElseIf arrayDepth > 0 AndAlso CBodyFixedExternalArrayDimensions( _
                 translation, itemTokens(), itemTokenCount, itemCommonTypeTokenCount, _
                 sourceName, arrayInitializerText, arrayDimensionCounts(), _
                 arrayCount, arrayRank, arrayDimensions, isUnsizedArray) = 0 Then
@@ -2192,9 +2608,19 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
             If typeTokensComplete = 0 OrElse typeTokenCount = 0 Then Continue For
 
             Dim resolvedType As C2fbResolvedTypeModel
-            ResolveC2fbTypeModel( _
-                translation, catalog, typeTokens(), 0, typeTokenCount - 1, _
-                resolvedType)
+            If arrayTypedefAliasIndex >= 0 Then
+                With translation.body.aliases(arrayTypedefAliasIndex)
+                    resolvedType.status = C2FB_TYPE_RESOLUTION_RESOLVED
+                    resolvedType.freeBasicType = .arrayElementType
+                    resolvedType.pointerCount = 0
+                    resolvedType.isConst = CInt( _
+                        .isConst <> 0 OrElse arrayTypedefIsConst <> 0) * -1
+                End With
+            Else
+                ResolveC2fbTypeModel( _
+                    translation, catalog, typeTokens(), 0, typeTokenCount - 1, _
+                    resolvedType)
+            End If
             If resolvedType.status <> C2FB_TYPE_RESOLUTION_RESOLVED OrElse _
                resolvedType.freeBasicType = "" OrElse _
                resolvedType.freeBasicType = "void" Then Continue For
@@ -2231,27 +2657,51 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                                 arrayDimensionCounts(), arrayRank, arrayCount, _
                                 CInt(pointerDepth > 0) * -1, initializerText) = 0 Then _
                                 Continue For
-                        ElseIf TranslateGenericModuleStaticInitializer( _
-                            translation, sourceInitializer, freeBasicType, -1, _
-                            CInt(pointerDepth > 0) * -1, 0, _
-                            CInt(IsGenericCharacterArrayType( _
-                                translation, itemCommonType, freeBasicType, 0) <> 0) * -1, _
-                            0, 0, arrayCount, initializerText) = 0 Then
-                            Continue For
+                        Else
+                            Dim staticInitializerStatus As Long = _
+                                TranslateGenericModuleStaticInitializer( _
+                                translation, sourceInitializer, freeBasicType, -1, _
+                                CInt(pointerDepth > 0) * -1, 0, _
+                                CInt(IsGenericCharacterArrayType( _
+                                    translation, itemCommonType, freeBasicType, 0) <> 0) * -1, _
+                                0, 0, arrayCount, initializerText)
+                            If staticInitializerStatus = 0 Then Continue For
                         End If
                     Else
-                        Dim emptyCallableNames(0 To 0) As String
-                        Dim emptyParameterNames(0 To 0) As String
-                        Dim emptyParameterAliases(0 To 0) As String
-                        Dim emptyParameterTypes(0 To 0) As String
-                        Dim hasBooleanOperator As Long
-                        Dim hasFunctionCall As Long
-                        If TranslateSimpleExpression( _
-                            translation, catalog, sourceInitializer, initializerText, _
-                            hasBooleanOperator, hasFunctionCall, emptyCallableNames(), _
-                            0, emptyParameterNames(), emptyParameterAliases(), _
-                            emptyParameterTypes(), 0, freeBasicType) = 0 OrElse _
-                           hasFunctionCall <> 0 Then Continue For
+                        Dim sourceRecord As String = CBodyRecordName( _
+                            translation, catalog, freeBasicType)
+                        If sourceRecord <> "" AndAlso _
+                           Left(LTrim(sourceInitializer), 1) = "{" Then
+                            Dim emptySimpleContext As SimpleBodyContext
+                            Dim emptyCallableNames(0 To 0) As String
+                            Dim emptyParameterNames(0 To 0) As String
+                            Dim emptyParameterAliases(0 To 0) As String
+                            Dim emptyParameterTypes(0 To 0) As String
+                            If TranslateSimpleRecordInitializer( _
+                                translation, catalog, sourceInitializer, _
+                                freeBasicType, initializerText, _
+                                emptySimpleContext, emptyCallableNames(), 0, _
+                                emptyParameterNames(), emptyParameterAliases(), _
+                                emptyParameterTypes(), 0, -1) = 0 Then Continue For
+                        ElseIf pointerDepth > 0 AndAlso _
+                               GenericNullPointerConstantText(sourceInitializer) <> 0 Then
+                            ' Keep the declared pointer type for the initializer;
+                            ' the C backend emits its zero without an alias cast.
+                            initializerText = "CPtr(" & freeBasicType & ", 0)"
+                        Else
+                            Dim emptyCallableNames(0 To 0) As String
+                            Dim emptyParameterNames(0 To 0) As String
+                            Dim emptyParameterAliases(0 To 0) As String
+                            Dim emptyParameterTypes(0 To 0) As String
+                            Dim hasBooleanOperator As Long
+                            Dim hasFunctionCall As Long
+                            If TranslateSimpleExpression( _
+                                translation, catalog, sourceInitializer, initializerText, _
+                                hasBooleanOperator, hasFunctionCall, emptyCallableNames(), _
+                                0, emptyParameterNames(), emptyParameterAliases(), _
+                                emptyParameterTypes(), 0, freeBasicType) = 0 OrElse _
+                               hasFunctionCall <> 0 Then Continue For
+                        End If
                     End If
                 End If
             End If

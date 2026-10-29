@@ -131,14 +131,19 @@ Private Sub FilterUnusedHeaderBodyCandidates( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     candidates() As C2fbBodyCandidateModel, ByVal candidateCount As Long, _
-    ByVal includeHeaderInlineBodies As Long _
+    ByVal includeHeaderInlineBodies As Long, _
+    ByVal includeHeaderInlineBodyNames As String _
 )
     For i As Long = 0 To candidateCount - 1
         candidates(i).isHeaderRequired = 0
-        If includeHeaderInlineBodies <> 0 AndAlso _
-           candidates(i).isHeaderBody <> 0 AndAlso _
-           candidates(i).isHeaderInlineBody <> 0 Then _
-            candidates(i).isHeaderRequired = -1
+        If candidates(i).isHeaderBody <> 0 AndAlso _
+           candidates(i).isHeaderInlineBody <> 0 Then
+            If includeHeaderInlineBodies <> 0 OrElse _
+               C2fbDelimitedNameListContains( _
+                   includeHeaderInlineBodyNames, candidates(i).name) <> 0 Then
+                candidates(i).isHeaderRequired = -1
+            End If
+        End If
     Next
 
     ' Static bodies from included headers are module-local candidates. Inline
@@ -256,6 +261,8 @@ Private Sub TranslateCBodyFile( _
     declarationScan.options.sourceOriginPrecision = bodyOptions.sourceOriginPrecision
     declarationScan.options.collectHeaderInlineBodies = _
         bodyOptions.includeHeaderInlineBodies
+    declarationScan.options.includeHeaderInlineBodyNames = _
+        bodyOptions.includeHeaderInlineBodyNames
     declarationScan.options.collectIncludedCSourceBodies = _
         bodyOptions.includeIncludedCSourceBodies
     If CollectC2fbDeclarationsInSourceUnit( _
@@ -268,11 +275,15 @@ Private Sub TranslateCBodyFile( _
     IndexCBodyGeneratedSourceRecords(translation, catalog)
     ' Re-index typedef aliases after port record bindings are available.
     IndexCBodyTypeAliasesFromDeclarations(translation, catalog)
+    ' Enum expressions can use typedef ranks once the body aliases are known.
+    If translation.target.profile = C2FB_TARGET_GENERIC Then _
+        IndexGenericBodyEnumConstants(translation)
     IndexCBodyProceduresFromDeclarations(translation, catalog)
     AddCBodyCallableSymbols( _
         translation, catalog, _
         catalog.callableNames(), _
         catalog.callableNameCount)
+    BuildCBodyRecordStaticInitializerBindings(translation, catalog)
     IndexCBodyExternalObjectsFromDeclarations(translation, catalog)
 
     Dim candidates() As C2fbBodyCandidateModel
@@ -287,6 +298,8 @@ Private Sub TranslateCBodyFile( _
     bodyScan.options.sourceOriginPrecision = bodyOptions.sourceOriginPrecision
     bodyScan.options.collectHeaderInlineBodies = _
         bodyOptions.includeHeaderInlineBodies
+    bodyScan.options.includeHeaderInlineBodyNames = _
+        bodyOptions.includeHeaderInlineBodyNames
     bodyScan.options.collectIncludedCSourceBodies = _
         bodyOptions.includeIncludedCSourceBodies
     Dim scanner As C2fbFunctionScanner
@@ -338,6 +351,12 @@ Private Sub TranslateCBodyFile( _
             candidates(candidateCount).isHeaderBody = sourceItem.declaration.isHeaderBody
             candidates(candidateCount).isHeaderInlineBody = _
                 CBodyDeclarationHasInlineSpecifier(sourceItem.declaration)
+            If GenericProcedureExcludedInPolicy( _
+                translation.genericC.policy, functionName) <> 0 Then
+                candidates(candidateCount).source = ""
+                candidates(candidateCount).skipMessage = _
+                    "excluded by --exclude-proc"
+            End If
             If AddC2fbStringIndexMapEntry( _
                 candidateNameIndex, functionName, candidateCount) <> -1 Then _
                 ReportError("source file exceeds the configured function limit")
@@ -373,7 +392,8 @@ Private Sub TranslateCBodyFile( _
     If translation.target.sourceMapMode <> C2FB_SOURCE_MAP_DISABLED Then _
         FilterUnusedHeaderBodyCandidates( _
             translation, catalog, candidates(), candidateCount, _
-            bodyOptions.includeHeaderInlineBodies)
+            bodyOptions.includeHeaderInlineBodies, _
+            bodyOptions.includeHeaderInlineBodyNames)
     If keepUnresolvedDependencies = 0 Then _
         FilterCBodyDependencies( _
             translation, catalog, candidates(), candidateCount)

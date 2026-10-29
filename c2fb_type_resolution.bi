@@ -232,8 +232,14 @@ Private Function MapGenericHeaderCType( _
                     baseType = "Any"
                 Else
                     baseType = translation.genericC.header.headerTypeAliases(aliasIndex).freeBasicName
-                    If translation.genericC.header.headerTypeAliases(aliasIndex).isFunction <> 0 AndAlso _
-                       pointerCount > 0 Then pointerCount -= 1
+                    If translation.genericC.header.headerTypeAliases(aliasIndex).isFunction <> 0 Then
+                        ' FreeBASIC's callback alias represents the source
+                        ' typedef's function pointer layers. Only a C typedef
+                        ' of a bare function type needs one implicit layer.
+                        If pointerCount > 0 AndAlso _
+                           translation.genericC.header.headerTypeAliases(aliasIndex).functionPointerDepth = 0 Then _
+                            pointerCount -= 1
+                    End If
                 End If
             Else
                 If pointerCount = 0 AndAlso allowIncompleteValue <> 0 Then _

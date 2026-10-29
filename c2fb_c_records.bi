@@ -160,7 +160,9 @@ End Function
 
 Private Sub BindCBodyRecord( _
     ByRef translation As C2fbTranslationContext, _
-    ByVal sourceName As String, ByVal fbName As String _
+    ByVal sourceName As String, ByVal fbName As String, _
+    ByVal isGenerated As Long = 0, _
+    ByVal recordKind As C2fbRecordKind = C2FB_RECORD_KIND_NONE _
 )
     If sourceName = "" OrElse fbName = "" Then Exit Sub
     For i As Long = 0 To translation.body.recordBindingCount - 1
@@ -174,8 +176,9 @@ Private Sub BindCBodyRecord( _
     translation.body.recordBindings(translation.body.recordBindingCount).sourceName = sourceName
     translation.body.recordBindings(translation.body.recordBindingCount).fbName = fbName
     translation.body.recordBindings(translation.body.recordBindingCount).recordKind = _
-        C2FB_RECORD_KIND_NONE
-    translation.body.recordBindings(translation.body.recordBindingCount).isGenerated = 0
+        recordKind
+    translation.body.recordBindings(translation.body.recordBindingCount).isGenerated = _
+        isGenerated
     translation.body.recordBindingCount += 1
 End Sub
 
@@ -209,7 +212,8 @@ Declare Sub RecordCBodyFieldWithTokens( _
     ByVal ownerName As String, ByVal declaration As String, _
     tokens() As String, ByVal count As Long, ByRef commonType As String, _
     ByRef commonTypeTokenCount As Long, _
-    ByVal part As Long, ByVal nestedType As String _
+    ByVal part As Long, ByVal nestedType As String, _
+    ByVal nestedTypeKind As C2fbRecordKind _
 )
 
 Private Function LookupCBodyRecordBindingInContext( _
@@ -239,37 +243,36 @@ Private Function CBodyRecordName( _
     ByRef catalog As C2fbProjectCatalog, ByVal fbType As String _
 ) As String
     fbType = ResolveFbBodyRecordOwner(catalog, fbType)
-    If translation.target.profile <> C2FB_TARGET_SQLITE Then
-        For i As Long = 0 To translation.body.recordBindingCount - 1
-            If LCase(ResolveFbBodyRecordOwner(catalog, translation.body.recordBindings(i).fbName)) = _
-               LCase(fbType) Then Return translation.body.recordBindings(i).sourceName
-        Next
-        If MappedFbBodyRecord(translation, catalog, fbType) <> "" Then Return fbType
-        Return ""
-    End If
     ' The two flexible-list element types are standalone layouts in the port,
     ' even when a preprocessed source omits their enclosing member metadata.
-    Select Case fbType
-    Case "SqliteExprListItem": Return "ExprList_item"
-    Case "SqliteIdListItem": Return "IdList_item"
-    Case "SqliteSubroutineSignature": Return "SubrtnSig"
-    End Select
+    If translation.target.profile = C2FB_TARGET_SQLITE Then
+        Select Case fbType
+        Case "SqliteExprListItem": Return "ExprList_item"
+        Case "SqliteIdListItem": Return "IdList_item"
+        Case "SqliteSubroutineSignature": Return "SubrtnSig"
+        End Select
+    End If
     ' sqlite3 is a private connection record with the same name in C and in
     ' the port. Keep that exact owner so array fields such as aLimit retain
     ' their declared storage type in sizeof and member expressions.
-    If fbType = "sqlite3" Then Return "sqlite3"
-    If fbType = "SqlitePragmaEncodingName" Then Return "EncName"
+    If translation.target.profile = C2FB_TARGET_SQLITE Then
+        If fbType = "sqlite3" Then Return "sqlite3"
+        If fbType = "SqlitePragmaEncodingName" Then Return "EncName"
+    End If
     For i As Long = 0 To translation.body.recordBindingCount - 1
         If LCase(ResolveFbBodyRecordOwner(catalog, translation.body.recordBindings(i).fbName)) = LCase(fbType) Then _
             Return translation.body.recordBindings(i).sourceName
     Next
+    ' Enum aliases often map to scalar FreeBASIC types such as Long. They do
+    ' not describe record storage and must not claim that scalar's layout.
     Dim generatedRecordPrefix As String = _
         translation.genericC.policy.generatedNamePrefix
     If generatedRecordPrefix = "" Then generatedRecordPrefix = "c2fb_"
     For declarationIndex As Long = 0 To _
         translation.sourceUnit.declarationCount - 1
         With translation.sourceUnit.declarations(declarationIndex)
-            If .entryKind <> C2FB_DECLARATION_RECORD Then Continue For
+            If .entryKind <> C2FB_DECLARATION_RECORD OrElse _
+               .recordKind = C2FB_RECORD_ENUM Then Continue For
             Dim sourceNames(0 To 1) As String
             sourceNames(0) = .recordTag
             sourceNames(1) = .recordAlias
@@ -293,7 +296,8 @@ Private Function CBodyRecordName( _
     For declarationIndex As Long = 0 To _
         translation.sourceUnit.declarationCount - 1
         With translation.sourceUnit.declarations(declarationIndex)
-            If .entryKind <> C2FB_DECLARATION_RECORD Then Continue For
+            If .entryKind <> C2FB_DECLARATION_RECORD OrElse _
+               .recordKind = C2FB_RECORD_ENUM Then Continue For
             Dim sourceNames(0 To 1) As String
             sourceNames(0) = .recordTag
             sourceNames(1) = .recordAlias
@@ -311,12 +315,15 @@ Private Function CBodyRecordName( _
     Return ""
 End Function
 
-Private Function CBodyRecordTag(ByVal declaration As String, ByRef isRecord As Long) As String
+Private Function CBodyRecordTag( _
+    ByVal declaration As String, ByRef isRecord As Long, _
+    ByRef recordKind As C2fbRecordKind _
+) As String
     isRecord = 0
     Dim recordTag As String
     Dim isTypedef As Long
     Dim isPacked As Long
-    Dim recordKind As C2fbRecordKind = C2fbRecordKindFromPrefix( _
+    recordKind = C2fbRecordKindFromPrefix( _
         declaration, recordTag, isTypedef, isPacked)
     If recordKind <> C2FB_RECORD_STRUCT AndAlso _
        recordKind <> C2FB_RECORD_UNION Then Return ""
@@ -328,7 +335,8 @@ Private Sub RecordCBodyField( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     ByVal ownerName As String, ByVal declaration As String, _
-    ByVal nestedType As String = "" _
+    ByVal nestedType As String = "", _
+    ByVal nestedTypeKind As C2fbRecordKind = C2FB_RECORD_KIND_NONE _
 )
     Dim parts() As String
     Dim partCount As Long
@@ -343,7 +351,7 @@ Private Sub RecordCBodyField( _
         Dim commonTypeTokenCount As Long = 0
         RecordCBodyFieldWithTokens( _
             translation, catalog, ownerName, text, tokens(), count, _
-            commonType, commonTypeTokenCount, part, nestedType)
+            commonType, commonTypeTokenCount, part, nestedType, nestedTypeKind)
     Next
 End Sub
 
@@ -353,7 +361,8 @@ Private Sub RecordCBodyFieldWithTokens( _
     ByVal ownerName As String, ByVal declaration As String, _
     tokens() As String, ByVal count As Long, ByRef commonType As String, _
     ByRef commonTypeTokenCount As Long, _
-    ByVal part As Long, ByVal nestedType As String _
+    ByVal part As Long, ByVal nestedType As String, _
+    ByVal nestedTypeKind As C2fbRecordKind _
 )
     If count < 2 OrElse count >= MAX_TYPE_WORDS Then Exit Sub
     Dim callbackResult As C2fbCallbackTypeResultModel
@@ -444,6 +453,18 @@ Private Sub RecordCBodyFieldWithTokens( _
             End Select
         Next
         If nestedType <> "" Then sourceType = nestedType
+        If isArray = 0 AndAlso pointerCount = 0 Then
+            For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+                If translation.body.aliases(aliasIndex).name = sourceType AndAlso _
+                   translation.body.aliases(aliasIndex).isArray <> 0 AndAlso _
+                   translation.body.aliases(aliasIndex).ambiguous = 0 Then
+                    isArray = -1
+                    arrayBound = Trim(Str( _
+                        translation.body.aliases(aliasIndex).arrayCount))
+                    Exit For
+                End If
+            Next
+        End If
         If CBodyRecordFieldIndex(translation, catalog, ownerName, tokens(nameIndex)) >= 0 Then Exit Sub
         Dim bitOffset As Long = 0
         If bitWidth >= 0 Then
@@ -472,6 +493,7 @@ Private Sub RecordCBodyFieldWithTokens( _
             .freeBasicName = CBodyFreeBasicFieldNameInContext( _
                 translation, ownerName, .name)
             .sourceType = sourceType
+            .nestedRecordKind = nestedTypeKind
             .pointerCount = pointerCount
             .isConst = isConst
             .isArray = isArray
@@ -507,6 +529,7 @@ Private Function RecordCBodyFieldsFromModel( _
         With declaration.recordFields(fieldIndex)
             Dim nestedOpening As Long = 0
             Dim nestedTag As String
+            Dim nestedRecordKind As C2fbRecordKind = C2FB_RECORD_KIND_NONE
             Dim parenDepth As Long = 0
             Dim bracketDepth As Long = 0
             Dim quoteByte As Long = 0
@@ -536,7 +559,7 @@ Private Function RecordCBodyFieldsFromModel( _
                        parenDepth = 0 AndAlso bracketDepth = 0 Then
                     Dim isRecord As Long
                     nestedTag = CBodyRecordTag( _
-                        Left(.text, position - 1), isRecord)
+                        Left(.text, position - 1), isRecord, nestedRecordKind)
                     If isRecord = 0 Then Return 0
                     nestedOpening = position
                     Exit For
@@ -551,6 +574,7 @@ Private Function RecordCBodyFieldsFromModel( _
                     .text, nestedOpening + 1, nestedEnd - nestedOpening - 2)
                 Dim nestedModel As C2fbDeclarationModel
                 nestedModel.entryKind = C2FB_DECLARATION_RECORD
+                nestedModel.recordKind = nestedRecordKind
                 nestedModel.recordBody = nestedBody
                 BuildC2fbRecordFieldSources(nestedModel)
 
@@ -579,9 +603,13 @@ Private Function RecordCBodyFieldsFromModel( _
                        RecordCBodyFieldsFromModel( _
                            translation, catalog, nestedTag, nestedModel, _
                            depth + 1) = 0 Then Return 0
+                    Dim nestedKeyword As String = "struct "
+                    If nestedRecordKind = C2FB_RECORD_UNION Then _
+                        nestedKeyword = "union "
                     RecordCBodyField( _
                         translation, catalog, ownerName, _
-                        "struct " & fieldName & " " & nestedTail, nestedTag)
+                        nestedKeyword & fieldName & " " & nestedTail, nestedTag, _
+                        nestedModel.recordKind)
                 End If
                 Continue For
             End If
@@ -623,12 +651,18 @@ Private Function RecordCBodyFieldsFromModel( _
                 RecordCBodyFieldWithTokens( _
                     translation, catalog, ownerName, itemDeclaration, _
                     itemTokens(), itemTokenCount, commonType, _
-                    commonTypeTokenCount, partIndex, "")
+                    commonTypeTokenCount, partIndex, "", _
+                    C2FB_RECORD_KIND_NONE)
             Next
         End With
     Next
     Return -1
 End Function
+
+Declare Sub BuildCBodyRecordStaticInitializerBindings( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog _
+)
 
 Private Sub IndexCBodyRecordsFromDeclarations( _
     ByRef translation As C2fbTranslationContext, _
@@ -755,7 +789,10 @@ Private Sub IndexCBodyRecordsFromDeclarations( _
                     If catalog.bodyFields(j).ownerName = nestedType Then hasFbRecord = -1
                 Next
                 If hasSourceRecord <> 0 AndAlso hasFbRecord <> 0 Then
-                    BindCBodyRecord(translation, .sourceType, nestedType)
+                    ' Anonymous nested C aggregates have a generated layout,
+                    ' but the source-unit type include already emits that type.
+                    BindCBodyRecord( _
+                        translation, .sourceType, nestedType, 0, .nestedRecordKind)
                     changed = -1
                 End If
             End With
@@ -793,6 +830,31 @@ Private Function CBodyFieldType( _
                 callbackType &= " Ptr"
             Next
             Return callbackType
+        End If
+        Dim arrayAliasSourceType As String = .sourceType
+        If .pointerCount = 0 Then
+            For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+                With translation.body.aliases(aliasIndex)
+                    If .name <> arrayAliasSourceType OrElse .ambiguous <> 0 OrElse _
+                       .isArray = 0 OrElse .arrayElementType = "" Then Continue For
+                    Dim elementTokens() As String
+                    Dim elementTokenCount As Long
+                    TokenizeCDeclaration( _
+                        .arrayElementType, elementTokens(), elementTokenCount)
+                    If elementTokenCount = 0 Then Return ""
+                    Dim resolvedElementType As C2fbResolvedTypeModel
+                    ResolveC2fbTypeModel( _
+                        translation, catalog, elementTokens(), 0, _
+                        elementTokenCount - 1, resolvedElementType, _
+                        C2FB_POINTER_MAPPING_PRESERVE, C2FB_TYPE_MAPPING_BODY)
+                    If resolvedElementType.status <> _
+                       C2FB_TYPE_RESOLUTION_RESOLVED Then Return ""
+                    Dim elementType As String = resolvedElementType.freeBasicType
+                    If .isConst <> 0 AndAlso Left(elementType, 6) <> "Const " Then _
+                        elementType = "Const " & elementType
+                    Return elementType & " Ptr"
+                End With
+            Next
         End If
         Dim baseType As String = _
             LookupCBodyRecordBindingInContext(translation, .sourceType)
@@ -839,6 +901,90 @@ Private Function CBodyFieldType( _
         Return baseType
     End With
 End Function
+
+Private Sub BuildCBodyRecordStaticInitializerBindings( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog _
+)
+    For recordIndex As Long = 0 To translation.body.recordBindingCount - 1
+        With translation.body.recordBindings(recordIndex)
+            If .fbName = "" Then Continue For
+            Dim itemCount As Long = 0
+            For fieldIndex As Long = 0 To translation.body.recordFieldCount - 1
+                If translation.body.recordFields(fieldIndex).ownerName = _
+                   .sourceName OrElse _
+                   translation.body.recordFields(fieldIndex).ownerName = _
+                   .fbName Then itemCount += 1
+            Next
+            If itemCount <= 0 Then Continue For
+
+            Dim initializerBinding As C2fbRecordBindingModel
+            initializerBinding.freeBasicName = .fbName
+            initializerBinding.isUnion = CInt( _
+                .recordKind = C2FB_RECORD_UNION) * -1
+            If .recordKind = C2FB_RECORD_KIND_NONE Then
+                For declarationIndex As Long = 0 To _
+                    translation.sourceUnit.declarationCount - 1
+                    With translation.sourceUnit.declarations(declarationIndex)
+                        If .entryKind <> C2FB_DECLARATION_RECORD OrElse _
+                           (.recordTag <> translation.body.recordBindings( _
+                                recordIndex).sourceName AndAlso _
+                            .recordAlias <> translation.body.recordBindings( _
+                                recordIndex).sourceName) Then Continue For
+                        initializerBinding.isUnion = CInt( _
+                            .recordKind = C2FB_RECORD_UNION) * -1
+                        Exit For
+                    End With
+                Next
+            End If
+            ReDim initializerBinding.items(0 To itemCount - 1)
+
+            Dim itemIndex As Long = 0
+            For fieldIndex As Long = 0 To translation.body.recordFieldCount - 1
+                With translation.body.recordFields(fieldIndex)
+                    If .ownerName <> translation.body.recordBindings( _
+                        recordIndex).sourceName AndAlso _
+                       .ownerName <> translation.body.recordBindings( _
+                        recordIndex).fbName Then Continue For
+                    Dim fieldType As String = CBodyFieldType( _
+                        translation, catalog, fieldIndex, 0)
+                    If fieldType = "" Then
+                        itemCount = 0
+                        Exit For
+                    End If
+                    With initializerBinding.items(itemIndex)
+                        .kind = C2FB_RECORD_BINDING_ITEM_FIELD
+                        .isUnion = initializerBinding.isUnion
+                        .isBitField = CInt( _
+                            translation.body.recordFields(fieldIndex).bitWidth >= 0) * -1
+                        .name = translation.body.recordFields(fieldIndex).freeBasicName
+                        .sourceName = translation.body.recordFields(fieldIndex).name
+                        .fieldType = fieldType
+                        If translation.body.recordFields(fieldIndex).isArray <> 0 Then
+                            Dim fieldArrayCount As Long
+                            If EvaluateGenericHeaderArrayBound( _
+                                translation, _
+                                translation.body.recordFields(fieldIndex).arrayBound, _
+                                fieldArrayCount, MAX_GENERIC_ARRAY_COUNT) = 0 OrElse _
+                               fieldArrayCount <= 0 Then
+                                itemCount = 0
+                                Exit For
+                            End If
+                            .arrayCount = fieldArrayCount
+                            .arrayBounds = "0 To " & Trim(Str(fieldArrayCount - 1))
+                        End If
+                    End With
+                    itemIndex += 1
+                End With
+            Next
+
+            If itemCount <> itemIndex Then Continue For
+            initializerBinding.itemCount = itemCount
+            translation.body.recordBindings(recordIndex).staticInitializerBinding = _
+                initializerBinding
+        End With
+    Next
+End Sub
 
 Private Function CBodyGenericFlexibleArrayAccessorName( _
     ByRef translation As C2fbTranslationContext, _
@@ -1254,6 +1400,7 @@ Private Sub IndexCBodyGeneratedSourceRecords( _
                             .name = translation.body.recordFields(fieldIndex).name
                         .typeName = storedFieldType
                         .isArray = translation.body.recordFields(fieldIndex).isArray
+                        .isUnionMember = 0
                         .isPrivate = 0
                         .headerName = ""
                     End With
@@ -1297,6 +1444,48 @@ Private Function CBodyFieldBitFieldSignedness( _
          "c2fb_c_uint", "c2fb_c_ulong", "c2fb_uint64"
         Return C2FB_BITFIELD_SIGNEDNESS_UNSIGNED
     End Select
+
+    ' On the GCC target, enum bitfields with only nonnegative enumerators are
+    ' unsigned. Preserve their high bits when the BASIC enum alias is Long.
+    Dim sourceType As String = _
+        Trim(translation.body.recordFields(index).sourceType)
+    Dim enumSourceType As String = ""
+    Dim sourceTypeTokens() As String
+    Dim sourceTypeTokenCount As Long = 0
+    TokenizeCDeclaration(sourceType, sourceTypeTokens(), sourceTypeTokenCount)
+    For tokenIndex As Long = 0 To sourceTypeTokenCount - 1
+        If sourceTypeTokens(tokenIndex) = "enum" Then
+            If tokenIndex + 1 < sourceTypeTokenCount Then _
+                enumSourceType = sourceTypeTokens(tokenIndex + 1)
+            Exit For
+        ElseIf IsIdentifierToken(sourceTypeTokens(tokenIndex)) <> 0 AndAlso _
+               IsQualifierToken(sourceTypeTokens(tokenIndex)) = 0 Then
+            enumSourceType = sourceTypeTokens(tokenIndex)
+        End If
+    Next
+    If enumSourceType <> "" Then
+        Dim enumMemberFound As Long = 0
+        Dim enumValuesKnown As Long = -1
+        Dim enumHasNegativeValue As Long = 0
+        For enumIndex As Long = 0 To _
+            translation.genericC.header.enumMemberCount - 1
+            With translation.genericC.header.enumMembers(enumIndex)
+                If .enumTypeName <> enumSourceType AndAlso _
+                   .enumTagName <> enumSourceType Then Continue For
+                enumMemberFound = -1
+                If .integerValueKnown = 0 Then
+                    enumValuesKnown = 0
+                ElseIf .integerValue < 0 Then
+                    enumHasNegativeValue = -1
+                End If
+            End With
+        Next
+        If enumMemberFound <> 0 AndAlso enumValuesKnown <> 0 Then
+            If enumHasNegativeValue <> 0 Then _
+                Return C2FB_BITFIELD_SIGNEDNESS_SIGNED
+            Return C2FB_BITFIELD_SIGNEDNESS_UNSIGNED
+        End If
+    End If
     Return C2FB_BITFIELD_SIGNEDNESS_UNKNOWN
 End Function
 

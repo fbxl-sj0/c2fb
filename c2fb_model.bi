@@ -279,6 +279,7 @@ Private Type C2fbBodyTranslationOptions
     keepUnresolvedDependencies As Long
     includeExistingBodies As Long
     includeHeaderInlineBodies As Long
+    includeHeaderInlineBodyNames As String
     includeIncludedCSourceBodies As Long
     includeGlobalDefinitions As Long
     assertionsStripped As Long
@@ -375,6 +376,7 @@ Private Type C2fbFunctionScannerOptionsModel
     sourceOriginPrecision As C2fbSourceOriginPrecision
     collectLibraryPragmas As C2fbLibraryPragmaCollectionMode
     collectHeaderInlineBodies As Long
+    includeHeaderInlineBodyNames As String
     collectIncludedCSourceBodies As Long
 End Type
 
@@ -387,6 +389,7 @@ Private Type C2fbFunctionScannerSettingsModel
     collectRecordModels As Long
     retainFunctionBodies As Long
     collectHeaderInlineBodies As Long
+    includeHeaderInlineBodyNames As String
     collectIncludedCSourceBodies As Long
     recognizeCLinkageBlocks As Long
     resetConditionalBranches As Long
@@ -561,6 +564,7 @@ End Type
 Private Type C2fbRecordFieldBindingModel
     name As String
     fieldType As String
+    alignmentStorageType As String
     arrayCount As Long
     arrayBounds As String
 End Type
@@ -584,6 +588,7 @@ Private Type C2fbRecordBindingItemModel
     name As String
     sourceName As String
     fieldType As String
+    alignmentStorageType As String
     arrayCount As Long
     arrayBounds As String
     zeroArrayAccessorName As String
@@ -684,6 +689,7 @@ Private Type CGenericHeaderTypeAlias
     isArray As Long
     isFunction As Long
     isForward As Long
+    functionPointerDepth As Long
 End Type
 
 Private Type CGenericTypeOverride
@@ -854,6 +860,16 @@ Private Type C2fbBodyExternalObjectModel
     isAmbiguous As Long
 End Type
 
+Private Type C2fbPointerToArrayParameterModel
+    procedureName As String
+    parameterIndex As Long
+    parameterName As String
+    arrayElementType As String
+    arrayElementCount As Long
+    isConst As Long
+    isAmbiguous As Long
+End Type
+
 Private Type C2fbBodySymbolModel
     callNameOverride As String
     linkName As String
@@ -894,6 +910,7 @@ Private Type GenericRecordField
     name As String
     sourceName As String
     fieldType As String
+    alignmentStorageType As String
     arrayCount As Long
     arrayBounds As String
     zeroArrayAccessorName As String
@@ -905,6 +922,8 @@ End Type
 Private Type GenericEnumMember
     sourceName As String
     freeBasicName As String
+    enumTypeName As String
+    enumTagName As String
     integerValue As Long
     integerValueKnown As Long
     isEmitted As Long
@@ -939,6 +958,7 @@ Private Type CBodyRecordField
     arrayBound As String
     bitWidth As Long
     bitOffset As Long
+    nestedRecordKind As C2fbRecordKind
     callbackType As String
 End Type
 
@@ -947,6 +967,7 @@ Private Type CBodyRecordBinding
     fbName As String
     recordKind As C2fbRecordKind
     isGenerated As Long
+    staticInitializerBinding As C2fbRecordBindingModel
 End Type
 
 Private Type CBodyCallback
@@ -976,6 +997,7 @@ Private Type FbBodyField
     name As String
     typeName As String
     isArray As Long
+    isUnionMember As Long
     isPrivate As Long
     headerName As String
 End Type
@@ -1002,6 +1024,11 @@ Private Type C2fbBodyTranslationStateModel
     aliasCount As Long
     externalObjects(Any) As C2fbBodyExternalObjectModel
     externalObjectCount As Long
+    pointerToArrayParameters(Any) As C2fbPointerToArrayParameterModel
+    pointerToArrayParameterCount As Long
+    generatedStaticDeclarations As String
+    generatedStaticStorageSerial As Long
+    generatedAggregateInitializerSerial As Long
     recordFields(Any) As CBodyRecordField
     recordFieldCount As Long
     recordFieldIndex As C2fbStringIndexMapModel
@@ -1158,6 +1185,7 @@ Private Type C2fbGenericHeaderTranslationStateModel
     requiredTypeDependencies(Any) As String
     requiredTypeDependencyCount As Long
     recordPlans(Any) As C2fbGenericRecordPlanModel
+    recordPlanCount As Long
     enumMembers(Any) As GenericEnumMember
     enumMemberCount As Long
     headerMacros(Any) As C2fbGenericHeaderMacroModel

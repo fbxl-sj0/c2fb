@@ -42,6 +42,7 @@ Private Sub InitializeC2fbBodyTranslationOptions( _
     options.keepUnresolvedDependencies = 0
     options.includeExistingBodies = 0
     options.includeHeaderInlineBodies = 0
+    options.includeHeaderInlineBodyNames = ""
     options.includeIncludedCSourceBodies = 0
     options.assertionsStripped = 0
     options.assumeSingleThreadedAtomics = 0
@@ -322,9 +323,9 @@ Private Function ReadC2fbCommandModel( _
             modeName, argumentCount, request.genericBodyRequest, errorMessage) = 0 Then
             If request.genericBodyRequest.bodyRequest.inputShape = _
                C2FB_BODY_INPUT_TREE Then
-                usageText = "usage: c2fb translate-simple-generic-tree-c source-directory output-directory [@options.txt ...] [compiler] [preprocessor-options...] [--fb-source-directory=Dir] [--type-map=CName=FbType] [--typedef-hint=CName] [--rename-proc=CName=FbName] [--rename-proc-prefix=Prefix] [--replacement-file=Rules.rpl] [--keep-unresolved] [--include-existing] [--include-header-inline-bodies] [--include-included-c-source-bodies]"
+                usageText = "usage: c2fb translate-simple-generic-tree-c source-directory output-directory [@options.txt ...] [compiler] [preprocessor-options...] [--fb-source-directory=Dir] [--type-map=CName=FbType] [--typedef-hint=CName] [--rename-proc=CName=FbName] [--rename-proc-prefix=Prefix] [--exclude-proc=Pattern ...] [--replacement-file=Rules.rpl] [--keep-unresolved] [--include-existing] [--include-header-inline-bodies] [--include-header-inline-body=Name ...] [--include-included-c-source-bodies]"
             Else
-                usageText = "usage: c2fb translate-simple-generic-c input.c output.bas [@options.txt ...] [compiler] [preprocessor-options...] [--fb-source-directory=Dir] [--type-map=CName=FbType] [--typedef-hint=CName] [--rename-proc=CName=FbName] [--rename-proc-prefix=Prefix] [--replacement-file=Rules.rpl] [--keep-unresolved] [--include-existing] [--include-header-inline-bodies] [--include-included-c-source-bodies] [--assume-single-threaded-atomics]"
+                usageText = "usage: c2fb translate-simple-generic-c input.c output.bas [@options.txt ...] [compiler] [preprocessor-options...] [--fb-source-directory=Dir] [--type-map=CName=FbType] [--typedef-hint=CName] [--rename-proc=CName=FbName] [--rename-proc-prefix=Prefix] [--exclude-proc=Pattern ...] [--replacement-file=Rules.rpl] [--keep-unresolved] [--include-existing] [--include-header-inline-bodies] [--include-header-inline-body=Name ...] [--include-included-c-source-bodies] [--assume-single-threaded-atomics]"
             End If
             Return 0
         End If

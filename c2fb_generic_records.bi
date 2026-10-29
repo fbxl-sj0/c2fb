@@ -242,6 +242,7 @@ Private Function PrepareGenericHeaderRecords( _
     Dim planCapacity As Long = translation.sourceUnit.declarationCount
     If planCapacity <= 0 Then planCapacity = 1
     ReDim translation.genericC.header.recordPlans(0 To planCapacity - 1)
+    translation.genericC.header.recordPlanCount = planCapacity
 
     ' Reserve all tag and typedef names before fields or procedures are emitted.
     ' This mirrors C's separate tag namespace and allows recursive pointer fields.
@@ -745,6 +746,8 @@ Private Sub ValidateGenericHeaderRecordLayouts( _
                     recordBinding.items(itemIndex).sourceName = _
                         fields(itemIndex).sourceName
                     recordBinding.items(itemIndex).fieldType = fields(itemIndex).fieldType
+                    recordBinding.items(itemIndex).alignmentStorageType = _
+                        fields(itemIndex).alignmentStorageType
                     recordBinding.items(itemIndex).arrayCount = fields(itemIndex).arrayCount
                     recordBinding.items(itemIndex).arrayBounds = fields(itemIndex).arrayBounds
                     recordBinding.items(itemIndex).zeroArrayAccessorName = _
@@ -959,6 +962,71 @@ Private Function GenericRecordValueFieldType( _
     Return freeBasicType
 End Function
 
+Private Function ResolveGenericRecordCallbackArrayTypeInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, tokens() As String, _
+    ByVal tokenCount As Long, ByVal sourceName As String, _
+    ByRef callbackResult As C2fbCallbackTypeResultModel, _
+    ByVal typeMappingKind As C2fbTypeMappingKind _
+) As Long
+    If tokenCount <= 0 OrElse sourceName = "" Then Return 0
+    Dim lastToken As Long = tokenCount - 1
+    If tokens(lastToken) = ";" Then lastToken -= 1
+
+    For nameToken As Long = 0 To lastToken - 1
+        If tokens(nameToken) <> sourceName OrElse _
+           tokens(nameToken + 1) <> "[" Then Continue For
+
+        ' Remove every array suffix that belongs to this declarator while
+        ' keeping its function-pointer signature intact for the callback parser.
+        Dim arrayClose As Long = nameToken + 1
+        Do While arrayClose <= lastToken AndAlso tokens(arrayClose) = "["
+            Dim nesting As Long = 1
+            Dim closeToken As Long = arrayClose + 1
+            While closeToken <= lastToken AndAlso nesting > 0
+                If tokens(closeToken) = "[" Then
+                    nesting += 1
+                ElseIf tokens(closeToken) = "]" Then
+                    nesting -= 1
+                End If
+                If nesting > 0 Then closeToken += 1
+            Wend
+            If nesting <> 0 Then Return 0
+            arrayClose = closeToken + 1
+        Loop
+
+        Dim callbackTokens() As String
+        ReDim callbackTokens(0 To lastToken - 1)
+        Dim callbackTokenCount As Long = 0
+        For tokenIndex As Long = 0 To lastToken
+            If tokenIndex = nameToken Then
+                callbackTokens(callbackTokenCount) = tokens(tokenIndex)
+                callbackTokenCount += 1
+                tokenIndex = arrayClose - 1
+                Continue For
+            End If
+            callbackTokens(callbackTokenCount) = tokens(tokenIndex)
+            callbackTokenCount += 1
+        Next
+        ResolveCBodyCallbackTypeInContext( _
+            translation, catalog, callbackTokens(), 0, _
+            callbackTokenCount - 1, callbackResult, 0, typeMappingKind)
+        Return -1
+    Next
+    Return 0
+End Function
+
+Private Function GenericRecordLongDoubleAlignmentStorageType( _
+    ByRef translation As C2fbTranslationContext _
+) As String
+    Select Case GenericHeaderCLongDoubleAlignmentBytes(translation)
+    Case 16: Return "Integer<128>"
+    Case 8: Return "LongInt"
+    Case 4: Return "Long"
+    End Select
+    Return ""
+End Function
+
 Private Function TranslateGenericRecordFieldWithTokens( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -972,11 +1040,19 @@ Private Function TranslateGenericRecordFieldWithTokens( _
     If GenericFieldHasUnsupportedAttribute(sourceDeclarator) <> 0 Then Return 0
     If tokenCount < 2 OrElse tokenCount >= MAX_TYPE_WORDS Then Return 0
     Dim bitfieldColonIndex As Long = -1
+    Dim parenthesisDepth As Long = 0
+    Dim bracketDepth As Long = 0
     For tokenIndex As Long = 0 To tokenCount - 1
-        If tokens(tokenIndex) = ":" Then
+        Select Case tokens(tokenIndex)
+        Case "(": parenthesisDepth += 1
+        Case ")": If parenthesisDepth > 0 Then parenthesisDepth -= 1
+        Case "[": bracketDepth += 1
+        Case "]": If bracketDepth > 0 Then bracketDepth -= 1
+        Case ":"
+            If parenthesisDepth <> 0 OrElse bracketDepth <> 0 Then Continue For
             If bitfieldColonIndex >= 0 Then Return 0
             bitfieldColonIndex = tokenIndex
-        End If
+        End Select
     Next
     Dim declaratorTokenCount As Long = tokenCount
     Dim bitfieldWidth As Long = 0
@@ -1020,24 +1096,83 @@ Private Function TranslateGenericRecordFieldWithTokens( _
         commonTypeTokenCount = typeStart
     End If
     If commonType = "" Then Return 0
+    ' FreeBASIC has no C complex scalar ABI type. A plain complex value or a
+    ' callback signature containing one cannot be laid out or called safely;
+    ' opaque data pointers remain representable as pointer-sized fields.
+    Dim hasComplexTypeSpecifier As Long = 0
+    For tokenIndex As Long = 0 To tokenCount - 1
+        Select Case LCase(tokens(tokenIndex))
+        Case "_complex", "_imaginary", "__complex", "__complex__", _
+             "__imaginary", "__imaginary__"
+            hasComplexTypeSpecifier = -1
+            Exit For
+        End Select
+    Next
+    If hasComplexTypeSpecifier <> 0 AndAlso _
+       (InStr(bindingOrder, "P") = 0 OrElse InStr(bindingOrder, "F") <> 0) Then _
+        Return 0
 
     Dim arrayTypeAliasIndex As Long = -1
     Dim callbackResult As C2fbCallbackTypeResultModel
     ResolveCBodyCallbackTypeInContext( _
         translation, catalog, tokens(), 0, declaratorTokenCount - 1, _
         callbackResult, 0, C2FB_TYPE_MAPPING_GENERIC_HEADER)
+    If callbackResult.status <> C2FB_CALLBACK_TYPE_CONVERTED AndAlso _
+       Len(bindingOrder) > 0 AndAlso InStr(bindingOrder, "A") <> 0 Then _
+        ResolveGenericRecordCallbackArrayTypeInContext( _
+            translation, catalog, tokens(), declaratorTokenCount, _
+            fieldName, callbackResult, C2FB_TYPE_MAPPING_GENERIC_HEADER)
     If callbackResult.status = C2FB_CALLBACK_TYPE_UNSUPPORTED Then Return 0
     If callbackResult.status = C2FB_CALLBACK_TYPE_CONVERTED AndAlso _
        callbackResult.callbackName = fieldName Then
+        If callbackResult.pointerDepth > 1 Then Return 0
         recordField.fieldType = CBodyCallbackDeclarationInContext( _
             translation, callbackResult.freeBasicType)
         If recordField.fieldType = "" Then Return 0
+        Dim callbackArrayDimensions As Long = 0
+        For bindingIndex As Long = 1 To Len(bindingOrder)
+            If Mid(bindingOrder, bindingIndex, 1) = "A" Then _
+                callbackArrayDimensions += 1
+        Next
+        If callbackArrayDimensions > 0 Then
+            If callbackArrayDimensions > MAX_GENERIC_ARRAY_RANK Then Return 0
+            Dim identifierPosition As Long = _
+                GenericLastIdentifierPosition(declaration, fieldName)
+            Dim firstArrayDimensionCount As Long
+            Dim unsizedArray As Long
+            If identifierPosition = 0 OrElse _
+               ParseGenericArrayBoundsInDeclaration( _
+                translation, declaration, identifierPosition + Len(fieldName), _
+                callbackArrayDimensions, recordField.arrayBounds, _
+                firstArrayDimensionCount, recordField.arrayCount, _
+                unsizedArray, -1, -1) = 0 Then Return 0
+            If unsizedArray <> 0 OrElse recordField.arrayCount = 0 Then
+                recordField.arrayBounds = ""
+                recordField.arrayCount = 0
+                recordField.isZeroLengthArray = -1
+                If callbackArrayDimensions <> 1 Then Return 0
+            End If
+        End If
+        For pointerIndex As Long = 2 To callbackResult.pointerDepth
+            recordField.fieldType &= " Ptr"
+        Next
     Else
         If Len(bindingOrder) > 0 AndAlso Left(bindingOrder, 1) = "F" Then Return 0
         Dim baseTokens() As String
         Dim baseTokenCount As Long
+        Dim commonTypeIsFunctionType As Long = 0
         TokenizeCDeclaration(commonType, baseTokens(), baseTokenCount)
         If baseTokenCount = 0 Then Return 0
+        For tokenIndex As Long = 0 To baseTokenCount - 1
+            Dim callbackAliasIndex As Long = _
+                GenericHeaderTypeAliasIndexInHeader( _
+                    translation.genericC.header, baseTokens(tokenIndex), 0)
+            If callbackAliasIndex >= 0 AndAlso _
+               translation.genericC.header.headerTypeAliases(callbackAliasIndex).isFunction <> 0 Then
+                commonTypeIsFunctionType = -1
+                Exit For
+            End If
+        Next
 
         For tokenIndex As Long = 0 To baseTokenCount - 1
             Dim candidateAlias As Long = _
@@ -1126,26 +1261,46 @@ Private Function TranslateGenericRecordFieldWithTokens( _
             End If
         ElseIf Len(bindingOrder) > 0 AndAlso Left(bindingOrder, 1) = "A" Then
             Dim arrayDimensions As Long = 0
-            Dim hasPointerElement As Long = 0
+            Dim pointerElementLevels As Long = 0
             Dim hasFunctionElement As Long = 0
             For bindingIndex As Long = 1 To Len(bindingOrder)
                 Select Case Mid(bindingOrder, bindingIndex, 1)
                 Case "A": arrayDimensions += 1
-                Case "P": hasPointerElement = -1
+                Case "P": pointerElementLevels += 1
                 Case "F": hasFunctionElement = -1
                 End Select
             Next
+            If commonTypeIsFunctionType <> 0 Then hasFunctionElement = -1
             If arrayDimensions > MAX_GENERIC_ARRAY_RANK Then Return 0
             Dim identifierPosition As Long = _
                 GenericLastIdentifierPosition(declaration, fieldName)
             Dim firstArrayDimensionCount As Long
             Dim unsizedArray As Long
-            If identifierPosition = 0 OrElse _
-               ParseGenericArrayBoundsInDeclaration( _
+            If identifierPosition = 0 Then Return 0
+            Dim arrayBoundsParsed As Long = ParseGenericArrayBoundsInDeclaration( _
                 translation, declaration, identifierPosition + Len(fieldName), _
                 arrayDimensions, recordField.arrayBounds, _
                 firstArrayDimensionCount, recordField.arrayCount, _
-                unsizedArray, -1, -1) = 0 Then Return 0
+                unsizedArray, -1, -1)
+            If arrayBoundsParsed = 0 OrElse _
+               (recordField.arrayCount = 0 AndAlso unsizedArray = 0) Then
+                ' A caller may supply the exact compiled extent when a fixed
+                ' C bound contains sizeof of a record outside this evaluator.
+                Dim fixedArraySizeHint As Long = _
+                    UseGenericArraySizeOverrideInPolicy( _
+                        translation.genericC.policy, fieldName, _
+                        ownerTag, ownerAlias)
+                If fixedArraySizeHint > 0 Then
+                    If fixedArraySizeHint > MAX_GENERIC_ARRAY_COUNT Then Return 0
+                    recordField.arrayCount = fixedArraySizeHint
+                    recordField.arrayBounds = "0 To " & _
+                        Trim(Str(fixedArraySizeHint - 1))
+                    recordField.isArraySizeHinted = -1
+                    unsizedArray = 0
+                ElseIf arrayBoundsParsed = 0 Then
+                    Return 0
+                End If
+            End If
             If unsizedArray <> 0 Then
                 Dim arraySizeHint As Long = _
                     UseGenericArraySizeOverrideInPolicy( _
@@ -1166,10 +1321,69 @@ Private Function TranslateGenericRecordFieldWithTokens( _
                 If arrayDimensions <> 1 Then Return 0
             End If
 
-            If hasPointerElement <> 0 Then
-                recordField.fieldType = "Any Ptr"
+            If commonTypeIsFunctionType <> 0 Then
+                ' Preserve the alias's own C pointer depth, then resolve any
+                ' additional pointer operators on this array element.
+                Dim callbackAliasIndex As Long = -1
+                For tokenIndex As Long = 0 To baseTokenCount - 1
+                    Dim candidateAlias As Long = _
+                        GenericHeaderTypeAliasIndexInHeader( _
+                            translation.genericC.header, baseTokens(tokenIndex), 0)
+                    If candidateAlias >= 0 AndAlso _
+                       translation.genericC.header.headerTypeAliases(candidateAlias).isFunction <> 0 Then
+                        callbackAliasIndex = candidateAlias
+                        Exit For
+                    End If
+                Next
+                If callbackAliasIndex < 0 Then Return 0
+                Dim pointerLevels As Long = 0
+                For bindingIndex As Long = 1 To Len(bindingOrder)
+                    If Mid(bindingOrder, bindingIndex, 1) = "P" Then _
+                        pointerLevels += 1
+                Next
+                If pointerLevels = 0 AndAlso _
+                   translation.genericC.header.headerTypeAliases(callbackAliasIndex).functionPointerDepth = 0 Then _
+                    Return 0
+                If baseTokenCount + pointerLevels >= MAX_TYPE_WORDS Then Return 0
+                Dim pointerTokens() As String
+                ReDim pointerTokens(0 To MAX_TYPE_WORDS - 1)
+                Dim pointerTokenCount As Long = 0
+                For tokenIndex As Long = 0 To baseTokenCount - 1
+                    AddToken(pointerTokens(), pointerTokenCount, baseTokens(tokenIndex))
+                Next
+                For pointerIndex As Long = 1 To pointerLevels
+                    AddToken(pointerTokens(), pointerTokenCount, "*")
+                Next
+                Dim resolvedCallbackArrayElement As C2fbResolvedTypeModel
+                ResolveC2fbTypeModel(translation, catalog, _
+                    pointerTokens(), 0, pointerTokenCount - 1, _
+                    resolvedCallbackArrayElement, _
+                    C2FB_POINTER_MAPPING_OPAQUE, _
+                    C2FB_TYPE_MAPPING_GENERIC_HEADER)
+                If resolvedCallbackArrayElement.status <> _
+                   C2FB_TYPE_RESOLUTION_RESOLVED Then Return 0
+                recordField.fieldType = resolvedCallbackArrayElement.freeBasicType
             ElseIf hasFunctionElement <> 0 Then
                 Return 0
+            ElseIf pointerElementLevels > 0 Then
+                If baseTokenCount + pointerElementLevels >= MAX_TYPE_WORDS Then Return 0
+                Dim pointerTokens() As String
+                ReDim pointerTokens(0 To MAX_TYPE_WORDS - 1)
+                Dim pointerTokenCount As Long = 0
+                For tokenIndex As Long = 0 To baseTokenCount - 1
+                    AddToken(pointerTokens(), pointerTokenCount, baseTokens(tokenIndex))
+                Next
+                For pointerIndex As Long = 1 To pointerElementLevels
+                    AddToken(pointerTokens(), pointerTokenCount, "*")
+                Next
+                Dim resolvedArrayPointerType As C2fbResolvedTypeModel
+                ResolveC2fbTypeModel(translation, catalog, _
+                    pointerTokens(), 0, pointerTokenCount - 1, _
+                    resolvedArrayPointerType, C2FB_POINTER_MAPPING_OPAQUE, _
+                    C2FB_TYPE_MAPPING_GENERIC_HEADER)
+                If resolvedArrayPointerType.status <> _
+                   C2FB_TYPE_RESOLUTION_RESOLVED Then Return 0
+                recordField.fieldType = resolvedArrayPointerType.freeBasicType
             Else
                 Dim resolvedArrayFieldType As C2fbResolvedTypeModel
                 ResolveC2fbTypeModel(translation, catalog, _
@@ -1256,13 +1470,19 @@ Private Function TranslateGenericRecordFieldWithTokens( _
     If recordField.fieldType = "" OrElse recordField.fieldType = "void" Then Return 0
     If GenericHeaderTypeIsOpaqueEmptyRecordInHeader( _
         translation.genericC.header, recordField.fieldType) <> 0 Then Return 0
-    ' crt/longdouble.bi preserves C long double's byte size with byte-backed
-    ' storage, but that FreeBASIC type does not carry the target C field
-    ' alignment. Keep by-value fields opaque until that alignment is modeled.
-    If InStr(recordField.fieldType, "CLongDouble") <> 0 AndAlso _
-       InStr(recordField.fieldType, " Ptr") = 0 Then Return 0
-    If GenericHeaderTypeAliasStorageTypeInHeader( _
-        translation.genericC.header, recordField.fieldType, 0) = "CLongDouble" Then Return 0
+    ' crt/longdouble.bi preserves C long double's bytes with byte-backed
+    ' storage. A hidden union member supplies the C field alignment while
+    ' leaving the translated field directly accessible.
+    Dim longDoubleAliasStorage As String = GenericHeaderTypeAliasStorageTypeInHeader( _
+        translation.genericC.header, recordField.fieldType, 0)
+    If InStr(recordField.fieldType, "CLongDouble") <> 0 OrElse _
+       longDoubleAliasStorage = "CLongDouble" Then
+        If InStr(recordField.fieldType, " Ptr") = 0 Then
+            recordField.alignmentStorageType = _
+                GenericRecordLongDoubleAlignmentStorageType(translation)
+            If recordField.alignmentStorageType = "" Then Return 0
+        End If
+    End If
     If bitfieldColonIndex >= 0 Then
         If bindingOrder <> "" OrElse recordField.arrayCount <> 0 Then Return 0
         Dim storageWidth As Long = GenericRecordBitFieldStorageWidthInBits( _
@@ -1748,8 +1968,6 @@ Private Function GenericRecordBitFieldRunFillsStorage( _
     ByVal runWidth As Long, ByVal storageWidth As Long _
 ) As Long
     If runWidth <= 0 OrElse storageWidth <= 0 Then Return 0
-    ' C may use unused bytes in a bitfield unit for the next field, while
-    ' FreeBASIC advances by the full unit. Require matching extents.
     Dim usedBytes As Long = (runWidth + 7) \ 8
     Dim storageBytes As Long = (storageWidth + 7) \ 8
     Return CInt(usedBytes >= storageBytes) * -1
@@ -1763,7 +1981,79 @@ Private Function GenericRecordBitFieldNeedsFullStorage( _
     Return CInt(packingCap < storageBytes) * -1
 End Function
 
+Private Function GenericRecordFieldAlignmentBytes( _
+    ByRef translation As C2fbTranslationContext, ByVal fieldType As String _
+) As Long
+    fieldType = Trim(fieldType)
+    If Left(LCase(fieldType), Len("const ")) = "const " Then _
+        fieldType = Trim(Mid(fieldType, Len("const ") + 1))
+
+    Dim pointerCount As Long = 0
+    While Right(LCase(fieldType), Len(" ptr")) = " ptr"
+        fieldType = Trim(Left(fieldType, Len(fieldType) - Len(" ptr")))
+        pointerCount += 1
+    Wend
+    If pointerCount > 0 Then
+        Dim pointerWidth As Long = GenericPreprocessorTypeWidthInBits( _
+            translation, "__SIZEOF_POINTER__", 4)
+        If pointerWidth <= 0 OrElse pointerWidth Mod 8 <> 0 Then Return 0
+        Return pointerWidth \ 8
+    End If
+
+    Dim aliasStorageType As String = GenericHeaderTypeAliasStorageTypeInHeader( _
+        translation.genericC.header, fieldType, 0)
+    If aliasStorageType <> "" Then fieldType = aliasStorageType
+
+    Select Case LCase(fieldType)
+    Case "byte", "ubyte", "boolean", "c2fb_c_char", "c2fb_c_uchar"
+        Return 1
+    Case "short", "ushort", "c2fb_c_short", "c2fb_c_ushort"
+        Return 2
+    Case "long", "ulong", "single", "c2fb_c_int", "c2fb_c_uint"
+        Return 4
+    Case "integer", "uinteger"
+        Dim pointerWidth As Long = GenericPreprocessorTypeWidthInBits( _
+            translation, "__SIZEOF_POINTER__", 4)
+        If pointerWidth <= 0 OrElse pointerWidth Mod 8 <> 0 Then Return 0
+        Return pointerWidth \ 8
+    Case "clong", "culong", "c2fb_c_long", "c2fb_c_ulong"
+        Dim longWidth As Long = GenericPreprocessorTypeWidthInBits( _
+            translation, "__SIZEOF_LONG__", 4)
+        If longWidth <= 0 OrElse longWidth Mod 8 <> 0 Then Return 0
+        Return longWidth \ 8
+    Case "longint", "ulongint", "double", "c2fb_int64", "c2fb_uint64"
+        Dim pointerWidth As Long = GenericPreprocessorTypeWidthInBits( _
+            translation, "__SIZEOF_POINTER__", 4)
+        If pointerWidth <= 32 OrElse pointerWidth Mod 8 <> 0 Then Return 0
+        Return 8
+    Case "clongdouble"
+        Return GenericHeaderCLongDoubleAlignmentBytes(translation)
+    End Select
+    Return 0
+End Function
+
+Private Function GenericRecordBitFieldRunCanPrecedeField( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal runWidth As Long, ByVal storageWidth As Long, _
+    ByVal packingCap As Long, ByVal nextFieldType As String _
+) As Long
+    If GenericRecordBitFieldRunFillsStorage( _
+        runWidth, storageWidth) <> 0 Then Return -1
+    If GenericRecordBitFieldNeedsFullStorage( _
+        packingCap, storageWidth) <> 0 Then Return 0
+
+    Dim storageBytes As Long = (storageWidth + 7) \ 8
+    Dim nextFieldAlignment As Long = _
+        GenericRecordFieldAlignmentBytes(translation, nextFieldType)
+    If storageBytes <= 0 OrElse nextFieldAlignment < storageBytes Then Return 0
+
+    ' A sufficiently aligned following field cannot reuse the unused tail of
+    ' this allocation unit, so both C and FreeBASIC start it after the unit.
+    Return -1
+End Function
+
 Private Function ValidateGenericRecordFieldItems( _
+    ByRef translation As C2fbTranslationContext, _
     fields() As GenericRecordField, ByVal fieldCount As Long, _
     ByVal rootIsUnion As Long, ByVal rootPackingCap As Long _
 ) As Long
@@ -1823,9 +2113,11 @@ Private Function ValidateGenericRecordFieldItems( _
                 End If
             ElseIf aggregateKinds(nestingDepth) = 0 AndAlso _
                    bitfieldRunActive(nestingDepth) <> 0 Then
-                If GenericRecordBitFieldRunFillsStorage( _
-                    bitfieldRunWidths(nestingDepth), _
-                    bitfieldStorageWidths(nestingDepth)) = 0 Then Return 0
+                If GenericRecordBitFieldRunCanPrecedeField( _
+                    translation, bitfieldRunWidths(nestingDepth), _
+                    bitfieldStorageWidths(nestingDepth), _
+                    aggregatePackingCaps(nestingDepth), fields(itemIndex).fieldType) = 0 Then _
+                    Return 0
                 bitfieldRunActive(nestingDepth) = 0
                 bitfieldRunWidths(nestingDepth) = 0
                 bitfieldStorageWidths(nestingDepth) = 0
@@ -1969,7 +2261,7 @@ Private Function AppendGenericNamedAggregateField( _
         nestingDepth, recordPlan, outputNames(), outputNameCount, _
         nestedFields(), nestedFieldCount, nestedFieldNameIndex) = 0 OrElse _
        ValidateGenericRecordFieldItems( _
-        nestedFields(), nestedFieldCount, isUnion, 0) = 0 Then Return 0
+        translation, nestedFields(), nestedFieldCount, isUnion, 0) = 0 Then Return 0
 
     Dim nestedBinding As C2fbRecordBindingModel
     nestedBinding.freeBasicName = helperName
@@ -2216,7 +2508,7 @@ Private Function ParseGenericRecordFields( _
     If declaration.isPacked <> 0 Then rootPackingCap = 1
     If RemoveEmptyGenericRecordAggregates(fields(), fieldCount) = 0 Then Return 0
     If ValidateGenericRecordFieldItems( _
-        fields(), fieldCount, _
+        translation, fields(), fieldCount, _
         CInt(declaration.recordKind = C2FB_RECORD_UNION) * -1, _
         rootPackingCap) = 0 Then Return 0
     Return -1

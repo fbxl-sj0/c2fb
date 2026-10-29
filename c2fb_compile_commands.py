@@ -285,7 +285,8 @@ def parse_command_entry(entry, index, database_directory) -> Optional[CompileCom
     )
 
 
-def command_signature(entry: CompileCommandModel, c2fb_options):
+def command_signature(entry: CompileCommandModel, c2fb_options,
+                     body_compiler_options=()):
     signature_parts = [
         str(entry.directory),
         str(entry.source_path),
@@ -294,6 +295,10 @@ def command_signature(entry: CompileCommandModel, c2fb_options):
         "--c2fb-options--",
         *c2fb_options,
     ]
+    if body_compiler_options:
+        signature_parts.extend((
+            "--body-compiler-options--", *body_compiler_options
+        ))
     return json.dumps(signature_parts, ensure_ascii=True, separators=(",", ":"))
 
 
@@ -307,6 +312,8 @@ def split_source_unit_options(options):
     body_options = []
     fb_source_directory = None
     fb_source_recursive = False
+    fb_source_include_closure = False
+    fb_source_patterns = []
     index = 0
     while index < len(options):
         option = options[index]
@@ -331,10 +338,39 @@ def split_source_unit_options(options):
             if value not in {"0", "1", "false", "true"}:
                 raise ValueError("--fb-source-recursive must be 0 or 1")
             fb_source_recursive = value in {"1", "true"}
+        elif option == "--fb-source-include-closure":
+            fb_source_include_closure = True
+        elif option.startswith("--fb-source-include-closure="):
+            value = option.split("=", 1)[1].casefold()
+            if value not in {"0", "1", "false", "true"}:
+                raise ValueError("--fb-source-include-closure must be 0 or 1")
+            fb_source_include_closure = value in {"1", "true"}
+        elif option == "--fb-source-pattern":
+            index += 1
+            if index >= len(options):
+                raise ValueError("--fb-source-pattern requires a glob")
+            fb_source_patterns.append(
+                require_text(options[index], "FreeBASIC source pattern")
+            )
+        elif option.startswith("--fb-source-pattern="):
+            fb_source_patterns.append(
+                require_text(
+                    option.split("=", 1)[1], "FreeBASIC source pattern"
+                )
+            )
         else:
             body_options.append(option)
         index += 1
-    return body_options, fb_source_directory, fb_source_recursive
+    if fb_source_patterns and fb_source_directory is None:
+        raise ValueError("--fb-source-pattern requires --fb-source-directory")
+    if fb_source_include_closure and fb_source_directory is None:
+        raise ValueError(
+            "--fb-source-include-closure requires --fb-source-directory"
+        )
+    return (
+        body_options, fb_source_directory, fb_source_recursive,
+        fb_source_include_closure, fb_source_patterns,
+    )
 
 
 def resolve_converter(converter_text, base_directory):
@@ -409,6 +445,7 @@ def run_compile_database(
     source_unit_context=False,
     header_options=(),
     jobs=1,
+    body_compiler_options=(),
 ):
     if not isinstance(jobs, int) or jobs < 1 or jobs > MAX_COMPILE_COMMAND_JOBS:
         print(
@@ -437,7 +474,9 @@ def run_compile_database(
 
     if source_unit_context:
         try:
-            body_options, fb_source_directory, fb_source_recursive = \
+            (body_options, fb_source_directory, fb_source_recursive,
+             fb_source_include_closure,
+             fb_source_patterns) = \
                 split_source_unit_options(c2fb_options)
         except ValueError as error:
             print(f"c2fb compile commands: {error}", file=sys.stderr)
@@ -450,9 +489,24 @@ def run_compile_database(
                 file=sys.stderr,
             )
             return 2
+        if any(
+            option == "--fb-source-pattern" or
+            option.startswith("--fb-source-pattern=") or
+            option == "--fb-source-include-closure" or
+            option.startswith("--fb-source-include-closure=")
+            for option in c2fb_options
+        ):
+            print(
+                "c2fb compile commands: FreeBASIC source-index options require "
+                "--source-unit-context",
+                file=sys.stderr,
+            )
+            return 2
         body_options = c2fb_options
         fb_source_directory = None
         fb_source_recursive = False
+        fb_source_include_closure = False
+        fb_source_patterns = []
 
     prepared_entries = []
     seen_signatures = set()
@@ -466,7 +520,8 @@ def run_compile_database(
             signature_options = list(c2fb_options)
             if source_unit_context:
                 signature_options.extend(("--source-unit-context", *header_options))
-            signature = command_signature(parsed, signature_options)
+            signature = command_signature(
+                parsed, signature_options, body_compiler_options)
             if signature in seen_signatures:
                 continue
             seen_signatures.add(signature)
@@ -538,6 +593,10 @@ def run_compile_database(
                         ))
                     if fb_source_recursive:
                         command.append("--fb-source-recursive")
+                    if fb_source_include_closure:
+                        command.append("--fb-source-include-closure")
+                    for pattern in fb_source_patterns:
+                        command.extend(("--fb-source-pattern", pattern))
                     command.extend(
                         "--header-option=" + option
                         for option in header_options
@@ -553,6 +612,10 @@ def run_compile_database(
                         command.append(
                             "--body-compiler-option=" + compiler_option
                         )
+                    command.extend(
+                        "--body-compiler-option=" + compiler_option
+                        for compiler_option in body_compiler_options
+                    )
                 else:
                     command = [
                         converter,
@@ -562,6 +625,7 @@ def run_compile_database(
                         *body_options,
                         entry.command.compiler,
                         *entry.command.compiler_arguments,
+                        *body_compiler_options,
                     ]
                 with tempfile.TemporaryFile(
                     mode="w+t", encoding="utf-8", errors="replace"
@@ -704,6 +768,7 @@ def run_compile_database(
                         "SourceUnitContext",
                         "TypeContextFile",
                         "HeaderOptions",
+                        "BodyCompilerOptions",
                     )
                 )
                 for entry in prepared_entries:
@@ -721,6 +786,7 @@ def run_compile_database(
                             "1" if source_unit_context else "0",
                             type_context_name,
                             json.dumps(list(header_options), ensure_ascii=False),
+                            json.dumps(list(body_compiler_options), ensure_ascii=False),
                         )
                     )
             staged_outputs.append(
@@ -755,7 +821,10 @@ def main():
         "--c2fb-option",
         action="append",
         default=[],
-        help="C2FB body option, repeat for each option argument",
+        help=(
+            "C2FB body option, or FreeBASIC source-index option such as "
+            "--fb-source-directory/--fb-source-pattern in source-unit mode"
+        ),
     )
     parser.add_argument(
         "--source-unit-context",
@@ -777,6 +846,12 @@ def main():
         default=[],
         help="generic-header option for --source-unit-context; repeat as needed",
     )
+    parser.add_argument(
+        "--body-compiler-option",
+        action="append",
+        default=[],
+        help="additional compiler option for C2FB body preprocessing; repeat as needed",
+    )
     arguments = parser.parse_args()
     if arguments.jobs < 1 or arguments.jobs > MAX_COMPILE_COMMAND_JOBS:
         parser.error(
@@ -796,6 +871,10 @@ def main():
             require_text(option, "C2FB header option")
             for option in arguments.header_option
         ]
+        body_compiler_options = [
+            require_text(option, "body compiler option")
+            for option in arguments.body_compiler_option
+        ]
     except ValueError as error:
         parser.error(str(error))
     return run_compile_database(
@@ -806,6 +885,7 @@ def main():
         arguments.source_unit_context,
         header_options,
         arguments.jobs,
+        body_compiler_options,
     )
 
 

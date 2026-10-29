@@ -239,9 +239,43 @@ Private Function CombineGenericArrayBounds( _
     Return firstBounds & ", " & secondBounds
 End Function
 
+Private Function TranslateGenericModuleStaticArrayDecayInitializer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceName As String, ByVal offsetExpression As String, _
+    ByVal targetPointerType As String, ByRef initialValue As String _
+) As Long
+    initialValue = ""
+    If sourceName = "" OrElse targetPointerType = "" Then Return 0
+    Dim symbolIndex As Long = _
+        GenericHeaderSymbolIndexInContext(translation, sourceName)
+    If symbolIndex < 0 Then Return 0
+    With translation.symbolTable.symbols(symbolIndex)
+        If .kind <> GENERIC_SYMBOL_OBJECT OrElse _
+           .genericHeader.arrayCount <= 0 OrElse _
+           .genericHeader.unsizedArray <> 0 OrElse _
+           .freeBasicName = "" OrElse .genericHeader.freeBasicType = "" Then _
+            Return 0
+        Dim arrayPointerType As String = .genericHeader.freeBasicType
+        If Right(arrayPointerType, 4) <> " Ptr" Then _
+            arrayPointerType &= " Ptr"
+        Dim arrayAddress As String = _
+            "CPtr(" & arrayPointerType & ", @" & .freeBasicName & "(0))"
+        If offsetExpression <> "" Then
+            Dim offsetOperator As String = Left(LTrim(offsetExpression), 1)
+            If offsetOperator <> "+" AndAlso offsetOperator <> "-" Then _
+                offsetExpression = "+ " & offsetExpression
+            arrayAddress &= " " & offsetExpression
+        End If
+        initialValue = "CPtr(" & targetPointerType & ", " & _
+            arrayAddress & ")"
+    End With
+    Return -1
+End Function
+
 Private Function TranslateGenericModuleStaticAddressInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByVal sourceText As String, ByVal isCallbackObject As Long, _
+    ByVal targetPointerType As String, _
     ByRef initialValue As String _
 ) As Long
     initialValue = ""
@@ -257,6 +291,98 @@ Private Function TranslateGenericModuleStaticAddressInitializer( _
        IsIdentifierToken(tokens(1)) <> 0 Then
         sourceName = tokens(1)
         isAddressOfObject = -1
+    ElseIf tokenCount >= 5 AndAlso tokens(0) = "&" AndAlso _
+           IsIdentifierToken(tokens(1)) <> 0 AndAlso tokens(2) = "[" Then
+        sourceName = tokens(1)
+        Dim externalObjectIndex As Long = -1
+        For objectIndex As Long = 0 To _
+            translation.body.externalObjectCount - 1
+            With translation.body.externalObjects(objectIndex)
+                If .sourceName = sourceName AndAlso .isAmbiguous = 0 Then
+                    externalObjectIndex = objectIndex
+                    Exit For
+                End If
+            End With
+        Next
+        If externalObjectIndex < 0 Then Return 0
+
+        With translation.body.externalObjects(externalObjectIndex)
+            If .isArray = 0 OrElse .isUnsizedArray <> 0 OrElse _
+               .arrayRank <= 0 OrElse .arrayRank > MAX_GENERIC_ARRAY_RANK Then _
+                Return 0
+
+            Dim dimensionExpressions() As String
+            Dim dimensionExpressionCount As Long
+            If SplitSimpleCList( _
+                .arrayDimensions, dimensionExpressions(), _
+                dimensionExpressionCount) = 0 OrElse _
+               dimensionExpressionCount <> .arrayRank Then Return 0
+
+            Dim subscripts As String
+            Dim tokenPosition As Long = 2
+            For dimensionIndex As Long = 0 To .arrayRank - 1
+                If tokenPosition >= tokenCount OrElse _
+                   tokens(tokenPosition) <> "[" Then Return 0
+                Dim bracketDepth As Long = 1
+                Dim closingBracket As Long = tokenPosition + 1
+                While closingBracket < tokenCount AndAlso bracketDepth > 0
+                    If tokens(closingBracket) = "[" Then
+                        bracketDepth += 1
+                    ElseIf tokens(closingBracket) = "]" Then
+                        bracketDepth -= 1
+                    End If
+                    closingBracket += 1
+                Wend
+                If bracketDepth <> 0 Then Return 0
+                closingBracket -= 1
+                If closingBracket <= tokenPosition + 1 Then Return 0
+
+                Dim dimensionSize As Long
+                If EvaluateGenericHeaderArrayBound( _
+                    translation, dimensionExpressions(dimensionIndex), _
+                    dimensionSize, MAX_GENERIC_ARRAY_COUNT) = 0 OrElse _
+                   dimensionSize <= 0 Then Return 0
+                Dim subscriptValue As Long
+                Dim subscriptExpression As String = GenericTokensToText( _
+                    tokens(), tokenPosition + 1, closingBracket - 1)
+                If EvaluateGenericHeaderArrayBound( _
+                    translation, subscriptExpression, subscriptValue, _
+                    MAX_GENERIC_ARRAY_COUNT, -1) = 0 OrElse _
+                   subscriptValue < 0 OrElse subscriptValue >= dimensionSize Then _
+                    Return 0
+
+                If dimensionIndex > 0 Then subscripts &= ", "
+                subscripts &= Trim(Str(subscriptValue))
+                tokenPosition = closingBracket + 1
+            Next
+            If tokenPosition <> tokenCount Then Return 0
+
+            ' Addressing an element keeps the C pointer tied to the same
+            ' storage used by exported records initialized from that array.
+            initialValue = "@" & .freeBasicName & "(" & subscripts & ")"
+            Return -1
+        End With
+    ElseIf tokenCount >= 3 AndAlso _
+           IsIdentifierToken(tokens(0)) <> 0 AndAlso _
+           (tokens(1) = "+" OrElse tokens(1) = "-") Then
+        Dim offsetExpression As String = GenericTokensToText( _
+            tokens(), 1, tokenCount - 1)
+        If offsetExpression = "" Then Return 0
+        Return TranslateGenericModuleStaticArrayDecayInitializer( _
+            translation, tokens(0), offsetExpression, targetPointerType, initialValue)
+    ElseIf tokenCount >= 3 AndAlso _
+           IsIdentifierToken(tokens(tokenCount - 1)) <> 0 AndAlso _
+           tokens(tokenCount - 2) = "+" Then
+        Dim offsetExpression As String = GenericTokensToText( _
+            tokens(), 0, tokenCount - 3)
+        If offsetExpression = "" Then Return 0
+        Return TranslateGenericModuleStaticArrayDecayInitializer( _
+            translation, tokens(tokenCount - 1), offsetExpression, _
+            targetPointerType, initialValue)
+    ElseIf tokenCount = 1 AndAlso isCallbackObject = 0 AndAlso _
+           IsIdentifierToken(tokens(0)) <> 0 Then
+        Return TranslateGenericModuleStaticArrayDecayInitializer( _
+            translation, tokens(0), "", targetPointerType, initialValue)
     ElseIf tokenCount = 1 AndAlso isCallbackObject <> 0 AndAlso _
            IsIdentifierToken(tokens(0)) <> 0 Then
         sourceName = tokens(0)
@@ -430,6 +556,149 @@ Private Function TranslateGenericCharacterArrayInitializer( _
     Return -1
 End Function
 
+Private Function GenericBodyGeneratedNameExists( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceName As String _
+) As Long
+    Dim targetName As String = LCase(sourceName)
+    For declarationIndex As Long = 0 To _
+        translation.sourceUnit.declarationCount - 1
+        With translation.sourceUnit.declarations(declarationIndex)
+            If LCase(.sourceName) = targetName OrElse _
+               LCase(.recordTag) = targetName OrElse _
+               LCase(.recordAlias) = targetName Then Return -1
+        End With
+    Next
+    For objectIndex As Long = 0 To translation.body.externalObjectCount - 1
+        With translation.body.externalObjects(objectIndex)
+            If LCase(.sourceName) = targetName OrElse _
+               LCase(.freeBasicName) = targetName Then Return -1
+        End With
+    Next
+    For symbolIndex As Long = 0 To translation.symbolTable.symbolCount - 1
+        With translation.symbolTable.symbols(symbolIndex)
+            If LCase(.sourceName) = targetName OrElse _
+               LCase(.freeBasicName) = targetName OrElse _
+               LCase(.cName) = targetName Then Return -1
+        End With
+    Next
+    For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+        If LCase(translation.body.aliases(aliasIndex).name) = targetName Then _
+            Return -1
+    Next
+    For enumIndex As Long = 0 To _
+        translation.genericC.header.enumMemberCount - 1
+        With translation.genericC.header.enumMembers(enumIndex)
+            If LCase(.sourceName) = targetName OrElse _
+               LCase(.freeBasicName) = targetName Then Return -1
+        End With
+    Next
+    Return 0
+End Function
+
+Private Function TranslateGenericStaticCharacterCompoundLiteralPointer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceText As String, ByVal freeBasicType As String, _
+    ByRef initialValue As String _
+) As Long
+    initialValue = ""
+    If translation.target.profile <> C2FB_TARGET_GENERIC OrElse _
+       InStr(freeBasicType, " Ptr") = 0 Then Return 0
+
+    sourceText = GenericMacroStripOuterParentheses(Trim(sourceText))
+    If Left(sourceText, 1) <> "(" Then Return 0
+    Dim typeEnd As Long = 1
+    If ScanSimpleExpressionGroup( _
+        sourceText, typeEnd, Asc("("), Asc(")")) = 0 Then Return 0
+    Dim sourceType As String = Trim(Mid(sourceText, 2, typeEnd - 3))
+    Dim arrayOpen As Long = InStr(sourceType, "[")
+    If arrayOpen <= 0 Then Return 0
+    Dim arrayClose As Long = InStr(arrayOpen + 1, sourceType, "]")
+    If arrayClose <= arrayOpen OrElse _
+       Trim(Mid(sourceType, arrayClose + 1)) <> "" Then Return 0
+
+    Dim elementTokens() As String
+    Dim elementTokenCount As Long
+    TokenizeCDeclaration(Trim(Left(sourceType, arrayOpen - 1)), _
+                         elementTokens(), elementTokenCount)
+    If elementTokenCount <= 0 Then Return 0
+    Dim elementType As C2fbCTypeModel
+    If ParseCTypeModel(elementTokens(), 0, elementTokenCount - 1, elementType) = 0 OrElse _
+       elementType.pointerDepth <> 0 OrElse _
+       (elementType.baseName <> "char" AndAlso _
+        elementType.baseName <> "signed char" AndAlso _
+        elementType.baseName <> "unsigned char") Then Return 0
+
+    Dim initializerPosition As Long = typeEnd
+    SkipCSpaces(sourceText, initializerPosition)
+    If initializerPosition > Len(sourceText) OrElse _
+       Asc(sourceText, initializerPosition) <> Asc("{") Then Return 0
+    Dim initializerEnd As Long = initializerPosition
+    If ScanSimpleExpressionGroup( _
+        sourceText, initializerEnd, Asc("{"), Asc("}")) = 0 OrElse _
+       Trim(Mid(sourceText, initializerEnd)) <> "" Then Return 0
+    Dim initializerBody As String = Trim(Mid( _
+        sourceText, initializerPosition + 1, _
+        initializerEnd - initializerPosition - 2))
+    If Right(initializerBody, 1) = "," Then _
+        initializerBody = RTrim(Left( _
+            initializerBody, Len(initializerBody) - 1))
+    Dim initializerValues() As String
+    Dim initializerValueCount As Long
+    If SplitSimpleCList( _
+        initializerBody, initializerValues(), initializerValueCount, 0, _
+        MAX_GENERIC_STATIC_INITIALIZER_VALUES) = 0 OrElse _
+       initializerValueCount <= 0 Then Return 0
+
+    Dim arrayCount As Long = initializerValueCount
+    Dim boundText As String = Trim(Mid( _
+        sourceType, arrayOpen + 1, arrayClose - arrayOpen - 1))
+    If boundText <> "" AndAlso EvaluateGenericBodyArrayBound( _
+        translation, boundText, arrayCount, MAX_GENERIC_ARRAY_COUNT) = 0 Then _
+        Return 0
+    If arrayCount < initializerValueCount OrElse _
+       arrayCount > MAX_GENERIC_ARRAY_COUNT Then Return 0
+
+    Dim byteValues As String
+    For valueIndex As Long = 0 To arrayCount - 1
+        Dim byteValue As Long = 0
+        If valueIndex < initializerValueCount Then
+            Dim sourceValue As String = Trim(initializerValues(valueIndex))
+            If Left(sourceValue, 1) = "'" Then
+                Dim characterPosition As Long = 1
+                If DecodeCCharacterConstant( _
+                    sourceValue, characterPosition, byteValue) = 0 Then Return 0
+                SkipCSpaces(sourceValue, characterPosition)
+                If characterPosition <= Len(sourceValue) Then Return 0
+            ElseIf EvaluateGenericEnumIntegerValue( _
+                translation, sourceValue, byteValue) = 0 Then
+                Return 0
+            End If
+        End If
+        If byteValue < 0 OrElse byteValue > 255 Then Return 0
+        If valueIndex > 0 Then byteValues &= ", "
+        byteValues &= Trim(Str(byteValue))
+    Next
+
+    Dim storageName As String
+    Do
+        storageName = "c2fb_internal_static_char_array_" & _
+            Trim(Str(translation.body.generatedStaticStorageSerial))
+        translation.body.generatedStaticStorageSerial += 1
+    Loop While GenericBodyGeneratedNameExists(translation, storageName) <> 0
+
+    ' FreeBASIC constant arrays cannot be addressed through an element.
+    ' The backing storage is private; C constness stays on the pointer field.
+    Dim storageDeclaration As String = "Private Dim Shared " & storageName & "(0 To " & _
+        Trim(Str(arrayCount - 1)) & ") As UByte = {" & byteValues & "}"
+    translation.body.generatedStaticDeclarations &= _
+        storageDeclaration & Chr(10)
+    initialValue = "CPtr(" & freeBasicType & ", @" & _
+        storageName & "(0))"
+    Return -1
+End Function
+
+
 Private Function IsGenericCharacterArrayType( _
     ByRef translation As C2fbTranslationContext, _
     ByVal commonType As String, ByVal freeBasicType As String, _
@@ -469,6 +738,336 @@ Declare Function TranslateGenericRecordModuleStaticInitializer( _
     ByRef initialValue As String _
 ) As Long
 
+Private Function EvaluateGenericArrayInitializerIndex( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal expression As String, ByRef index As Long _
+) As Long
+    If EvaluateSimpleArrayBound( _
+        expression, index, MAX_GENERIC_ARRAY_COUNT - 1, -1) <> 0 Then _
+        Return -1
+    Dim evaluatedIndex As Long
+    If EvaluateGenericEnumIntegerValue( _
+        translation, expression, evaluatedIndex) = 0 OrElse _
+       evaluatedIndex < 0 OrElse evaluatedIndex >= MAX_GENERIC_ARRAY_COUNT Then _
+        Return 0
+    index = evaluatedIndex
+    Return -1
+End Function
+
+Private Function ParseGenericArrayInitializerDesignator( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal initializerItem As String, _
+    ByRef firstIndex As Long, ByRef lastIndex As Long, _
+    ByRef elementText As String _
+) As Long
+    initializerItem = Trim(initializerItem)
+    firstIndex = 0
+    lastIndex = 0
+    elementText = ""
+    If Left(initializerItem, 1) <> "[" Then Return 0
+
+    Dim bracketEnd As Long = 1
+    If ScanSimpleExpressionGroup( _
+        initializerItem, bracketEnd, Asc("["), Asc("]")) = 0 Then _
+        Return -1
+    Dim indexText As String = Trim(Mid( _
+        initializerItem, 2, bracketEnd - 3))
+    Dim assignmentPosition As Long = bracketEnd
+    SkipCSpaces(initializerItem, assignmentPosition)
+    If Mid(initializerItem, assignmentPosition, 1) <> "=" Then Return -1
+    assignmentPosition += 1
+    elementText = Trim(Mid(initializerItem, assignmentPosition))
+    If indexText = "" OrElse elementText = "" Then Return -1
+
+    Dim rangePosition As Long = InStr(indexText, "...")
+    If rangePosition = 0 Then
+        If EvaluateGenericArrayInitializerIndex( _
+            translation, indexText, firstIndex) = 0 Then _
+            Return -1
+        lastIndex = firstIndex
+        Return 1
+    End If
+    If InStr(rangePosition + 3, indexText, "...") <> 0 Then Return -1
+    Dim firstExpression As String = Trim(Left(indexText, rangePosition - 1))
+    Dim lastExpression As String = Trim(Mid(indexText, rangePosition + 3))
+    If firstExpression = "" OrElse lastExpression = "" Then Return -1
+    If EvaluateGenericArrayInitializerIndex( _
+        translation, firstExpression, firstIndex) = 0 OrElse _
+       EvaluateGenericArrayInitializerIndex( _
+        translation, lastExpression, lastIndex) = 0 OrElse _
+       lastIndex < firstIndex Then Return -1
+    Return 1
+End Function
+
+Private Function GenericModuleStaticTypeSizeInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceType As String, ByRef byteSize As Long, _
+    ByVal depth As Long = 0 _
+) As Long
+    If depth >= 32 OrElse sourceType = "" Then Return 0
+    If LCase(Trim(sourceType)) = "long double" Then
+        byteSize = GenericHeaderPreprocessorSizeValue( _
+            translation, "__SIZEOF_LONG_DOUBLE__")
+        Return CInt(byteSize > 0) * -1
+    End If
+    If GenericArrayBoundTypeSize(sourceType, byteSize) <> 0 Then Return -1
+
+    Dim typeTokens() As String
+    Dim typeTokenCount As Long
+    TokenizeCDeclaration(sourceType, typeTokens(), typeTokenCount)
+    If typeTokenCount <= 0 Then Return 0
+    Dim parsedSourceType As C2fbCTypeModel
+    If ParseCTypeModel(typeTokens(), 0, typeTokenCount - 1, _
+        parsedSourceType) <> 0 AndAlso _
+       (parsedSourceType.isStruct <> 0 OrElse _
+        parsedSourceType.isUnion <> 0) Then
+        ' File-scope sizeof in a C initializer can name an aggregate tag
+        ' directly; resolve it through the prepared generic-header layout.
+        byteSize = GenericHeaderSizeofTypeInBytes( _
+            translation, sourceType)
+        Return CInt(byteSize > 0) * -1
+    End If
+    Dim aliasName As String
+    For tokenIndex As Long = 0 To typeTokenCount - 1
+        If IsQualifierToken(typeTokens(tokenIndex)) <> 0 Then Continue For
+        If IsIdentifierToken(typeTokens(tokenIndex)) = 0 OrElse _
+           aliasName <> "" Then Return 0
+        aliasName = typeTokens(tokenIndex)
+    Next
+    If aliasName = "" Then Return 0
+
+    Dim aliasIndex As Long = GenericHeaderTypeAliasIndexInHeader( _
+        translation.genericC.header, aliasName, 0)
+    If aliasIndex < 0 Then Return 0
+    With translation.genericC.header.headerTypeAliases(aliasIndex)
+        If .isFunction <> 0 OrElse .isTag <> 0 Then Return 0
+        If .isArray <> 0 Then
+            If .arrayCount <= 0 Then Return 0
+            Dim elementSize As Long
+            If GenericModuleStaticTypeSizeInContext( _
+                translation, .arrayElementType, elementSize, depth + 1) = 0 OrElse _
+               elementSize <= 0 OrElse _
+               .arrayCount > MAX_GENERIC_ARRAY_BOUND_VALUE \ elementSize Then _
+                Return 0
+            byteSize = elementSize * .arrayCount
+            Return -1
+        End If
+        Return GenericModuleStaticTypeSizeInContext( _
+            translation, .baseType, byteSize, depth + 1)
+    End With
+    Return 0
+End Function
+
+Private Function GenericModuleStaticObjectSizeInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceName As String, ByRef byteSize As Long _
+) As Long
+    byteSize = 0
+    Dim symbolIndex As Long = _
+        GenericHeaderSymbolIndexInContext(translation, sourceName)
+    If symbolIndex < 0 Then Return 0
+    With translation.symbolTable.symbols(symbolIndex)
+        If .kind <> GENERIC_SYMBOL_OBJECT OrElse _
+           .genericHeader.unsizedArray <> 0 OrElse _
+           .genericHeader.freeBasicType = "" Then Return 0
+
+        Dim elementSize As Long
+        If InStr(.genericHeader.freeBasicType, " Ptr") <> 0 Then
+            elementSize = GenericHeaderPreprocessorSizeValue( _
+                translation, "__SIZEOF_POINTER__")
+        Else
+            elementSize = GenericHeaderFreeBasicScalarSize( _
+                translation, .genericHeader.freeBasicType)
+            If elementSize <= 0 Then
+                elementSize = GenericHeaderSimpleRecordSizeInBytes( _
+                    translation, .genericHeader.freeBasicType)
+            End If
+        End If
+        If elementSize <= 0 Then Return 0
+
+        Dim elementCount As Long = .genericHeader.arrayCount
+        If elementCount <= 0 Then elementCount = 1
+        If elementCount > MAX_GENERIC_ARRAY_BOUND_VALUE \ elementSize Then _
+            Return 0
+        byteSize = elementCount * elementSize
+        Return -1
+    End With
+    Return 0
+End Function
+
+Private Function NormalizeGenericModuleStaticInitializerSizeof( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceExpression As String, ByRef normalizedExpression As String _
+) As Long
+    normalizedExpression = ""
+    Dim position As Long = 1
+    While position <= Len(sourceExpression)
+        If Mid(sourceExpression, position, Len("sizeof")) = "sizeof" AndAlso _
+           (position = 1 OrElse _
+            IsIdentifierPart(Asc(sourceExpression, position - 1)) = 0) Then
+            Dim operandPosition As Long = position + Len("sizeof")
+            SkipCSpaces(sourceExpression, operandPosition)
+            Dim byteSize As Long
+            If operandPosition <= Len(sourceExpression) AndAlso _
+               Asc(sourceExpression, operandPosition) = Asc(Chr(34)) Then
+                If GenericArrayBoundStringSize( _
+                    sourceExpression, operandPosition, byteSize) = 0 Then Return 0
+            ElseIf operandPosition <= Len(sourceExpression) AndAlso _
+                   Asc(sourceExpression, operandPosition) = Asc("(") Then
+                Dim groupEnd As Long = operandPosition
+                If ScanSimpleExpressionGroup( _
+                    sourceExpression, groupEnd, Asc("("), Asc(")")) = 0 Then _
+                    Return 0
+                Dim sourceType As String = Trim(Mid( _
+                    sourceExpression, operandPosition + 1, _
+                    groupEnd - operandPosition - 2))
+                If GenericModuleStaticTypeSizeInContext( _
+                    translation, sourceType, byteSize) = 0 Then Return 0
+                operandPosition = groupEnd
+            ElseIf operandPosition <= Len(sourceExpression) AndAlso _
+                   IsIdentifierStart(Asc(sourceExpression, operandPosition)) <> 0 Then
+                Dim identifierStart As Long = operandPosition
+                operandPosition += 1
+                While operandPosition <= Len(sourceExpression) AndAlso _
+                      IsIdentifierPart(Asc(sourceExpression, operandPosition)) <> 0
+                    operandPosition += 1
+                Wend
+                Dim sourceName As String = Mid( _
+                    sourceExpression, identifierStart, _
+                    operandPosition - identifierStart)
+                If GenericModuleStaticObjectSizeInContext( _
+                    translation, sourceName, byteSize) = 0 Then Return 0
+            Else
+                Return 0
+            End If
+            normalizedExpression &= Trim(Str(byteSize))
+            position = operandPosition
+        Else
+            normalizedExpression &= Mid(sourceExpression, position, 1)
+            position += 1
+        End If
+    Wend
+    Return -1
+End Function
+
+Private Function NormalizeGenericStaticSingleValueHelperCalls( _
+    ByVal sourceExpression As String, ByRef normalizedExpression As String, _
+    ByVal depth As Long = 0 _
+) As Long
+    normalizedExpression = ""
+    If depth >= MAX_GENERIC_MACRO_EXPRESSION_DEPTH Then Return 0
+    Dim functionName As String = "__c2fb_single_value"
+    Dim position As Long = 1
+    Dim foundHelper As Long = 0
+    While position <= Len(sourceExpression)
+        If Mid(sourceExpression, position, Len(functionName)) = functionName AndAlso _
+           (position = 1 OrElse _
+            IsIdentifierPart(Asc(sourceExpression, position - 1)) = 0) Then
+            Dim operandPosition As Long = position + Len(functionName)
+            SkipCSpaces(sourceExpression, operandPosition)
+            If operandPosition <= Len(sourceExpression) AndAlso _
+               Asc(sourceExpression, operandPosition) = Asc("(") Then
+                Dim groupEnd As Long = operandPosition
+                If ScanSimpleExpressionGroup( _
+                    sourceExpression, groupEnd, Asc("("), Asc(")")) = 0 Then _
+                    Return 0
+                Dim operand As String = Trim(Mid( _
+                    sourceExpression, operandPosition + 1, _
+                    groupEnd - operandPosition - 2))
+                If operand = "" Then Return 0
+                Dim normalizedOperand As String
+                If NormalizeGenericStaticSingleValueHelperCalls( _
+                    operand, normalizedOperand, depth + 1) = 0 Then _
+                    normalizedOperand = operand
+                normalizedExpression &= "Cast(Single, " & _
+                    normalizedOperand & ")"
+                position = groupEnd
+                foundHelper = -1
+                Continue While
+            End If
+        End If
+        normalizedExpression &= Mid(sourceExpression, position, 1)
+        position += 1
+    Wend
+    Return foundHelper
+End Function
+
+Private Sub NormalizeGenericModuleStaticInitializerValue( _
+    ByRef initialValue As String _
+)
+    Dim normalizedValue As String
+    If NormalizeGenericStaticSingleValueHelperCalls( _
+        initialValue, normalizedValue) <> 0 Then _
+        initialValue = normalizedValue
+End Sub
+
+Private Function GenericModuleStaticBooleanKeywordValue( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceText As String, ByRef initialValue As String _
+) As Long
+    If translation.target.profile <> C2FB_TARGET_GENERIC Then Return 0
+    Select Case sourceText
+    Case "true"
+        initialValue = "1"
+    Case "false"
+        initialValue = "0"
+    Case Else
+        Return 0
+    End Select
+
+    ' Before C23, true and false are macros or ordinary identifiers. Do not
+    ' replace a project declaration or a retained macro with the keywords.
+    For symbolIndex As Long = 0 To translation.symbolTable.symbolCount - 1
+        If translation.symbolTable.symbols(symbolIndex).sourceName = _
+           sourceText Then Return 0
+    Next
+    If GenericEnumMemberIndexInContext(translation, sourceText) >= 0 Then _
+        Return 0
+    For macroIndex As Long = 0 To _
+        translation.genericC.header.headerMacroCount - 1
+        If translation.genericC.header.headerMacros( _
+            macroIndex).definition.sourceName = sourceText Then Return 0
+    Next
+    Return -1
+End Function
+
+Private Function GenericModuleStaticInitializerHasCTypeCast( _
+    ByRef translation As C2fbTranslationContext, _
+    ByVal sourceText As String _
+) As Long
+    Dim tokens() As String
+    Dim tokenCount As Long
+    If TokenizeCPreprocessorReplacement( _
+        sourceText, tokens(), tokenCount) = 0 Then Return 0
+
+    For openIndex As Long = 0 To tokenCount - 1
+        If tokens(openIndex) <> "(" Then Continue For
+        Dim groupDepth As Long = 1
+        Dim closeIndex As Long = openIndex + 1
+        While closeIndex < tokenCount AndAlso groupDepth > 0
+            If tokens(closeIndex) = "(" Then
+                groupDepth += 1
+            ElseIf tokens(closeIndex) = ")" Then
+                groupDepth -= 1
+            End If
+            closeIndex += 1
+        Wend
+        If groupDepth <> 0 OrElse closeIndex <= openIndex + 2 Then Continue For
+
+        Dim sourceType As String
+        For typeIndex As Long = openIndex + 1 To closeIndex - 2
+            If sourceType <> "" Then sourceType &= " "
+            sourceType &= tokens(typeIndex)
+        Next
+        Dim freeBasicType As String
+        Dim isPointerCast As Long
+        If GenericHeaderMacroCastType( _
+            translation, sourceType, freeBasicType, isPointerCast) <> 0 Then _
+            Return -1
+    Next
+    Return 0
+End Function
+
 Private Function TranslateGenericModuleStaticInitializer( _
     ByRef translation As C2fbTranslationContext, _
     ByVal sourceText As String, ByVal freeBasicType As String, _
@@ -480,6 +1079,8 @@ Private Function TranslateGenericModuleStaticInitializer( _
     sourceText = Trim(sourceText)
     initialValue = ""
     If sourceText = "" Then Return -1
+    If GenericModuleStaticBooleanKeywordValue( _
+        translation, sourceText, initialValue) <> 0 Then Return -1
 
     If sourceText = "{0}" Then
         ' Module-level FreeBASIC storage starts zeroed, matching C's aggregate
@@ -504,6 +1105,18 @@ Private Function TranslateGenericModuleStaticInitializer( _
         If Right(initializerBody, 1) = "," Then _
             initializerBody = RTrim(Left( _
                 initializerBody, Len(initializerBody) - 1))
+        If isArray <> 0 AndAlso isCharacterArray <> 0 Then
+            ' A brace-wrapped adjacent string sequence is one C string
+            ' initializer, including its explicit embedded NUL bytes.
+            Dim stringBytes() As Long
+            Dim stringByteCount As Long
+            If ReadGenericStaticStringBytes( _
+                initializerBody, stringBytes(), stringByteCount) <> 0 Then
+                Return TranslateGenericCharacterArrayInitializer( _
+                    initializerBody, isUnsizedArray, useStringStorage, _
+                    arrayCount, initialValue)
+            End If
+        End If
         Dim values() As String
         Dim valueCount As Long
         If SplitSimpleCList( _
@@ -511,8 +1124,92 @@ Private Function TranslateGenericModuleStaticInitializer( _
             MAX_GENERIC_STATIC_INITIALIZER_VALUES) = 0 OrElse _
            valueCount <= 0 Then Return 0
         If isArray = 0 AndAlso valueCount <> 1 Then Return 0
-        If arrayCount > 0 AndAlso valueCount > arrayCount Then Return 0
-        If arrayCount = 0 AndAlso isArray <> 0 Then arrayCount = valueCount
+        Dim hasArrayDesignator As Long = 0
+        If isArray <> 0 Then
+            For valueIndex As Long = 0 To valueCount - 1
+                If Left(Trim(values(valueIndex)), 1) = "[" Then
+                    hasArrayDesignator = -1
+                    Exit For
+                End If
+            Next
+        End If
+        If arrayCount > 0 AndAlso valueCount > arrayCount AndAlso _
+           hasArrayDesignator = 0 Then Return 0
+        If arrayCount = 0 AndAlso isArray <> 0 AndAlso _
+           hasArrayDesignator = 0 Then arrayCount = valueCount
+
+        If hasArrayDesignator <> 0 Then
+            If arrayCount = 0 Then
+                Dim nextInferredIndex As Long = 0
+                Dim maximumInitializedIndex As Long = -1
+                For valueIndex As Long = 0 To valueCount - 1
+                    Dim firstIndex As Long
+                    Dim lastIndex As Long
+                    Dim elementText As String
+                    Dim designatorStatus As Long = _
+                        ParseGenericArrayInitializerDesignator( _
+                            translation, values(valueIndex), firstIndex, _
+                            lastIndex, elementText)
+                    If designatorStatus < 0 Then Return 0
+                    If designatorStatus = 0 Then
+                        firstIndex = nextInferredIndex
+                        lastIndex = firstIndex
+                    End If
+                    If firstIndex < 0 OrElse _
+                       lastIndex >= MAX_GENERIC_ARRAY_COUNT Then Return 0
+                    If lastIndex > maximumInitializedIndex Then _
+                        maximumInitializedIndex = lastIndex
+                    nextInferredIndex = lastIndex + 1
+                Next
+                If maximumInitializedIndex < 0 Then Return 0
+                arrayCount = maximumInitializedIndex + 1
+            End If
+            If arrayCount < 1 OrElse _
+               arrayCount > MAX_GENERIC_STATIC_INITIALIZER_VALUES Then Return 0
+
+            Dim translatedArrayValues() As String
+            ReDim translatedArrayValues(0 To arrayCount - 1)
+            For valueIndex As Long = 0 To arrayCount - 1
+                translatedArrayValues(valueIndex) = "0"
+            Next
+
+            Dim nextArrayIndex As Long = 0
+            For valueIndex As Long = 0 To valueCount - 1
+                Dim firstIndex As Long
+                Dim lastIndex As Long
+                Dim elementText As String
+                Dim designatorStatus As Long = _
+                    ParseGenericArrayInitializerDesignator( _
+                        translation, values(valueIndex), firstIndex, _
+                        lastIndex, elementText)
+                If designatorStatus < 0 Then Return 0
+                If designatorStatus = 0 Then
+                    firstIndex = nextArrayIndex
+                    lastIndex = firstIndex
+                    elementText = Trim(values(valueIndex))
+                End If
+                If firstIndex < 0 OrElse lastIndex < firstIndex OrElse _
+                   lastIndex >= arrayCount Then Return 0
+
+                Dim translatedElement As String
+                If TranslateGenericModuleStaticInitializer( _
+                    translation, elementText, freeBasicType, 0, _
+                    isPointerLike, isCallbackObject, 0, 0, 0, arrayCount, _
+                    translatedElement) = 0 Then Return 0
+                For elementIndex As Long = firstIndex To lastIndex
+                    translatedArrayValues(elementIndex) = translatedElement
+                Next
+                nextArrayIndex = lastIndex + 1
+            Next
+
+            Dim translatedArrayInitializer As String
+            For valueIndex As Long = 0 To arrayCount - 1
+                If valueIndex > 0 Then translatedArrayInitializer &= ", "
+                translatedArrayInitializer &= translatedArrayValues(valueIndex)
+            Next
+            initialValue = "{" & translatedArrayInitializer & "}"
+            Return -1
+        End If
 
         Dim translatedValues As String
         For valueIndex As Long = 0 To valueCount - 1
@@ -536,6 +1233,9 @@ Private Function TranslateGenericModuleStaticInitializer( _
         Return 0
     End If
     If isPointerLike <> 0 AndAlso isCallbackObject = 0 Then
+        If TranslateGenericStaticCharacterCompoundLiteralPointer( _
+            translation, sourceText, freeBasicType, initialValue) <> 0 Then _
+            Return -1
         Dim pointerStorageType As String = _
             GenericHeaderTypeAliasStorageTypeInHeader( _
                 translation.genericC.header, freeBasicType, 0)
@@ -556,11 +1256,20 @@ Private Function TranslateGenericModuleStaticInitializer( _
     End If
     If isPointerLike <> 0 AndAlso _
        GenericNullPointerConstantText(sourceText) <> 0 Then
+        ' Retain callback attributes and the destination pointer type. The C
+        ' backend emits a pointer initializer's zero as C's null constant.
         initialValue = "CPtr(" & freeBasicType & ", 0)"
         Return -1
     End If
     If TranslateGenericModuleStaticAddressInitializer( _
-        translation, sourceText, isCallbackObject, initialValue) <> 0 Then Return -1
+        translation, sourceText, isCallbackObject, freeBasicType, initialValue) <> 0 Then Return -1
+
+    Dim sizeofParameterNames(0 To 0) As String
+    Dim sizeofFreeParameterNames(0 To 0) As String
+    If TranslateGenericHeaderSizeofMacroExpression( _
+        translation, sourceText, sizeofParameterNames(), _
+        sizeofFreeParameterNames(), 0, 0, 0, 0, initialValue) <> 0 Then _
+        Return -1
 
     If translation.target.profile = C2FB_TARGET_GENERIC Then
         Dim enumExpression As String
@@ -571,12 +1280,67 @@ Private Function TranslateGenericModuleStaticInitializer( _
         End If
     End If
 
+    If translation.target.profile = C2FB_TARGET_GENERIC AndAlso _
+       InStr(sourceText, "sizeof") <> 0 Then
+        Dim normalizedSizeof As String
+        ' String-literal sizeof is an integer constant expression in C.
+        If (NormalizeGenericModuleStaticInitializerSizeof( _
+                translation, sourceText, normalizedSizeof) <> 0 OrElse _
+            NormalizeGenericArrayBoundSizeof( _
+                translation, sourceText, normalizedSizeof) <> 0) AndAlso _
+           TranslateGenericHeaderIntegerExpression( _
+               translation, normalizedSizeof, initialValue, 0, -1) <> 0 Then _
+            Return -1
+    End If
+
+    Dim scalarCastExpression As String = _
+        GenericMacroStripOuterParentheses(sourceText)
+    If isArray = 0 AndAlso isPointerLike = 0 AndAlso _
+       Left(scalarCastExpression, 1) = "(" Then
+        Dim castTypeEnd As Long = 1
+        If ScanSimpleExpressionGroup( _
+            scalarCastExpression, castTypeEnd, Asc("("), Asc(")")) <> 0 AndAlso _
+           castTypeEnd < Len(scalarCastExpression) Then
+            Dim castType As String = Trim(Mid( _
+                scalarCastExpression, 2, castTypeEnd - 3))
+            Dim freeBasicCastType As String
+            Dim isPointerCast As Long
+            If GenericHeaderMacroCastType( _
+                translation, castType, freeBasicCastType, _
+                isPointerCast) <> 0 AndAlso _
+               isPointerCast = 0 AndAlso _
+               TranslateGenericHeaderMacroExpression( _
+                translation, scalarCastExpression, initialValue, -1) <> 0 Then _
+                ' Resolve C scalar casts before the integer-only path, which
+                ' can otherwise preserve the original cast syntax verbatim.
+                NormalizeGenericModuleStaticInitializerValue(initialValue)
+                Return -1
+            End If
+        End If
+    End If
+
     If GenericIntegerMacroCandidate(sourceText) <> 0 Then
+        ' Static C initializers are integer constant expressions here, so
+        ' division and remainder use C integer semantics even when the
+        ' expression contains a conditional operator.
+        If translation.target.profile = C2FB_TARGET_GENERIC AndAlso _
+           GenericModuleStaticInitializerHasCTypeCast( _
+               translation, sourceText) <> 0 AndAlso _
+           TranslateGenericHeaderMacroExpression( _
+               translation, sourceText, initialValue, -1) <> 0 Then _
+            NormalizeGenericModuleStaticInitializerValue(initialValue)
+            Return -1
         If TranslateGenericHeaderIntegerExpression( _
-            translation, sourceText, initialValue, 0) <> 0 Then Return -1
+            translation, sourceText, initialValue, 0, -1) <> 0 Then
+            NormalizeGenericModuleStaticInitializerValue(initialValue)
+            Return -1
+        End If
     End If
     If TranslateGenericHeaderMacroExpression( _
-        translation, sourceText, initialValue) <> 0 Then Return -1
+        translation, sourceText, initialValue) <> 0 Then
+        NormalizeGenericModuleStaticInitializerValue(initialValue)
+        Return -1
+    End If
     Return 0
 End Function
 
@@ -630,28 +1394,38 @@ Private Function GenericRecordBindingForStaticInitializer( _
     If Left(freeBasicType, 6) = "Const " Then freeBasicType = Mid(freeBasicType, 7)
     Dim storageType As String = GenericHeaderTypeAliasStorageTypeInHeader( _
         translation.genericC.header, freeBasicType, 0)
-    If storageType = "" OrElse storageType = "Any" Then Return 0
-
-    For declarationIndex As Long = 0 To translation.sourceUnit.declarationCount - 1
-        If declarationIndex > UBound(translation.genericC.header.recordPlans) Then Exit For
-        Dim plan As C2fbGenericRecordPlanModel = _
-            translation.genericC.header.recordPlans(declarationIndex)
-        ' A forward typedef may resolve through its backing UDT name rather
-        ' than the generic "Record" storage marker.
-        If plan.isSupported <> 0 AndAlso plan.bindingReady <> 0 AndAlso _
-           (plan.freeBasicName = freeBasicType OrElse _
-            plan.aliasFreeBasicName = freeBasicType OrElse _
-            plan.implementationName = storageType) Then
-            recordBinding = plan.binding
-            Return -1
-        End If
-        For nestedIndex As Long = 0 To plan.nestedBindingCount - 1
-            If plan.nestedBindings(nestedIndex).freeBasicName = freeBasicType OrElse _
-               plan.nestedBindings(nestedIndex).freeBasicName = storageType Then
-                recordBinding = plan.nestedBindings(nestedIndex)
+    If storageType <> "" AndAlso storageType <> "Any" Then
+        For declarationIndex As Long = 0 To translation.sourceUnit.declarationCount - 1
+            If declarationIndex > UBound(translation.genericC.header.recordPlans) Then Exit For
+            Dim plan As C2fbGenericRecordPlanModel = _
+                translation.genericC.header.recordPlans(declarationIndex)
+            ' A forward typedef may resolve through its backing UDT name rather
+            ' than the generic "Record" storage marker.
+            If plan.isSupported <> 0 AndAlso plan.bindingReady <> 0 AndAlso _
+               (plan.freeBasicName = freeBasicType OrElse _
+                plan.aliasFreeBasicName = freeBasicType OrElse _
+                plan.implementationName = storageType) Then
+                recordBinding = plan.binding
                 Return -1
             End If
+            For nestedIndex As Long = 0 To plan.nestedBindingCount - 1
+                If plan.nestedBindings(nestedIndex).freeBasicName = freeBasicType OrElse _
+                   plan.nestedBindings(nestedIndex).freeBasicName = storageType Then
+                    recordBinding = plan.nestedBindings(nestedIndex)
+                    Return -1
+                End If
+            Next
         Next
+    End If
+    For bodyRecordIndex As Long = 0 To _
+        translation.body.recordBindingCount - 1
+        With translation.body.recordBindings(bodyRecordIndex)
+            If (.fbName <> freeBasicType AndAlso _
+                .sourceName <> freeBasicType) OrElse _
+               .staticInitializerBinding.itemCount <= 0 Then Continue For
+            recordBinding = .staticInitializerBinding
+            Return -1
+        End With
     Next
     Return 0
 End Function
@@ -731,12 +1505,11 @@ Private Function TranslateGenericRecordModuleStaticInitializer( _
                             Return 0
                         translatedValue = "0"
                     Else
-                        Dim scalarArrayCount As Long = 0
-                        If TranslateGenericModuleStaticInitializer( _
+                    Dim scalarArrayCount As Long = 0
+                    If TranslateGenericModuleStaticInitializer( _
                             translation, scalarValue, .fieldType, 0, _
                             isPointerField, 0, 0, 0, 0, _
-                            scalarArrayCount, translatedValue) = 0 Then _
-                            Return 0
+                            scalarArrayCount, translatedValue) = 0 Then Return 0
                     End If
                     If translatedArrayValues <> "" Then _
                         translatedArrayValues &= ", "
@@ -1169,7 +1942,8 @@ Private Sub EmitGenericExternalObjectTokensCore( _
     If baseTokenCount = 0 Then Exit Sub
     commonType = GenericTokensToText(baseTokens(), 0, baseTokenCount - 1)
 
-    If callbackObject = 0 AndAlso bindingOrder = "" Then
+    If callbackObject = 0 AndAlso _
+       (bindingOrder = "" OrElse arrayDimensions > 0) Then
         Dim functionTypeAliasIndex As Long = -1
         For tokenIndex As Long = 0 To baseTokenCount - 1
             Dim candidateAlias As Long = _
@@ -1182,22 +1956,37 @@ Private Sub EmitGenericExternalObjectTokensCore( _
             End If
         Next
         If functionTypeAliasIndex >= 0 Then
-            If CDeclarationHasStdCall(declaration) <> 0 Then
-                EmitC2fbSkipped(translation,  _
-                    outputFile, conversionSummary, "non-CDecl function type alias use", declaration)
+            If arrayDimensions > 0 Then
+                ' A callback typedef hides the function pointer operator from
+                ' an array object declarator, but its elements remain pointers.
+                freeBasicType = translation.genericC.header.headerTypeAliases( _
+                    functionTypeAliasIndex).freeBasicName
+                If freeBasicType = "" Then
+                    EmitC2fbSkipped(translation, outputFile, conversionSummary, _
+                        "unresolved callback array typedef", declaration)
+                    Exit Sub
+                End If
+                callbackObject = -1
+            Else
+                If CDeclarationHasStdCall(declaration) <> 0 Then
+                    EmitC2fbSkipped(translation,  _
+                        outputFile, conversionSummary, _
+                        "non-CDecl function type alias use", declaration)
+                    Exit Sub
+                End If
+                Dim functionType As String = _
+                    GenericHeaderFunctionAliasTypeInHeader( _
+                        translation.genericC.header, functionTypeAliasIndex)
+                If functionType = "" OrElse EmitGenericFunctionAliasUsage( _
+                    translation, _
+                    functionType, sourceName, outputFile, names(), nameCount, _
+                    outputNames(), outputNameCount, conversionSummary) = 0 Then
+                    EmitC2fbSkipped(translation,  _
+                        outputFile, conversionSummary, _
+                        "unsupported function type alias use", declaration)
+                End If
                 Exit Sub
             End If
-            Dim functionType As String = _
-                GenericHeaderFunctionAliasTypeInHeader( _
-                    translation.genericC.header, functionTypeAliasIndex)
-            If functionType = "" OrElse EmitGenericFunctionAliasUsage( _
-                translation, _
-                functionType, sourceName, outputFile, names(), nameCount, _
-                outputNames(), outputNameCount, conversionSummary) = 0 Then
-                EmitC2fbSkipped(translation,  _
-                    outputFile, conversionSummary, "unsupported function type alias use", declaration)
-            End If
-            Exit Sub
         End If
     End If
 
@@ -1506,6 +2295,7 @@ Private Sub EmitGenericExternalObjectTokensCore( _
     If hasStaticStorage <> 0 AndAlso initializerToken >= 0 Then
         Dim isArrayObject As Long = CInt( _
             arrayBounds <> "" OrElse arrayCount > 0 OrElse _
+            (arrayDimensions > 0 AndAlso pointerDepth = 0) OrElse _
             unsizedArray <> 0) * -1
         Dim isPointerObject As Long = CInt( _
             pointerDepth > 0 OrElse callbackObject <> 0) * -1
@@ -1520,6 +2310,13 @@ Private Sub EmitGenericExternalObjectTokensCore( _
             EmitC2fbSkipped(translation, outputFile, conversionSummary, _
                 "unsupported module-static initializer", declaration)
             Exit Sub
+        End If
+        If translation.body.generatedStaticDeclarations <> "" Then
+            ' Compound literals use file-scope byte storage. Emit that storage
+            ' before this object's initializer refers to it.
+            WriteC2fbOutputText( _
+                outputFile, translation.body.generatedStaticDeclarations)
+            translation.body.generatedStaticDeclarations = ""
         End If
         If unsizedArray <> 0 AndAlso arrayCount > 0 Then
             unsizedArray = 0

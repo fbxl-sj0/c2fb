@@ -230,6 +230,211 @@ def check_generic_body_long_boolean_chains(converter, fbc, work):
     run([str(executable)], cwd=work)
 
 
+def check_generic_body_error_nonzero_status_terminates(
+    converter, fbc, cc, work
+):
+    # GNU error() exits only for nonzero status and returns for zero.
+    source_directory = work / "generic-body-error-status-termination"
+    source_directory.mkdir()
+    source = source_directory / "error_status.c"
+    source.write_text(
+        "#include <error.h>\n"
+        "int c2fbErrorStatusZero(void) {\n"
+        "    error(0, 0, \"nonfatal\");\n"
+        "    return 7;\n"
+        "}\n"
+        "int c2fbErrorStatusNonzero(void) {\n"
+        "    error(1, 0, \"fatal\");\n"
+        "    return 9;\n"
+        "}\n"
+    )
+    candidate = source_directory / "error_status_candidates.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), cc[0],
+    ])
+    assert "translated 2 simple functions; skipped 0" in summary, summary
+
+    reference_source = source_directory / "reference_main.c"
+    reference_source.write_text(
+        "#include <string.h>\n"
+        "int c2fbErrorStatusZero(void);\n"
+        "int c2fbErrorStatusNonzero(void);\n"
+        "int main(int argc, char **argv) {\n"
+        "    if (argc > 1 && strcmp(argv[1], \"zero\") == 0)\n"
+        "        return c2fbErrorStatusZero();\n"
+        "    return c2fbErrorStatusNonzero();\n"
+        "}\n"
+    )
+    reference = source_directory / "reference"
+    run(cc + ["-std=c99", "-O2", str(source), str(reference_source),
+              "-o", str(reference)], cwd=source_directory)
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "error_status_candidates.bas"\n'
+        'If Command(1) = "zero" Then\n'
+        "    End c2fbErrorStatusZero()\n"
+        "Else\n"
+        "    End c2fbErrorStatusNonzero()\n"
+        "End If\n"
+    )
+    converted = source_directory / "converted"
+    run(fbc + ["-w", "all", "-i", str(source_directory), str(wrapper),
+               "-x", str(converted)], cwd=source_directory)
+    for case in ("zero", "nonzero"):
+        c_result = subprocess.run(
+            [str(reference), case], capture_output=True)
+        fb_result = subprocess.run(
+            [str(converted), case], capture_output=True)
+        assert c_result.returncode == fb_result.returncode, (
+            case, c_result.returncode, fb_result.returncode
+        )
+
+
+def check_generic_body_longdouble(converter, fbc, cc, work):
+    # C long-double literals must retain their decimal precision and C integer
+    # conversions must not pass through Double in generated FreeBASIC bodies.
+    source = work / "generic-body-longdouble.c"
+    source.write_text(
+        "int c2fbLongDoubleLiteralPrecision(void) {\n"
+        "    long double value = 1.0L + 1.0000000000000001e-18L;\n"
+        "    return value > 1.0L;\n"
+        "}\n"
+        "int c2fbLongDoubleArgument(long double value) {\n"
+        "    long double adjusted = value + 1.0000000000000001e-18L;\n"
+        "    return adjusted > value;\n"
+        "}\n"
+        "int c2fbLongDoubleIntegerPrecision(void) {\n"
+        "    long long value = 9007199254740993LL;\n"
+        "    long double converted = (long double)value;\n"
+        "    return converted > 9007199254740992.0L;\n"
+        "}\n"
+        "int c2fbLongDoubleUnsignedPrecision(void) {\n"
+        "    unsigned long long value = 18446744073709551615ULL;\n"
+        "    long double converted = (long double)value;\n"
+        "    return converted > 18446744073709551614.0L;\n"
+        "}\n"
+        "int c2fbLongDoubleIntegerInitializer(void) {\n"
+        "    long double value = 1;\n"
+        "    return value == 1.0L;\n"
+        "}\n"
+        "int c2fbLongDoubleTruncate(void) {\n"
+        "    return (int)-1.75L == -1;\n"
+        "}\n"
+        "int c2fbLongDoubleCompound(long double value) {\n"
+        "    value += 1.0000000000000001e-18L;\n"
+        "    return value > 1.0L;\n"
+        "}\n"
+        "int c2fbLongDoubleDivision(long double value) {\n"
+        "    return (value / 3.0L) > (value / 4.0L);\n"
+        "}\n"
+        "long double c2fbLongDoubleReturn(long double value) {\n"
+        "    return value + 0.5L;\n"
+        "}\n"
+        "long double c2fbLongDoubleExternal(long double value);\n"
+        "int c2fbLongDoubleExternalResult(long double value) {\n"
+        "    return c2fbLongDoubleExternal(value) > value;\n"
+        "}\n"
+        "long double c2fbLongDoubleExternalArgument(long double value) {\n"
+        "    return c2fbLongDoubleExternal(value + 0.5L);\n"
+        "}\n"
+    )
+    support_source = work / "generic-body-longdouble-support.c"
+    support_source.write_text(
+        "long double c2fbLongDoubleExternal(long double value) {\n"
+        "    return value + 0.5L;\n"
+        "}\n"
+        "extern long double c2fbLongDoubleReturn(long double value);\n"
+        "int c2fbLongDoubleReturnPrecisionCheck(void) {\n"
+        "    return c2fbLongDoubleReturn(1.0L) > 1.0L;\n"
+        "}\n"
+    )
+    support_object = work / "generic-body-longdouble-support.o"
+    run(cc + ["-std=c99", "-O2", "-fPIC", "-c", str(support_source),
+              "-o", str(support_object)])
+    candidate = work / "generic-body-longdouble.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), *cc,
+    ])
+    assert "translated 11 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert '#include once "crt/longdouble.bi"' in generated, generated
+    assert "CLongDoubleFromStringValue" in generated, generated
+    assert 'As CLongDouble' in generated, generated
+    assert 'Alias "c2fbLongDoubleExternal"' in generated, generated
+
+    reference_path = work / "generic-body-longdouble-reference.so"
+    run(cc + ["-std=c99", "-O2", "-shared", "-fPIC", str(source),
+              str(support_source),
+              "-lm", "-o", str(reference_path)])
+    reference = ctypes.CDLL(str(reference_path))
+    for backend, flags in (
+        ("native", []), ("gcc", ["-gen", "gcc"]),
+        ("llvm", ["-gen", "llvm"]),
+    ):
+        converted_path = work / f"generic-body-longdouble-{backend}.so"
+        run(fbc + flags + ["-w", "all", "-dll", str(candidate),
+                           str(support_object),
+                           "-x", str(converted_path)])
+        converted = ctypes.CDLL(str(converted_path))
+        for name in (
+            "c2fbLongDoubleLiteralPrecision",
+            "c2fbLongDoubleIntegerPrecision",
+            "c2fbLongDoubleUnsignedPrecision",
+            "c2fbLongDoubleIntegerInitializer",
+            "c2fbLongDoubleTruncate",
+            "c2fbLongDoubleReturnPrecisionCheck",
+        ):
+            c_function = getattr(reference, name)
+            fb_function = getattr(converted, name)
+            c_function.restype = fb_function.restype = ctypes.c_int32
+            expected = c_function()
+            actual = fb_function()
+            assert actual == expected, f"{name}: C={expected}, FreeBASIC={actual}"
+        for name in (
+            "c2fbLongDoubleArgument", "c2fbLongDoubleCompound",
+            "c2fbLongDoubleDivision",
+        ):
+            c_function = getattr(reference, name)
+            fb_function = getattr(converted, name)
+            for function in (c_function, fb_function):
+                function.argtypes = [ctypes.c_longdouble]
+                function.restype = ctypes.c_int32
+            for number in (-1.0, 0.0, 1.0, 1e16):
+                expected = c_function(ctypes.c_longdouble(number))
+                actual = fb_function(ctypes.c_longdouble(number))
+                assert actual == expected, (
+                    f"{name}({number}): C={expected}, FreeBASIC={actual}"
+                )
+        for name in (
+            "c2fbLongDoubleReturn", "c2fbLongDoubleExternalArgument",
+        ):
+            c_function = getattr(reference, name)
+            fb_function = getattr(converted, name)
+            for function in (c_function, fb_function):
+                function.argtypes = [ctypes.c_longdouble]
+                function.restype = ctypes.c_longdouble
+            for number in (-1.0, 0.0, 1.0, 1e16):
+                expected = c_function(ctypes.c_longdouble(number))
+                actual = fb_function(ctypes.c_longdouble(number))
+                assert actual == expected, (
+                    f"{name}({number}): C={expected}, FreeBASIC={actual}"
+                )
+        c_function = reference.c2fbLongDoubleExternalResult
+        fb_function = converted.c2fbLongDoubleExternalResult
+        for function in (c_function, fb_function):
+            function.argtypes = [ctypes.c_longdouble]
+            function.restype = ctypes.c_int32
+        for number in (-1.0, 0.0, 1.0, 1e16):
+            expected = c_function(ctypes.c_longdouble(number))
+            actual = fb_function(ctypes.c_longdouble(number))
+            assert actual == expected, (
+                f"c2fbLongDoubleExternalResult({number}): "
+                f"C={expected}, FreeBASIC={actual}"
+            )
+
+
 def check_generic_body_tree_catalog_field_growth(converter, work):
     # The project-wide layout catalog spans declaration-sized source batches.
     source_directory = work / "generic-body-tree-catalog-field-growth-source"
@@ -1439,6 +1644,105 @@ def check_compile_commands_workflow(converter, fbc, cc, work):
         run(fbc + ["-w", "all", str(direct_wrapper), "-x", str(direct_executable)],
             cwd=direct_output)
         run([str(direct_executable)], cwd=direct_output)
+
+
+def check_compile_commands_source_index_closure(converter, fbc, cc, work):
+    # Bulk compile-database options must reach the source-unit binding scan.
+    project = work / "compile-commands-source-index-closure"
+    source = project / "src/closure.c"
+    bindings = project / "fb-source"
+    (bindings / "helpers").mkdir(parents=True)
+    source.parent.mkdir(parents=True)
+    (bindings / "api.bi").write_text(
+        '#include once "helpers/helper.bi"\n'
+    )
+    (bindings / "helpers/helper.bi").write_text(
+        'Declare Function moduleHelper CDecl Alias "moduleHelper" '
+        "(ByVal value As Integer) As Integer\n"
+    )
+    (bindings / "helpers/helper.bas").write_text(
+        '#include once "helper.bi"\n'
+        'Function moduleHelper CDecl Alias "moduleHelper" '
+        "(ByVal value As Integer) As Integer\n"
+        "    Return value + 1\n"
+        "End Function\n"
+    )
+    source.write_text(
+        "#ifndef C2FB_EXTRA\n"
+        "#define C2FB_EXTRA 0\n"
+        "#endif\n"
+        "int moduleHelper(int value);\n"
+        "int c2fbCompileDatabaseClosure(int value) {\n"
+        "    return moduleHelper(value) + value + C2FB_EXTRA;\n"
+        "}\n"
+    )
+    build_directory = project / "build"
+    build_directory.mkdir()
+    database = build_directory / "compile_commands.json"
+    database.write_text(json.dumps([{
+        "directory": str(project.resolve()),
+        "file": "src/closure.c",
+        "arguments": [
+            *cc, "-std=c99", "-c", "src/closure.c", "-o", "closure.o",
+        ],
+    }]))
+    output_directory = project / "candidates"
+    tool = Path(__file__).resolve().parents[1] / "c2fb_compile_commands.py"
+    summary = run([
+        sys.executable, str(tool), str(database), str(output_directory),
+        "--converter", str(Path(converter).resolve()), "--source-unit-context",
+        "--c2fb-option=--fb-source-directory=" + str(bindings.resolve()),
+        "--c2fb-option=--fb-source-pattern=api.bi",
+        "--c2fb-option=--fb-source-include-closure",
+        "--body-compiler-option=-DC2FB_EXTRA=1",
+    ])
+    assert "published 1 candidates" in summary, summary
+    with (output_directory / "compile-command-map.csv").open(
+        encoding="utf-8", newline=""
+    ) as map_file:
+        row = next(csv.DictReader(map_file))
+    assert json.loads(row["BodyCompilerOptions"]) == ["-DC2FB_EXTRA=1"], row
+    candidate = next(output_directory.glob("*_candidates.bas"))
+    wrapper = output_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "helpers/helper.bas"\n'
+        f'#include once "{candidate.name}"\n'
+        "If c2fbCompileDatabaseClosure(41) <> 84 Then End 1\n"
+    )
+    runtime_include = Path(fbc[0]).resolve().parent.parent / "inc"
+    include_options = ["-i", str(runtime_include)] if runtime_include.is_dir() else []
+    executable = output_directory / "check"
+    run(fbc + ["-w", "all", *include_options, "-i", str(bindings),
+               str(wrapper), "-x", str(executable)], cwd=output_directory)
+    run([str(executable)], cwd=output_directory)
+
+    direct_options = subprocess.run([
+        sys.executable, str(tool), str(database),
+        str(project / "direct-candidates"), "--converter",
+        str(Path(converter).resolve()),
+        "--c2fb-option=--fb-source-pattern=api.bi",
+    ], capture_output=True, text=True)
+    assert direct_options.returncode == 2, direct_options.stderr
+    assert "require --source-unit-context" in direct_options.stderr, \
+        direct_options.stderr
+
+    outside_binding = project / "outside.bi"
+    outside_binding.write_text("Declare Sub escapedBinding()\n")
+    (bindings / "escaped.bi").symlink_to(outside_binding)
+    escaped_output = project / "escaped-candidates"
+    escaped_link = subprocess.run([
+        sys.executable, str(tool), str(database), str(escaped_output),
+        "--converter", str(Path(converter).resolve()),
+        "--source-unit-context",
+        "--c2fb-option=--fb-source-directory=" + str(bindings.resolve()),
+        "--c2fb-option=--fb-source-pattern=escaped.bi",
+    ], capture_output=True, text=True)
+    assert escaped_link.returncode == 1, escaped_link.stdout + escaped_link.stderr
+    assert "did not match any indexed .bas or .bi files" in escaped_link.stdout, \
+        escaped_link.stdout
+    assert "no staged candidates were published" in escaped_link.stderr, \
+        escaped_link.stderr
+    assert not list(escaped_output.glob("*_candidates.bas")), escaped_output
 
 
 def check_source_unit_pair_publication_rollback(converter, cc, work):
@@ -3432,6 +3736,63 @@ def check_generic_body_callback_pointer_record(converter, fbc, cc, work):
         )
 
 
+def check_generic_body_nested_callback_alias_dependency(converter, fbc, cc, work):
+    # Callback aliases referenced from another callback signature must be emitted too.
+    source_directory = work / "generic-body-nested-callback-alias-dependency"
+    source_directory.mkdir(parents=True)
+    bindings = source_directory / "bindings"
+    bindings.mkdir(parents=True)
+    (bindings / "callbacks.bi").write_text(
+        "Type c2fb_BLENDER As Function CDecl("
+        "ByVal arg0 As ULong, ByVal arg1 As ULong, "
+        "ByVal arg2 As Any Ptr) As ULong\n"
+    )
+    source = source_directory / "callback_record.c"
+    source.write_text(
+        "typedef unsigned int BLENDER(unsigned int, unsigned int, void *);\n"
+        "typedef void PUTTER(unsigned char *, unsigned char *, int, int, int, "
+        "int, int, BLENDER *, void *);\n"
+        "struct Context { PUTTER **putter[1]; int flags; };\n"
+        "int c2fbReadNestedCallbackFlags(const struct Context *context) {\n"
+        "    return context->flags;\n"
+        "}\n"
+    )
+    candidate = source_directory / "callback_record_candidates.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source), str(candidate),
+        cc[0], *cc[1:], "--fb-source-directory=" + str(bindings),
+    ])
+    assert "translated 1 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    nested_callback = re.search(
+        r"(?m)^Type (c2fb_callback_\d+) As Sub CDecl\([^\r\n]*"
+        r"ByVal arg7 As c2fb_BLENDER, ByVal arg8 As Any Ptr\)$",
+        generated,
+    )
+    assert nested_callback is not None, generated
+    assert re.search(
+        r"(?m)^Type c2fb_BLENDER As Function CDecl\(", generated
+    ), generated
+    record = re.search(
+        r"(?ms)^Private Type (c2fb_source_record_\d+)\s*\n(.*?)^End Type$",
+        generated,
+    )
+    assert record is not None, generated
+    assert nested_callback.group(1) in record.group(2), record.group(2)
+
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        f'#include once "{candidate.name}"\n'
+        f"Dim context As {record.group(1)}\n"
+        "context.flags = 37\n"
+        "If c2fbReadNestedCallbackFlags(@context) <> 37 Then End 1\n"
+    )
+    executable = source_directory / "check"
+    run(fbc + ["-w", "all", "-i", str(bindings), str(wrapper), "-x",
+               str(executable)], cwd=source_directory)
+    run([str(executable)], cwd=source_directory)
+
+
 def check_generic_body_noreturn_function_specifier(converter, fbc, work):
     # _Noreturn is a function specifier, not part of its C return type.
     source_directory = work / "generic-body-noreturn-function-specifier"
@@ -4219,6 +4580,111 @@ def check_generic_body_source_unit_local_types(converter, fbc, cc, work):
                str(source_directory / "check.o")], cwd=source_directory)
 
 
+def check_generic_body_source_unit_binding_closure(converter, fbc, cc, work):
+    # A filtered source index must retain transitive includes and the BAS owner
+    # of an included interface without exposing unrelated binding modules.
+    root = work / "generic-body-source-unit-binding-closure"
+    source_directory = root / "c-source"
+    bindings = root / "fb-source"
+    (bindings / "helpers").mkdir(parents=True)
+    source = source_directory / "caller.c"
+    source_directory.mkdir()
+    (bindings / "api.bi").write_text(
+        '#include once "helpers/helper.bi"\n'
+        '#include once "detached.bi"\n'
+    )
+    (bindings / "helpers/helper.bi").write_text(
+        'Declare Function moduleHelper CDecl Alias "moduleHelper" '
+        "(ByVal value As Integer) As Integer\n"
+    )
+    (bindings / "helpers/helper.bas").write_text(
+        '#include once "helper.bi"\n'
+        'Function moduleHelper CDecl Alias "moduleHelper" '
+        "(ByVal value As Integer) As Integer\n"
+        "    Return value + 1\n"
+        "End Function\n"
+    )
+    (bindings / "detached.bi").write_text(
+        'Declare Function detachedHelper CDecl Alias "detachedHelper" '
+        "(ByVal value As Integer) As Integer\n"
+    )
+    (bindings / "detached.bas").write_text(
+        'Function detachedHelper CDecl Alias "detachedHelper" '
+        "(ByVal value As Integer) As Integer\n"
+        "    Return value + 2\n"
+        "End Function\n"
+    )
+    (bindings / "unused.bas").write_text(
+        "Private Sub unrelatedBinding()\nEnd Sub\n"
+    )
+    source.write_text(
+        "int moduleHelper(int value);\n"
+        "int c2fbSourceUnitCall(int value) { return moduleHelper(value); }\n"
+    )
+
+    candidate = root / "caller_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source), str(candidate),
+        "--converter", converter, "--compiler", cc[0],
+        "--fb-source-directory", str(bindings),
+        "--fb-source-pattern=api.bi", "--fb-source-include-closure",
+    ])
+    assert "indexed 1 selected and 3 included FreeBASIC source files" in summary, summary
+    generated = candidate.read_text()
+    assert "Function c2fbSourceUnitCall" in generated, generated
+    assert '#include once "caller_candidates_types.bi"' in generated, generated
+
+    wrapper = root / "check.bas"
+    wrapper.write_text(
+        '#include once "helpers/helper.bas"\n'
+        '#include once "caller_candidates.bas"\n'
+        "If c2fbSourceUnitCall(41) <> 42 Then End 1\n"
+    )
+    executable = root / "check"
+    runtime_include = Path(fbc[0]).resolve().parent.parent / "inc"
+    include_options = ["-i", str(runtime_include)] if runtime_include.is_dir() else []
+    run(fbc + ["-w", "all", *include_options, "-i", str(bindings),
+               str(wrapper), "-x", str(executable)], cwd=root)
+    run([str(executable)], cwd=root)
+
+    for index, invalid_glob in enumerate(("../*", "C:/outside.bi")):
+        invalid_pattern = subprocess.run([
+            sys.executable, str(source_unit_tool), str(source),
+            str(root / f"invalid_candidates_{index}.bas"), "--converter", converter,
+            "--fb-source-directory", str(bindings),
+            "--fb-source-pattern=" + invalid_glob,
+        ], capture_output=True, text=True)
+        assert invalid_pattern.returncode == 2, invalid_pattern.stderr
+        assert "must be a non-empty path relative" in invalid_pattern.stderr, \
+            invalid_pattern.stderr
+
+    invalid_body_option = subprocess.run([
+        sys.executable, str(source_unit_tool), str(source),
+        str(root / "invalid_body_option.bas"), "--converter", converter,
+        "--fb-source-directory", str(bindings),
+        "--body-option=--fb-source-include-closure",
+    ], capture_output=True, text=True)
+    assert invalid_body_option.returncode == 2, invalid_body_option.stderr
+    assert "is managed by c2fb_source_unit.py" in invalid_body_option.stderr, \
+        invalid_body_option.stderr
+
+    source_unit_spec = importlib.util.spec_from_file_location(
+        "c2fb_source_unit_limit_test", source_unit_tool
+    )
+    source_unit_module = importlib.util.module_from_spec(source_unit_spec)
+    source_unit_spec.loader.exec_module(source_unit_module)
+    source_unit_module.MAX_INDEXED_BODY_SOURCE_FILES = 3
+    try:
+        source_unit_module.collect_binding_sources(
+            bindings, True, ("api.bi",), include_closure=True
+        )
+    except ValueError as error:
+        assert "source limit" in str(error), error
+    else:
+        raise AssertionError("FreeBASIC include closure exceeded its source limit")
+
+
 def check_generic_body_source_unit_preprocessed_goto(converter, fbc, cc, work):
     # Source-unit preprocessing selects a C branch before lowering labels and goto.
     source_directory = work / "generic-body-source-unit-preprocessed-goto"
@@ -4860,6 +5326,59 @@ def check_generic_body_source_unit_included_header_types(
         )
 
 
+def check_generic_body_source_unit_private_header_helper(
+    converter, fbc, cc, work
+):
+    # C static inline helpers need a private prototype that matches their body.
+    source_directory = work / "generic-body-source-unit-private-header-helper"
+    source_directory.mkdir()
+    (source_directory / "helper.h").write_text(
+        "static inline int c2fbHeaderHelper(int value) { return value + 1; }\n"
+    )
+    source = source_directory / "root.c"
+    source.write_text(
+        '#include "helper.h"\n'
+        "int c2fbHeaderRoot(int value) {\n"
+        "    return c2fbHeaderHelper(value) + 2;\n"
+        "}\n"
+    )
+    candidate = source_directory / "root_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source), str(candidate),
+        "--converter", converter, "--compiler", cc[0],
+        "--include-header-types",
+        "--body-option=--include-header-inline-bodies",
+        f"--header-compiler-option=-I{source_directory}",
+        f"--body-compiler-option=-I{source_directory}",
+    ])
+    assert "translated 2 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert (
+        "Private Declare Function c2fbHeaderHelper CDecl "
+        in generated
+    ), generated
+    assert "Private Function c2fbHeaderHelper CDecl " in generated
+    assert not any(
+        line.startswith("Declare Function c2fbHeaderHelper CDecl ")
+        for line in generated.splitlines()
+    ), generated
+
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "root_candidates.bas"\n'
+        "If c2fbHeaderRoot(7) <> 10 Then End 1\n"
+    )
+    for backend_flags in ([], ["-gen", "gcc"], ["-gen", "gas64"]):
+        executable = source_directory / (
+            "check" if not backend_flags else "check_" + backend_flags[1]
+        )
+        run(fbc + backend_flags + [
+            "-w", "all", str(wrapper), "-x", str(executable),
+        ], cwd=source_directory)
+        run([str(executable)], cwd=source_directory)
+
+
 def check_generic_body_source_unit_incomplete_external_object(
     converter, fbc, cc, work
 ):
@@ -5041,19 +5560,20 @@ def check_generic_body_source_unit_record_typedef_alias_fields(
 def check_generic_body_source_unit_type_keyword_field(
     converter, fbc, cc, work
 ):
-    # FreeBASIC permits TYPE but rejects the hard keyword fields NEW and AND.
+    # C field names must survive FreeBASIC keywords and UNICODE defines.
     source_directory = work / "generic-body-source-unit-type-keyword-field"
     source_directory.mkdir()
     source = source_directory / "type_field.c"
     source.write_text(
-        "typedef struct TypeField { int type; int new; int new_; int and; int value; } TypeField;\n"
-        "int c2fbUpdateTypeField(TypeField *field, int type, int new, int new_, int and, int value) {\n"
+        "typedef struct TypeField { int type; int new; int new_; int and; int value; int unicode; } TypeField;\n"
+        "int c2fbUpdateTypeField(TypeField *field, int type, int new, int new_, int and, int value, int unicode) {\n"
         "    field->type = type;\n"
         "    field->new = new;\n"
         "    field->new_ = new_;\n"
         "    field->and = and;\n"
         "    field->value = value;\n"
-        "    return field->type + field->new + field->new_ + field->and + field->value;\n"
+        "    field->unicode = unicode;\n"
+        "    return field->type + field->new + field->new_ + field->and + field->value + field->unicode;\n"
         "}\n"
     )
     candidate = source_directory / "type_field_candidates.bas"
@@ -5069,6 +5589,8 @@ def check_generic_body_source_unit_type_keyword_field(
     assert re.search(r"^    new_ As Long$", type_context, re.M), type_context
     assert re.search(r"^    new__ As Long$", type_context, re.M), type_context
     assert re.search(r"^    and_ As Long$", type_context, re.M), type_context
+    assert re.search(r"^    unicode_ As Long$", type_context, re.M), type_context
+    assert "unicode_" in candidate.read_text()
 
     reference_path = source_directory / "reference.so"
     run(cc + ["-std=c99", "-shared", "-fPIC", str(source),
@@ -5076,14 +5598,14 @@ def check_generic_body_source_unit_type_keyword_field(
     wrapper = source_directory / "check.bas"
     wrapper.write_text('#include once "type_field_candidates.bas"\n')
     converted_path = source_directory / "converted.so"
-    run(fbc + ["-w", "all", "-dll", str(wrapper), "-x",
-               str(converted_path)], cwd=source_directory)
+    run(fbc + ["-w", "all", "-d", "UNICODE=1", "-dll", str(wrapper),
+               "-x", str(converted_path)], cwd=source_directory)
 
     class TypeField(ctypes.Structure):
         _fields_ = [
             ("type", ctypes.c_int), ("new", ctypes.c_int),
             ("new_", ctypes.c_int), ("and", ctypes.c_int),
-            ("value", ctypes.c_int),
+            ("value", ctypes.c_int), ("unicode", ctypes.c_int),
         ]
 
     reference = ctypes.CDLL(str(reference_path))
@@ -5091,18 +5613,19 @@ def check_generic_body_source_unit_type_keyword_field(
     for library in (reference, converted):
         library.c2fbUpdateTypeField.argtypes = [
             ctypes.POINTER(TypeField), ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
         library.c2fbUpdateTypeField.restype = ctypes.c_int
-    for values in ((-7, 13, 17, 5, 29), (0, -2, 6, 7, -11), (29, 29, 3, -3, 0)):
-        reference_field = TypeField(1, 2, 3, 4, 5)
-        converted_field = TypeField(1, 2, 3, 4, 5)
+    for values in ((-7, 13, 17, 5, 29, 31), (0, -2, 6, 7, -11, 4),
+                   (29, 29, 3, -3, 0, -19)):
+        reference_field = TypeField(1, 2, 3, 4, 5, 6)
+        converted_field = TypeField(1, 2, 3, 4, 5, 6)
         reference_result = reference.c2fbUpdateTypeField(
             ctypes.byref(reference_field), *values)
         converted_result = converted.c2fbUpdateTypeField(
             ctypes.byref(converted_field), *values)
         assert reference_result == converted_result == sum(values)
-        field_names = ("type", "new", "new_", "and", "value")
+        field_names = ("type", "new", "new_", "and", "value", "unicode")
         assert [getattr(reference_field, name) for name in field_names] == \
             [getattr(converted_field, name) for name in field_names] == \
             list(values)
@@ -5796,6 +6319,176 @@ def check_generic_body_record_array_decay(converter, fbc, cc, work):
         converted.c2fbReadArrayDecay(ctypes.byref(bucket)) == 40
 
 
+def check_generic_body_array_address_to_void_pointer(
+    converter, fbc, cc, work
+):
+    # C decays &buffer to the same address as its first element for void *.
+    source_directory = work / "generic-body-array-address-to-void-pointer"
+    source_directory.mkdir()
+    source = source_directory / "array_address.c"
+    source.write_text(
+        "#include <stddef.h>\n"
+        "static int c2fbConsumeArrayAddress(void *data, size_t size) {\n"
+        "    const unsigned char *bytes = (const unsigned char *)data;\n"
+        "    return size == 4 && bytes[0] == 11 && bytes[3] == 33;\n"
+        "}\n"
+        "int c2fbPassArrayAddress(void) {\n"
+        "    unsigned char buffer[4];\n"
+        "    buffer[0] = 11; buffer[3] = 33;\n"
+        "    return c2fbConsumeArrayAddress(&buffer, sizeof(buffer));\n"
+        "}\n"
+    )
+    candidate = source_directory / "array_address_candidates.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), cc[0],
+    ])
+    assert "translated 2 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert "CPtr(Any Ptr" in generated, generated
+
+    for target, backend in (("win32", "gas"), ("win64", "gas64")):
+        assembly = source_directory / f"array_address_{target}.asm"
+        run(fbc + ["-target", target, "-gen", backend, "-r", "-i",
+                   str(source_directory), str(candidate), "-o", str(assembly)],
+            cwd=source_directory)
+
+    reference_path = source_directory / "reference.so"
+    run(cc + ["-std=c99", "-shared", "-fPIC", str(source),
+              "-o", str(reference_path)], cwd=source_directory)
+    reference = ctypes.CDLL(str(reference_path))
+    reference.c2fbPassArrayAddress.restype = ctypes.c_int
+    for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
+        converted_path = source_directory / f"converted-{backend}.so"
+        wrapper = source_directory / f"check-{backend}.bas"
+        wrapper.write_text('#include once "array_address_candidates.bas"\n')
+        run(fbc + flags + ["-w", "all", "-dll", str(wrapper), "-x",
+                           str(converted_path)], cwd=source_directory)
+        converted = ctypes.CDLL(str(converted_path))
+        converted.c2fbPassArrayAddress.restype = ctypes.c_int
+        assert (
+            reference.c2fbPassArrayAddress() ==
+            converted.c2fbPassArrayAddress() == 1
+        )
+
+
+def check_generic_body_wide_character_static_initializer(
+    converter, fbc, cc, work
+):
+    # ASCII wide character constants retain their numeric value in static data.
+    source_directory = work / "generic-body-wide-character-static-initializer"
+    source_directory.mkdir()
+    source = source_directory / "wide_chars.c"
+    source.write_text(
+        "#define _LC(c) L ## c\n"
+        "typedef unsigned int FB_WCHAR;\n"
+        "static FB_WCHAR wide_chars[4] = {_LC('0'), _LC('A'), _LC('\\0'), _LC('\\n')};\n"
+        "int c2fbWideCharAt(int index) { return wide_chars[index]; }\n"
+    )
+    candidate = source_directory / "wide_chars_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source), str(candidate),
+        "--converter", converter, "--compiler", cc[0],
+    ])
+    assert "translated 1 simple functions; skipped 0" in summary, summary
+    type_context = candidate.with_name(
+        candidate.stem + "_types.bi").read_text()
+    assert "= {48, 65, 0, 10}" in type_context, type_context
+
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "wide_chars_candidates.bas"\n'
+        "If c2fbWideCharAt(0) <> 48 Then End 1\n"
+        "If c2fbWideCharAt(1) <> 65 Then End 2\n"
+        "If c2fbWideCharAt(2) <> 0 Then End 3\n"
+        "If c2fbWideCharAt(3) <> 10 Then End 4\n"
+    )
+    for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
+        executable = source_directory / f"check-{backend}"
+        run(fbc + flags + ["-w", "all", str(wrapper), "-x",
+                           str(executable)], cwd=source_directory)
+        run([str(executable)], cwd=source_directory)
+
+
+def check_generic_body_setjmp_array_typedef_field(
+    converter, fbc, cc, work
+):
+    # C array typedef fields decay even when their FreeBASIC layout is an opaque UDT.
+    source_directory = work / "generic-body-setjmp-array-typedef-field"
+    source_directory.mkdir()
+    source = source_directory / "jmp_buf_field.c"
+    source.write_text(chr(10).join([
+        "#include <setjmp.h>",
+        "struct C2fbJmpOwner { jmp_buf buffer; };",
+        "int c2fbJmpBufFieldCall(struct C2fbJmpOwner *owner) {",
+        "    longjmp(owner->buffer, 1);",
+        "    return 2;",
+        "}",
+        "void *c2fbJmpBufFieldAddress(struct C2fbJmpOwner *owner) {",
+        "    return &owner->buffer;",
+        "}",
+    ]) + chr(10))
+    candidate = source_directory / "jmp_buf_field_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source), str(candidate),
+        "--converter", converter, "--compiler", cc[0],
+        "--header-option=--fb-include=crt/setjmp.bi",
+    ])
+    assert "translated 2 simple functions; skipped 0" in summary, summary
+    type_context = candidate.with_name(
+        candidate.stem + "_types.bi").read_text()
+    assert "buffer As jmp_buf" in type_context, type_context
+    generated = candidate.read_text()
+    assert "CPtr(c2fb___jmp_buf_tag Ptr, @(" in generated, generated
+    assert "->buffer))" in generated, generated
+    assert "CPtr(Any Ptr, @(" in generated, generated
+
+    object_path = source_directory / "jmp_buf_field_candidates.o"
+    run(fbc + ["-w", "all", "-c", str(candidate), "-o", str(object_path),
+               "-i", str(source_directory)], cwd=source_directory)
+
+
+def check_generic_body_fixed_array_member_offset(
+    converter, fbc, cc, work, fb_directory
+):
+    # OffsetOf names element zero when FreeBASIC represents a fixed C array.
+    source_directory = work / "generic-body-fixed-array-member-offset"
+    source_directory.mkdir()
+    source = source_directory / "array_offset.c"
+    source.write_text(
+        "struct SrcArrayRecord { int prefix; unsigned char values[1]; };\n"
+        "unsigned long long c2fbFixedArrayMemberOffset(void) {\n"
+        "    return __builtin_offsetof(struct SrcArrayRecord, values);\n"
+        "}\n"
+    )
+    candidate = source_directory / "array_offset_candidates.bas"
+    summary = run([
+        converter, "translate-simple", str(source), str(candidate),
+        str(fb_directory),
+    ])
+    assert "translated 1 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert "values(0)" in generated, generated
+
+    reference_path = source_directory / "reference.so"
+    run(cc + ["-std=c99", "-shared", "-fPIC", str(source),
+              "-o", str(reference_path)], cwd=source_directory)
+    converted_path = source_directory / "converted.so"
+    run(fbc + ["-w", "all", "-d", "SQLITE_THREADSAFE=1", "-i",
+               str(fb_directory), "-dll", str(candidate), "-x",
+               str(converted_path)], cwd=source_directory)
+    reference = ctypes.CDLL(str(reference_path))
+    converted = ctypes.CDLL(str(converted_path))
+    reference.c2fbFixedArrayMemberOffset.restype = ctypes.c_ulonglong
+    converted.c2fbFixedArrayMemberOffset.restype = ctypes.c_ulonglong
+    assert (
+        reference.c2fbFixedArrayMemberOffset() ==
+        converted.c2fbFixedArrayMemberOffset()
+    )
+
+
 def check_generic_body_source_unit_enum_static_initializer_dependency(
     converter, fbc, cc, work
 ):
@@ -5917,6 +6610,13 @@ def check_generic_body_source_tree_local_types(converter, fbc, work):
         "--compiler", "cc", "--unit-manifest", str(manifest),
     ])
     assert "processed 2 C files; failed 0" in parallel_summary, parallel_summary
+    assert "totals: 2 translated simple functions; 0 unsupported or duplicate " \
+        "candidates skipped" in parallel_summary, parallel_summary
+    per_unit_counts = re.findall(
+        r"translated (\d+) simple functions; skipped (\d+)",
+        parallel_summary,
+    )
+    assert len(per_unit_counts) == 2, parallel_summary
     assert "jobs 2" in parallel_summary, parallel_summary
     for relative_name in (
         "first_candidates.bas",
@@ -6013,6 +6713,174 @@ def check_generic_body_source_tree_local_types(converter, fbc, work):
     assert invalid_jobs.returncode != 0
     assert "--jobs must be between 1 and 32" in invalid_jobs.stderr
     assert not invalid_jobs_directory.exists()
+
+
+def check_generic_body_source_tree_excludes_procedure(
+    converter, fbc, cc, work
+):
+    # A per-unit profile may leave an ABI helper in C while porting its peers.
+    root = work / "generic-body-source-tree-excludes-procedure"
+    source_directory = root / "sources"
+    source_directory.mkdir(parents=True)
+    source = source_directory / "port.c"
+    source.write_text(chr(10).join([
+        "int c2fbPortedProcedure(void) { return 17; }",
+        "int c2fbRuntimeBoundary(void) { return 23; }",
+    ]) + chr(10))
+    manifest = root / "unit-options.json"
+    manifest.write_text(json.dumps({
+        "version": 1,
+        "profiles": [{
+            "pattern": "port.c",
+            "body_options": ["--exclude-proc=c2fbRuntimeBoundary"],
+        }],
+    }))
+    output = root / "candidates"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source_directory),
+        str(output), "--tree", "--jobs=2", "--source-pattern=port.c",
+        "--converter", converter, "--compiler", cc[0],
+        "--unit-manifest", str(manifest),
+    ])
+    assert "processed 1 C files; failed 0" in summary, summary
+    assert (
+        "totals: 1 translated simple functions; 1 unsupported or duplicate "
+        "candidates skipped" in summary
+    ), summary
+    candidate = output / "port_candidates.bas"
+    generated = candidate.read_text()
+    assert "Function c2fbPortedProcedure" in generated, generated
+    assert "Function c2fbRuntimeBoundary" not in generated, generated
+    assert "excluded by --exclude-proc" in generated, generated
+    object_path = output / "port_candidates.o"
+    run(fbc + ["-w", "all", "-c", str(candidate), "-o", str(object_path),
+               "-i", str(output)], cwd=output)
+
+
+def check_generic_body_source_tree_binding_profiles(converter, fbc, work):
+    # Each C unit can scan only its own bindings and their transitive owners.
+    root = work / "generic-body-source-tree-binding-profiles"
+    source_directory = root / "c-source"
+    bindings = root / "fb-source"
+    (source_directory / "nested").mkdir(parents=True)
+    (bindings / "api").mkdir(parents=True)
+    (source_directory / "first.c").write_text(
+        "int moduleFirst(int value);\n"
+        "int c2fbTreeFirst(int value) { return moduleFirst(value); }\n"
+    )
+    (source_directory / "nested/second.c").write_text(
+        "int moduleSecond(int value);\n"
+        "int c2fbTreeSecond(int value) { return moduleSecond(value); }\n"
+    )
+    (bindings / "api/first.bi").write_text(
+        '#include once "helper.bi"\n'
+        'Declare Function moduleFirst CDecl Alias "moduleFirst" '
+        "(ByVal value As Integer) As Integer\n"
+    )
+    (bindings / "api/first.bas").write_text(
+        '#include once "first.bi"\n'
+        'Function moduleFirst CDecl Alias "moduleFirst" '
+        "(ByVal value As Integer) As Integer\n"
+        "    Return value + 1\n"
+        "End Function\n"
+    )
+    (bindings / "api/second.bi").write_text(
+        '#include once "helper.bi"\n'
+        'Declare Function moduleSecond CDecl Alias "moduleSecond" '
+        "(ByVal value As Integer) As Integer\n"
+    )
+    (bindings / "api/second.bas").write_text(
+        '#include once "second.bi"\n'
+        'Function moduleSecond CDecl Alias "moduleSecond" '
+        "(ByVal value As Integer) As Integer\n"
+        "    Return value + 2\n"
+        "End Function\n"
+    )
+    (bindings / "api/helper.bi").write_text("")
+
+    manifest = root / "unit-options.json"
+    manifest.write_text(json.dumps({
+        "version": 1,
+        "profiles": [
+            {
+                "pattern": "first.c",
+                "fb_source_patterns": ["api/first.bi"],
+                "fb_source_recursive": True,
+                "fb_source_include_closure": True,
+            },
+            {
+                "pattern": "nested/second.c",
+                "fb_source_patterns": ["api/second.bi"],
+                "fb_source_recursive": True,
+                "fb_source_include_closure": True,
+            },
+        ],
+    }))
+    output_directory = root / "candidates"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source_directory),
+        str(output_directory), "--tree", "--jobs=2", "--converter", converter,
+        "--compiler", "cc", "--fb-source-directory", str(bindings),
+        "--unit-manifest", str(manifest),
+    ])
+    assert "processed 2 C files; failed 0" in summary, summary
+    assert summary.count(
+        "indexed 1 selected and 2 included FreeBASIC source files"
+    ) == 2, summary
+
+    runtime_include = Path(fbc[0]).resolve().parent.parent / "inc"
+    include_options = ["-i", str(runtime_include)] if runtime_include.is_dir() else []
+    for module_name, function_name, expected in (
+        ("first", "c2fbTreeFirst", 42),
+        ("second", "c2fbTreeSecond", 43),
+    ):
+        candidate = output_directory / (
+            "nested/second_candidates.bas"
+            if module_name == "second" else "first_candidates.bas"
+        )
+        wrapper = output_directory / f"{module_name}_check.bas"
+        wrapper.write_text(
+            f'#include once "api/{module_name}.bas"\n'
+            f'#include once "{candidate.relative_to(output_directory).as_posix()}"\n'
+            f"If {function_name}(41) <> {expected} Then End 1\n"
+        )
+        executable = output_directory / f"{module_name}_check"
+        run(fbc + ["-w", "all", *include_options, "-i", str(bindings),
+                   str(wrapper), "-x", str(executable)], cwd=output_directory)
+        run([str(executable)], cwd=output_directory)
+
+    no_bindings_output = root / "missing-binding-directory-output"
+    no_bindings = subprocess.run([
+        sys.executable, str(source_unit_tool), str(source_directory),
+        str(no_bindings_output), "--tree", "--converter", converter,
+        "--compiler", "cc", "--unit-manifest", str(manifest),
+    ], capture_output=True, text=True)
+    assert no_bindings.returncode == 2, no_bindings.stderr
+    assert "profile options require --fb-source-directory" in no_bindings.stderr, \
+        no_bindings.stderr
+    assert not no_bindings_output.exists()
+
+    invalid_manifest = root / "invalid-unit-options.json"
+    invalid_manifest.write_text(json.dumps({
+        "version": 1,
+        "profiles": [{
+            "pattern": "first.c",
+            "fb_source_patterns": ["../outside.bi"],
+        }],
+    }))
+    invalid_output = root / "invalid-profile-output"
+    invalid_profile = subprocess.run([
+        sys.executable, str(source_unit_tool), str(source_directory),
+        str(invalid_output), "--tree", "--converter", converter,
+        "--compiler", "cc", "--fb-source-directory", str(bindings),
+        "--unit-manifest", str(invalid_manifest),
+    ], capture_output=True, text=True)
+    assert invalid_profile.returncode == 2, invalid_profile.stderr
+    assert "must be a non-empty path relative" in invalid_profile.stderr, \
+        invalid_profile.stderr
+    assert not invalid_output.exists()
 
 
 def check_generic_body_unused_local_record_definition(converter, fbc, work):
@@ -6344,6 +7212,7 @@ def check_generic_body_file_scope_records(converter, fbc, cc, work):
 
 def check_generic_body_keep_unresolved_helper_declaration(converter, fbc, work):
     # Kept callers need a declaration when their source-local helper is skipped.
+    # The helper is static, so it has no external C symbol to place in an Alias.
     source_directory = work / "generic-body-kept-helper-declaration"
     source_directory.mkdir()
     source = source_directory / "kept_helper.c"
@@ -6363,13 +7232,37 @@ def check_generic_body_keep_unresolved_helper_declaration(converter, fbc, work):
     ])
     assert "translated 1 simple functions; skipped 1" in summary, summary
     generated = candidate.read_text()
+    assert 'Declare Function sourceHelper CDecl (' in generated, generated
     assert 'Declare Function sourceHelper CDecl Alias "sourceHelper"' \
-        in generated, generated
+        not in generated, generated
     assert 'Function sourceCaller CDecl Alias "sourceCaller"' \
         in generated, generated
     assert "Private Function sourceHelper" not in generated, generated
     run(fbc + ["-w", "all", "-c", str(candidate), "-o",
                str(source_directory / "kept-helper.o")])
+
+    external_source = source_directory / "external_kept_helper.c"
+    external_source.write_text(
+        "int sourceExternalHelper(int value) {\n"
+        '    __asm__("nop");\n'
+        "    return value;\n"
+        "}\n"
+        "int sourceExternalCaller(int value) {\n"
+        "    return sourceExternalHelper(value);\n"
+        "}\n"
+    )
+    external_candidate = source_directory / "external_kept_helper_candidates.bas"
+    external_summary = run([
+        converter, "translate-simple-generic-c", str(external_source),
+        str(external_candidate), "cc", "--keep-unresolved",
+    ])
+    assert "translated 1 simple functions; skipped 1" in external_summary, \
+        external_summary
+    external_generated = external_candidate.read_text()
+    assert 'Declare Function sourceExternalHelper CDecl Alias "sourceExternalHelper"' \
+        in external_generated, external_generated
+    run(fbc + ["-w", "all", "-c", str(external_candidate), "-o",
+               str(source_directory / "external-kept-helper.o")])
 
 
 def check_generic_body_static_local_records(converter, fbc, cc, work):
@@ -9324,9 +10217,11 @@ def check_generic_header_forward_static_record_initializers(converter, fbc, work
     source_directory.mkdir()
     header = source_directory / "float_static.h"
     header.write_text(
-        "typedef struct FloatPair { float first; float second; } FloatPair;\n"
+        "typedef struct FloatPair { unsigned int byte_size; "
+        "float first; float second; } FloatPair;\n"
         "static const FloatPair values[2] = "
-        "{{1.25f, 0.5f}, {2.75f, 1.0f}};\n"
+        "{{sizeof(FloatPair), 1.25f, 0.5f}, "
+        "{sizeof(FloatPair), 2.75f, 1.0f}};\n"
     )
     binding = source_directory / "float_static.bi"
     summary = run([
@@ -9338,16 +10233,52 @@ def check_generic_header_forward_static_record_initializers(converter, fbc, work
     generated = binding.read_text()
     assert "1 module-static objects" in summary, summary
     assert "c2fb_values(0 To 1) As Const c2fb_FloatPair_ = " \
-        "{(1.25!, 0.5!), (2.75!, 1.0!)}" in generated, generated
+        "{(SizeOf(c2fb_FloatPair_), 1.25!, 0.5!), " \
+        "(SizeOf(c2fb_FloatPair_), 2.75!, 1.0!)}" in generated, generated
     assert "unsupported module-static initializer" not in generated, generated
 
     wrapper = source_directory / "check.bas"
     wrapper.write_text(
         '#include once "float_static.bi"\n'
+        "If c2fb_values(0).byte_size <> SizeOf(c2fb_FloatPair_) Then End 1\n"
+        "If c2fb_values(1).byte_size <> SizeOf(c2fb_FloatPair_) Then End 2\n"
         "If c2fb_values(0).first <> 1.25! OrElse "
         "c2fb_values(0).second <> 0.5! Then End 1\n"
         "If c2fb_values(1).first <> 2.75! OrElse "
         "c2fb_values(1).second <> 1.0! Then End 2\n"
+    )
+    executable = source_directory / "check"
+    run(fbc + ["-w", "all", str(wrapper), "-x", str(executable)],
+        cwd=source_directory)
+    run([str(executable)], cwd=source_directory)
+
+
+def check_generic_header_record_pointer_arrays(converter, fbc, work):
+    # Pointers to recursive records retain their pointee type inside arrays.
+    source_directory = work / "generic-header-record-pointer-arrays"
+    source_directory.mkdir()
+    header = source_directory / "recursive_node.h"
+    header.write_text(
+        "typedef struct RecursiveNode { int value; "
+        "struct RecursiveNode *children[2]; } RecursiveNode;\n"
+    )
+    binding = source_directory / "recursive_node.bi"
+    run([
+        converter, "generic-header", str(header), str(binding),
+        "--exclude=*", "--preserve-type-dependencies",
+        "--emit-source=*", "--forward-decl=*", "cc",
+    ])
+    generated = binding.read_text()
+    assert "children(0 To 1) As c2fb_RecursiveNode Ptr" in generated, generated
+
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "recursive_node.bi"\n'
+        "Dim parent As c2fb_RecursiveNode\n"
+        "Dim child As c2fb_RecursiveNode\n"
+        "parent.children(0) = @child\n"
+        "child.value = 17\n"
+        "If parent.children(0)->value <> 17 Then End 1\n"
     )
     executable = source_directory / "check"
     run(fbc + ["-w", "all", str(wrapper), "-x", str(executable)],
@@ -10822,6 +11753,60 @@ def check_generic_header_skips_records_with_unsupported_value_fields(
                str(source_directory / "probe.o")], cwd=source_directory)
 
 
+def check_generic_header_longdouble_bindings(converter, fbc, cc, work):
+    # Native C long-double objects and fixed C ABI declarations must use the
+    # target-sized CRT type and remain callable from generated bindings.
+    source_directory = work / "generic-header-longdouble-bindings"
+    source_directory.mkdir()
+    header = source_directory / "probe.h"
+    header.write_text(
+        "extern long double c2fb_longdouble_global;\n"
+        "long double c2fb_longdouble_sum(long double lhs, long double rhs);\n"
+    )
+    binding = source_directory / "probe.bi"
+    summary = run([
+        converter, "generic-header", str(header), str(binding), *cc,
+    ], cwd=source_directory)
+    generated = binding.read_text()
+    assert 'crt/longdouble.bi' in generated, generated
+    assert 'As CLongDouble' in generated, generated
+    assert 'Alias "c2fb_longdouble_global"' in generated, generated
+    assert 'Alias "c2fb_longdouble_sum"' in generated, generated
+    assert "unsupported declaration" not in generated, summary + generated
+
+    c_source = source_directory / "probe.c"
+    c_source.write_text(
+        '#include "probe.h"\n'
+        "long double c2fb_longdouble_global = 1.75L;\n"
+        "long double c2fb_longdouble_sum(long double lhs, long double rhs) {\n"
+        "    return lhs + rhs;\n"
+        "}\n"
+    )
+    c_object = source_directory / "probe.o"
+    run(cc + ["-Wall", "-Wextra", "-Werror", "-c", str(c_source),
+              "-o", str(c_object)], cwd=source_directory)
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "probe.bi"\n'
+        'Dim As CLongDouble leftValue = CLongDoubleFromStringValue( _\n'
+        '    StrPtr(!"1.25"))\n'
+        'Dim As CLongDouble rightValue = CLongDoubleFromStringValue( _\n'
+        '    StrPtr(!"2.5"))\n'
+        'If (c2fb_c2fb_longdouble_global = _\n'
+        '    CLongDoubleFromStringValue(StrPtr(!"1.75"))) <> -1 Then End 1\n'
+        'If (c2fb_c2fb_longdouble_sum(leftValue, rightValue) = _\n'
+        '    CLongDoubleFromStringValue(StrPtr(!"3.75"))) <> -1 Then End 2\n'
+    )
+    for backend, flags in (
+        ("default", []), ("gcc", ["-gen", "gcc"]),
+        ("llvm", ["-gen", "llvm"]),
+    ):
+        executable = source_directory / f"check-{backend}"
+        run(fbc + flags + ["-w", "all", str(wrapper), str(c_object),
+                           "-x", str(executable)], cwd=source_directory)
+        run([str(executable)], cwd=source_directory)
+
+
 def check_generic_header_int128_types(
     converter, fbc, cc, work, fbc_source_directory=None
 ):
@@ -10990,7 +11975,8 @@ def check_generic_header_int128_types(
         run(cc + ["-m32", "-no-pie", "-std=c99", "-Wall", "-Wextra", "-Werror",
                   str(gas32_body_object), str(gas32_main),
                   str(Path(fbc_source_directory) / "rtlib/math/int128.c"),
-                  "-o", str(gas32_runtime)], cwd=source_directory)
+                  str(Path(fbc_source_directory) / "rtlib/math/longdouble_ops.c"),
+                  "-lm", "-o", str(gas32_runtime)], cwd=source_directory)
         run([str(gas32_runtime)], cwd=source_directory)
 
         gcc_i386_body = source_directory / "wide_body_gcc_i386.c"
@@ -11007,7 +11993,8 @@ def check_generic_header_int128_types(
                  "-Werror=implicit-function-declaration", str(gcc_i386_body),
                  str(gas32_main),
                  str(Path(fbc_source_directory) / "rtlib/math/int128.c"),
-                 "-o", str(c_backend_runtime)], cwd=source_directory)
+                 str(Path(fbc_source_directory) / "rtlib/math/longdouble_ops.c"),
+                 "-lm", "-o", str(c_backend_runtime)], cwd=source_directory)
             run([str(c_backend_runtime)], cwd=source_directory)
 
 
@@ -11561,6 +12548,80 @@ def check_generic_body_global_definitions(converter, fbc, cc, work):
                        str(executable)], cwd=source_directory)
         for c_name in ("exported_counter", "exported_bytes", "header_tentative"):
             assert re.search(rf"^{re.escape(c_name)} [A-Z] ", symbols, re.M), symbols
+
+
+def check_generic_body_global_callback_objects(converter, fbc, cc, work):
+    # Initialized function-pointer objects are C data definitions with ABI-visible names.
+    source_directory = work / "generic-body-global-callback-objects"
+    source_directory.mkdir()
+    source = source_directory / "callbacks.c"
+    source.write_text(
+        "#include <stddef.h>\n"
+        "#include <string.h>\n"
+        "void *(*c2fb_copy_callback)(void *, const void *, size_t) = memcpy;\n"
+        "void *(*c2fb_set_callback)(void *, int, size_t) = memset;\n"
+        "void *(*c2fb_null_copy_callback)(void *, const void *, size_t) = 0;\n"
+        "int c2fb_callback_target(int value) { return value * 2 + 3; }\n"
+        "int (*c2fb_direct_callback)(int) = c2fb_callback_target;\n"
+        "int (*c2fb_null_callback)(int) = 0;\n"
+        "typedef int (*c2fb_callback_alias)(int);\n"
+        "c2fb_callback_alias c2fb_typedef_callback = c2fb_callback_target;\n"
+    )
+    probe = source_directory / "probe.c"
+    probe.write_text(
+        "#include <stddef.h>\n"
+        "extern void *(*c2fb_copy_callback)(void *, const void *, size_t);\n"
+        "extern void *(*c2fb_set_callback)(void *, int, size_t);\n"
+        "extern void *(*c2fb_null_copy_callback)(void *, const void *, size_t);\n"
+        "extern int (*c2fb_direct_callback)(int);\n"
+        "extern int (*c2fb_null_callback)(int);\n"
+        "typedef int (*c2fb_probe_callback)(int);\n"
+        "extern c2fb_probe_callback c2fb_typedef_callback;\n"
+        "int c2fb_probe_global_callback_objects(void) {\n"
+        "    const unsigned char source[3] = { 11, 22, 33 };\n"
+        "    unsigned char destination[3] = { 0, 0, 0 };\n"
+        "    void *copy_result = c2fb_copy_callback(destination, source, 3);\n"
+        "    void *set_result = c2fb_set_callback(destination + 1, 9, 2);\n"
+        "    return copy_result == destination && set_result == destination + 1 &&\n"
+        "           destination[0] == 11 && destination[1] == 9 &&\n"
+        "           destination[2] == 9 && c2fb_null_copy_callback == 0 &&\n"
+        "           c2fb_direct_callback != 0 && c2fb_null_callback == 0 &&\n"
+        "           c2fb_direct_callback(4) == 11 &&\n"
+        "           c2fb_typedef_callback(5) == 13;\n"
+        "}\n"
+    )
+    candidate = source_directory / "callbacks.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), *cc, "--include-global-definitions",
+    ])
+    assert "translated 1 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    for name in (
+        "c2fb_copy_callback", "c2fb_set_callback", "c2fb_null_copy_callback",
+        "c2fb_direct_callback", "c2fb_null_callback", "c2fb_typedef_callback",
+    ):
+        assert f'Alias "{name}"' in generated, generated
+    assert '#include once "crt/mem.bi"' in generated, generated
+    assert "ProcPtr(memcpy)" in generated and "ProcPtr(memset)" in generated
+
+    probe_object = source_directory / "probe.o"
+    run(cc + ["-Wall", "-Wextra", "-Werror", "-c", str(probe),
+              "-o", str(probe_object)], cwd=source_directory)
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "callbacks.bas"\n'
+        "Extern \"C\"\n"
+        '    Declare Function c2fb_probe_global_callback_objects Cdecl Alias '
+        '"c2fb_probe_global_callback_objects"() As Long\n'
+        "End Extern\n"
+        "If c2fb_probe_global_callback_objects() = 0 Then End 1\n"
+    )
+    for backend, flags in (("native", []), ("gcc", ["-gen", "gcc"])):
+        executable = source_directory / f"check-{backend}"
+        run(fbc + flags + ["-w", "all", str(wrapper), str(probe_object),
+                           "-x", str(executable)], cwd=source_directory)
+        run([str(executable)], cwd=source_directory)
 
 
 def check_source_unit_global_definitions_keep_static_storage_with_body(
@@ -16445,13 +17506,15 @@ def check_generic_body_static_callback_tables(converter, fbc, cc, work):
     ])
     assert "translated 4 simple functions; skipped 0" in file_summary, file_summary
     file_generated = file_candidate.read_text()
+    # FBC cannot const-qualify a procedure-pointer alias. C2FB keeps these
+    # tables private and checks C const writes while translating candidates.
     assert re.search(
-        r"Private Dim Shared \w*c2fbBuiltinCallbacks\(0 To 1\) As Const ",
+        r"Private Dim Shared \w*c2fbBuiltinCallbacks\(0 To 1\) As c2fb_callback_",
         file_generated,
     ), file_generated
     assert "{ProcPtr(c2fbBuiltinOne), ProcPtr(c2fbBuiltinTwo)}" in \
         file_generated, file_generated
-    assert "CPtr(c2fb_callback_0, 0)" in file_generated, file_generated
+    assert "{ProcPtr(c2fbBuiltinOne), 0, 0}" in file_generated, file_generated
 
     reference_path = source_directory / "file_callback_reference.so"
     run(cc + ["-std=c99", "-shared", "-fPIC", str(file_source),
@@ -16669,13 +17732,12 @@ def check_generic_body_void_typedef_callback_pointer(converter, fbc, cc, work):
 
 
 def check_sqlite_body_callback_array_preserves_known_pointer_types(
-    converter, fbc, cc, work
+    converter, fbc, cc, work, fb_source_directory
 ):
     # A callback taking an opaque SQLite record must match a typed C target.
     source_directory = work / "sqlite-body-callback-array-pointer-types"
     source_directory.mkdir()
     body_catalog = source_directory / "body-catalog"
-    fb_source_directory = Path(__file__).resolve().parents[3] / "fb_src"
     link_freebasic_standalone_interfaces(fb_source_directory, body_catalog)
 
     source = source_directory / "callback_array.c"
@@ -16705,7 +17767,7 @@ def check_sqlite_body_callback_array_preserves_known_pointer_types(
         r"Type c2fb_callback_\d+ As Function CDecl\(ByVal arg0 As sqlite3 Ptr\) As c2fb_c_int",
         generated,
     ), generated
-    assert "c2fb_global_c2fbSqliteCallbacks(0 To 0) As Const c2fb_callback_" in \
+    assert "Private Dim Shared c2fb_global_c2fbSqliteCallbacks(0 To 0) As c2fb_callback_" in \
         generated, generated
 
     reference_path = source_directory / "callback_array_reference.so"
@@ -16755,12 +17817,13 @@ def check_sqlite_body_callback_array_preserves_known_pointer_types(
     )
 
 
-def check_sqlite_body_pcache_config_snapshot(converter, fbc, cc, work):
+def check_sqlite_body_pcache_config_snapshot(
+    converter, fbc, cc, work, fb_source_directory
+):
     # C's global PCACHE2 table is read through the port's copied-table accessor.
     source_directory = work / "sqlite-body-pcache-config-snapshot"
     source_directory.mkdir()
     body_catalog = source_directory / "body-catalog"
-    fb_source_directory = Path(__file__).resolve().parents[3] / "fb_src"
     link_freebasic_standalone_interfaces(fb_source_directory, body_catalog)
 
     source = source_directory / "pcache_config.c"
@@ -19806,6 +20869,48 @@ def check_freebasic_rtlib_array_bounds(converter, fbc, cc, source_root,
                 )
 
 
+def check_freebasic_rtlib_longdouble_ops(
+    converter, fbc, cc, source_root, profile_directory, work
+):
+    # Keep the native-long-double ABI bridge in C and compile-check its peer helpers.
+    source_root = freebasic_source_root(source_root)
+    output = work / "fbc-source-rtlib-longdouble-ops"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    header_profile = profile_directory / "freebasic-linux-glibc-x86_64.rsp"
+    body_profile = profile_directory / "freebasic-linux-glibc-x86_64-body.rsp"
+    summary = run([
+        sys.executable, str(source_unit_tool),
+        str(source_root / "rtlib"), str(output), "--tree",
+        "--source-pattern=math/longdouble_ops.c",
+        "--converter", converter, "--compiler", cc[0],
+        "--unit-manifest", str(
+            profile_directory / "freebasic-rtlib-linux-x86_64-units.json"),
+        "--header-option=@" + str(header_profile),
+        "--body-option=@" + str(body_profile),
+        "--header-option=--emit-source=*fb.h",
+        "--header-option=--emit-source=*fb_*.h",
+        "--body-option=--rename-proc-prefix=c2fbRtl_",
+        "--header-compiler-option=" + f"-I{source_root / 'rtlib'}",
+        "--body-compiler-option=" + f"-I{source_root / 'rtlib'}",
+    ])
+    assert "processed 1 C files; failed 0" in summary, summary
+    assert (
+        "totals: 11 translated simple functions; 4 unsupported or duplicate "
+        "candidates skipped" in summary
+    ), summary
+    candidate = output / "math/longdouble_ops_candidates.bas"
+    generated = candidate.read_text()
+    assert (
+        "' c2fb skipped fb_LongDoubleToNative: excluded by --exclude-proc"
+        in generated
+    ), generated
+    assert "Function c2fbRtl_fb_LongDoubleToNative" not in generated, generated
+    object_path = candidate.with_suffix(".o")
+    run(fbc + ["-w", "all", "-c", str(candidate), "-o", str(object_path),
+               "-i", str(candidate.parent), "-i", str(source_root / "rtlib")],
+        cwd=candidate.parent)
+
+
 def check_freebasic_source_libraries(converter, fbc, cc, source_root,
                                      profile_directory, work):
     # Exercise real GFXLIB, RTLIB, and SFXLIB modules without writing into the
@@ -19957,7 +21062,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
     # Keep that layout context available while compiling the translated body.
     gfx_core_context = gfx_work / "gfx_core_source_context"
     gfx_core_context.mkdir()
-    (gfx_core_context / gfx_binding.name).symlink_to(gfx_binding.resolve())
+    shutil.copyfile(gfx_binding, gfx_core_context / gfx_binding.name)
     check_freebasic_gfx_source_tree(
         converter, fbc, cc, source_root, profile_directory, work,
         gfx_core_context,
@@ -19991,7 +21096,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
 
     gfx_control_context = gfx_work / "gfx_control_source_context"
     gfx_control_context.mkdir()
-    (gfx_control_context / gfx_binding.name).symlink_to(gfx_binding.resolve())
+    shutil.copyfile(gfx_binding, gfx_control_context / gfx_binding.name)
     gfx_control_candidates = gfx_work / "gfx_control_source_unit_candidates.bas"
     gfx_control_summary = run_freebasic_gfx_source_unit(
         converter, fbc, cc, source_root, "gfx_control.c", gfx_control_candidates,
@@ -20023,7 +21128,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
 
     gfx_x11_context = gfx_work / "gfx_x11_source_context"
     gfx_x11_context.mkdir()
-    (gfx_x11_context / gfx_binding.name).symlink_to(gfx_binding.resolve())
+    shutil.copyfile(gfx_binding, gfx_x11_context / gfx_binding.name)
     gfx_x11_candidates = gfx_work / "gfx_driver_x11_source_unit_candidates.bas"
     x11_fbc = list(fbc) + ["-i", str(source_root.parent / "inc")]
     # X11's Xpm declarations need Pixel from Intrinsic.bi. The C2FB source
@@ -20115,7 +21220,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
     # when later source files are scanned.
     gfx_enum_work = gfx_work / "enum-bound-candidates"
     gfx_enum_work.mkdir()
-    (gfx_enum_work / gfx_binding.name).symlink_to(gfx_binding.resolve())
+    shutil.copyfile(gfx_binding, gfx_enum_work / gfx_binding.name)
 
     gfx_mouse_candidates = gfx_work / "gfx_getmouse_candidates.bas"
     gfx_mouse_summary = run([
@@ -20181,7 +21286,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
 
     gfx_screen_context = gfx_work / "gfx_screen_source_context"
     gfx_screen_context.mkdir()
-    (gfx_screen_context / gfx_binding.name).symlink_to(gfx_binding.resolve())
+    shutil.copyfile(gfx_binding, gfx_screen_context / gfx_binding.name)
     gfx_screen_candidate = gfx_work / "gfx_screen_source_unit_candidates.bas"
     gfx_screen_summary = run([
         sys.executable, str(source_unit_tool),
@@ -21176,7 +22281,7 @@ def check_freebasic_source_libraries(converter, fbc, cc, source_root,
 
     midi_base_context = sfx_work / "midi-base-context"
     midi_base_context.mkdir()
-    (midi_base_context / "fb_sfx.bi").symlink_to(sfx_binding)
+    shutil.copyfile(sfx_binding, midi_base_context / "fb_sfx.bi")
     midi_candidates = sfx_work / "sfx_midi_fm_candidates.bas"
     midi_unit_summary = run([
         sys.executable, str(source_unit_tool),
@@ -21387,6 +22492,10 @@ def main():
         check_body_candidate_skip_summary(converter, work)
         check_generic_body_long_boolean_chains(
             converter, shlex.split(args.fbc), work)
+        check_generic_body_longdouble(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_error_nonzero_status_terminates(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_tree_catalog_field_growth(converter, work)
         check_generic_header_case_insensitive_record_fields(
             converter, shlex.split(args.fbc), work)
@@ -21408,6 +22517,8 @@ def main():
         check_fbfrog_record_layout_audit(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_compile_commands_workflow(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_compile_commands_source_index_closure(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_compile_commands_publication_rollback(work)
         check_source_unit_pair_publication_rollback(
@@ -21493,6 +22604,8 @@ def main():
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_callback_pointer_record(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_nested_callback_alias_dependency(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_noreturn_function_specifier(
             converter, shlex.split(args.fbc), work)
         check_generic_body_skips_callers_of_unconverted_static_function(
@@ -21528,6 +22641,8 @@ def main():
             converter, shlex.split(args.fbc), work)
         check_generic_body_source_unit_local_types(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_source_unit_binding_closure(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_unit_preprocessed_goto(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_unit_flexible_byte_array_access(
@@ -21545,6 +22660,8 @@ def main():
         check_generic_body_source_unit_included_typedef_dependencies(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_unit_included_header_types(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_source_unit_private_header_helper(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_unit_incomplete_external_object(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
@@ -21572,11 +22689,24 @@ def main():
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_record_array_decay(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_array_address_to_void_pointer(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_setjmp_array_typedef_field(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_wide_character_static_initializer(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_fixed_array_member_offset(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work,
+            fb_directory)
         check_generic_body_source_unit_enum_static_initializer_dependency(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_unit_shift_array_bound(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_source_tree_local_types(
+            converter, shlex.split(args.fbc), work)
+        check_generic_body_source_tree_excludes_procedure(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_source_tree_binding_profiles(
             converter, shlex.split(args.fbc), work)
         check_generic_body_unused_local_record_definition(
             converter, shlex.split(args.fbc), work)
@@ -21622,6 +22752,8 @@ def main():
             converter, shlex.split(args.fbc), work)
         check_generic_header_forward_static_record_initializers(
             converter, shlex.split(args.fbc), work)
+        check_generic_header_record_pointer_arrays(
+            converter, shlex.split(args.fbc), work)
         check_sqlite_expr_generic_type_context(
             converter, shlex.split(args.fbc), shlex.split(args.cc),
             repository, work)
@@ -21665,6 +22797,8 @@ def main():
         check_generic_header_int128_types(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work,
             args.fbc_source_directory)
+        check_generic_header_longdouble_bindings(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_header_mixed_typedef_specifiers(
             converter, shlex.split(args.fbc), work)
         check_generic_header_record_typedef_groups(
@@ -21678,6 +22812,8 @@ def main():
         check_generic_gnu_signed_types(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_global_definitions(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_global_callback_objects(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_source_unit_global_definitions_keep_static_storage_with_body(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
@@ -21850,9 +22986,11 @@ def main():
         check_generic_body_void_typedef_callback_pointer(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_sqlite_body_callback_array_preserves_known_pointer_types(
-            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work,
+            fb_directory)
         check_sqlite_body_pcache_config_snapshot(
-            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work,
+            fb_directory)
         check_generic_body_parenthesized_callback_member(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_static_unsigned_callback_objects(
@@ -21900,6 +23038,9 @@ def main():
         check_generic_header_expand_macro_calls_in_defines(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         if args.fbc_source_directory is not None:
+            check_freebasic_rtlib_longdouble_ops(
+                converter, shlex.split(args.fbc), shlex.split(args.cc),
+                args.fbc_source_directory, tool_directory / "profiles", work)
             check_freebasic_source_libraries(
                 converter, shlex.split(args.fbc), shlex.split(args.cc),
                 args.fbc_source_directory, tool_directory / "profiles", work)

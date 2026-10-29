@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "pattern": "core/gosub.c",
+      "header_options": [
+        "--fb-include=crt/setjmp.bi"
+      ]
+    },
+    {
+      "pattern": "devices/dev_com.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_cons_open.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_err_open.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_file_encod_open.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_file_open.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_lpt.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_pipe_open.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_scrn.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_scrn_init.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "devices/dev_tcp.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "drivers/linux/io_mouse.c",
+      "body_options": [
+        "--include-global-definitions"
+      ],
+      "header_options": [
+        "--emit-source=*gpm.h"
+      ]
+    },
+    {
+      "pattern": "drivers/linux/io_multikey.c",
+      "body_options": [
+        "--include-global-definitions"
+      ],
+      "header_options": [
+        "--emit-source=*termios-struct.h"
+      ]
+    },
+    {
+      "pattern": "drivers/unix/io_inkey.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "drivers/unix/io_xfocus.c",
+      "body_options": [
+        "--include-global-definitions"
+      ]
+    },
+    {
+      "pattern": "drivers/unix/scancodes_x11.c",
+      "header_options": [
+        "--type-map=KeyCode=UByte"
+      ],
+      "body_options": [
+        "--type-map=KeyCode=UByte"
+      ]
+    },
+    {
+      "pattern": "math/longdouble_ops.c",
+      "header_options": [
+        "--type-map=int64_t=LongInt",
+        "--type-map=uint64_t=ULongInt"
+      ],
+      "body_options": [
+        "--type-map=int64_t=LongInt",
+        "--type-map=uint64_t=ULongInt",
+        "--exclude-proc=fb_LongDoubleToNative"
+      ]
+    },
+    {
+      "pattern": "errors/error_frame.c",
+      "header_options": [
+        "--fb-include=crt/setjmp.bi"
+      ]
+    }
+  ]
+}

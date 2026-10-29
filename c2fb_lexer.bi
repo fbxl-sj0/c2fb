@@ -91,6 +91,67 @@ Private Sub AddToken( _
     tokenCount += 1
 End Sub
 
+Private Function ReadCDeclarationLiteralToken( _
+    ByVal declaration As String, ByRef position As Long, _
+    ByRef literalToken As String _
+) As Long
+    literalToken = ""
+    If position < 1 OrElse position > Len(declaration) Then Return 0
+    Dim literalStart As Long = position
+    Dim quotePosition As Long = 0
+    If position + 2 <= Len(declaration) AndAlso _
+       Mid(declaration, position, 2) = "u8" AndAlso _
+       (Mid(declaration, position + 2, 1) = Chr(34) OrElse _
+        Mid(declaration, position + 2, 1) = "'") Then
+        quotePosition = position + 2
+    ElseIf (Asc(declaration, position) = Asc("L") OrElse _
+            Asc(declaration, position) = Asc("u") OrElse _
+            Asc(declaration, position) = Asc("U")) AndAlso _
+           position < Len(declaration) AndAlso _
+           (Mid(declaration, position + 1, 1) = Chr(34) OrElse _
+            Mid(declaration, position + 1, 1) = "'") Then
+        quotePosition = position + 1
+    ElseIf Asc(declaration, position) = Asc(Chr(34)) OrElse _
+           Asc(declaration, position) = Asc("'") Then
+        quotePosition = position
+    Else
+        Return 0
+    End If
+
+    Dim quoteByte As Long = Asc(declaration, quotePosition)
+    position = quotePosition + 1
+    Dim closedLiteral As Long = 0
+    While position <= Len(declaration)
+        Dim currentByte As Long = Asc(declaration, position)
+        If position - literalStart > MAX_C_STRING_LITERAL_BYTES + 8 Then
+            position = literalStart
+            Return 1
+        End If
+        If currentByte = Asc(Chr(92)) Then
+            If position >= Len(declaration) Then
+                position = literalStart
+                Return 1
+            End If
+            position += 2
+        ElseIf currentByte = quoteByte Then
+            position += 1
+            closedLiteral = -1
+            Exit While
+        ElseIf currentByte = 10 OrElse currentByte = 13 Then
+            position = literalStart
+            Return 1
+        Else
+            position += 1
+        End If
+    Wend
+    If closedLiteral = 0 Then
+        position = literalStart
+        Return 1
+    End If
+    literalToken = Mid(declaration, literalStart, position - literalStart)
+    Return -1
+End Function
+
 Private Sub TokenizeCDeclaration( _
     ByVal declaration As String, _
     tokens() As String, _
@@ -113,20 +174,30 @@ Private Sub TokenizeCDeclaration( _
         Dim c As Long = Asc(declaration, i)
         If IsSpaceByte(c) Then
             i += 1
-        ElseIf IsIdentifierStart(c) Then
-            Dim start As Long = i
-            i += 1
-            While i <= Len(declaration) AndAlso IsIdentifierPart(Asc(declaration, i))
-                i += 1
-            Wend
-            AddToken(tokens(), tokenCount, Mid(declaration, start, i - start))
-        ElseIf c = Asc(".") AndAlso i + 2 <= Len(declaration) AndAlso _
-               Mid(declaration, i, 3) = "..." Then
-            AddToken(tokens(), tokenCount, "...")
-            i += 3
         Else
-            AddToken(tokens(), tokenCount, Chr(c))
-            i += 1
+            Dim literalToken As String
+            Dim literalStatus As Long = ReadCDeclarationLiteralToken( _
+                declaration, i, literalToken)
+            If literalStatus > 0 Then
+                ReportError("C declaration contains an invalid or oversized literal")
+                Exit Sub
+            ElseIf literalStatus < 0 Then
+                AddToken(tokens(), tokenCount, literalToken)
+            ElseIf IsIdentifierStart(c) Then
+                Dim start As Long = i
+                i += 1
+                While i <= Len(declaration) AndAlso IsIdentifierPart(Asc(declaration, i))
+                    i += 1
+                Wend
+                AddToken(tokens(), tokenCount, Mid(declaration, start, i - start))
+            ElseIf c = Asc(".") AndAlso i + 2 <= Len(declaration) AndAlso _
+                   Mid(declaration, i, 3) = "..." Then
+                AddToken(tokens(), tokenCount, "...")
+                i += 3
+            Else
+                AddToken(tokens(), tokenCount, Chr(c))
+                i += 1
+            End If
         End If
     Wend
 End Sub

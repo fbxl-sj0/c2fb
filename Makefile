@@ -12,6 +12,7 @@ CANDIDATE_DIR ?= build/candidates
 THREADSAFE ?= 1
 SQLITE_SOURCE_DIR ?= ../freebasic-sqlite
 FB_SOURCE_DIR ?= $(SQLITE_SOURCE_DIR)/fb_src
+FBC_SOURCE_DIR ?=
 
 # Any C2FB include module change must rebuild the composed converter.
 C2FB_MODULES := $(wildcard c2fb_*.bi)
@@ -33,8 +34,10 @@ $(API_ROUTINES_TARGET): api_routines.bas c2fb_api_routines.bi c2fb_file_input.bi
 api-routines: $(API_ROUTINES_TARGET)
 
 test: $(TARGET)
+	$(PYTHON) tests/test_fbc_archive_overlay.py --cc '$(CC)'
 	$(PYTHON) tests/test_c2fb.py --converter '$(abspath $(TARGET))' --fbc '$(FBC)' --cc '$(CC)' \
-		--sqlite-source-directory '$(abspath $(SQLITE_SOURCE_DIR))'
+		--sqlite-source-directory '$(abspath $(SQLITE_SOURCE_DIR))' \
+		$(if $(strip $(FBC_SOURCE_DIR)),--fbc-source-directory '$(abspath $(FBC_SOURCE_DIR))',)
 
 check-candidates:
 	$(PYTHON) check_candidates.py '$(CANDIDATE_DIR)' --fb-source '$(FB_SOURCE_DIR)' --fbc '$(FBC)' --threadsafe '$(THREADSAFE)'

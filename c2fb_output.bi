@@ -363,6 +363,91 @@ Private Sub FormatC2fbObjectBinding( _
         WriteC2fbOutputLine(outputFile, "End Extern")
 End Sub
 
+Private Function C2fbRecordBindingHasFieldName( _
+    ByRef recordBinding As C2fbRecordBindingModel, _
+    ByVal candidate As String _
+) As Long
+    For itemIndex As Long = 0 To recordBinding.itemCount - 1
+        With recordBinding.items(itemIndex)
+            If .kind = C2FB_RECORD_BINDING_ITEM_FIELD AndAlso _
+               LCase(.name) = LCase(candidate) Then Return -1
+            If .kind = C2FB_RECORD_BINDING_ITEM_ZERO_ARRAY AndAlso _
+               (.name = candidate OrElse .zeroArrayStorageName = candidate OrElse _
+                .zeroArrayAccessorName = candidate) Then Return -1
+        End With
+    Next
+    For fieldIndex As Long = 0 To recordBinding.fieldCount - 1
+        If LCase(recordBinding.fields(fieldIndex).name) = LCase(candidate) Then _
+            Return -1
+    Next
+    Return 0
+End Function
+
+Private Function C2fbRecordBindingFieldDeclarationText( _
+    ByRef recordBinding As C2fbRecordBindingModel, _
+    ByVal itemIndex As Long, ByVal fieldName As String, _
+    ByVal fieldType As String, ByVal arrayCount As Long, _
+    ByVal arrayBounds As String, ByVal alignmentStorageType As String, _
+    ByVal packValue As Long, ByVal isBitField As Long, _
+    ByVal bitWidth As Long, ByVal alignmentCarrierIsUnionMember As Long, _
+    ByVal indentLevel As Long _
+) As String
+    Dim fieldIndent As String = Space(indentLevel * 4)
+    Dim fieldText As String = ""
+    If alignmentStorageType <> "" AndAlso _
+       alignmentCarrierIsUnionMember = 0 Then
+        Dim wrapperHeader As String = fieldIndent & "Union"
+        Select Case packValue
+        Case 1, 2, 4, 8
+            wrapperHeader &= " Field = " & Trim(Str(packValue))
+        End Select
+        fieldText = wrapperHeader
+        fieldIndent = Space((indentLevel + 1) * 4)
+    End If
+
+    Dim fieldDeclaration As String = fieldIndent & fieldName
+    If isBitField <> 0 Then _
+        fieldDeclaration &= " : " & Trim(Str(bitWidth))
+    If arrayBounds <> "" Then
+        fieldDeclaration &= "(" & arrayBounds & ")"
+    ElseIf arrayCount > 0 Then
+        fieldDeclaration &= "(0 To " & Trim(Str(arrayCount - 1)) & ")"
+    End If
+    fieldDeclaration &= " As " & fieldType
+    If fieldText <> "" Then fieldText &= Chr(10)
+    fieldText &= fieldDeclaration
+
+    If alignmentStorageType <> "" Then
+        Dim alignmentName As String = _
+            "c2fbLongDoubleAlignment_" & Trim(Str(itemIndex))
+        While C2fbRecordBindingHasFieldName(recordBinding, alignmentName) <> 0
+            alignmentName &= "_"
+        Wend
+        Dim alignmentIndent As String = fieldIndent
+        If alignmentCarrierIsUnionMember = 0 Then _
+            alignmentIndent = Space((indentLevel + 1) * 4)
+        If fieldText <> "" Then fieldText &= Chr(10)
+        fieldText &= alignmentIndent & alignmentName & _
+            " As " & alignmentStorageType
+        If alignmentCarrierIsUnionMember = 0 Then _
+            fieldText &= Chr(10) & Space(indentLevel * 4) & "End Union"
+    End If
+    Return fieldText
+End Function
+
+Private Sub WriteC2fbOutputTextLines( _
+    ByRef outputFile As C2fbGeneratedFileOutputModel, ByVal text As String _
+)
+    Dim lineStart As Long = 1
+    While lineStart <= Len(text)
+        Dim lineEnd As Long = InStr(lineStart, text, Chr(10))
+        If lineEnd = 0 Then lineEnd = Len(text) + 1
+        WriteC2fbOutputLine( _
+            outputFile, Mid(text, lineStart, lineEnd - lineStart))
+        lineStart = lineEnd + 1
+    Wend
+End Sub
+
 Private Sub FormatC2fbRecordBinding( _
     ByRef outputFile As C2fbGeneratedFileOutputModel, ByRef recordBinding As C2fbRecordBindingModel _
 )
@@ -391,6 +476,9 @@ Private Sub FormatC2fbRecordBinding( _
         End If
     End If
     If recordBinding.itemCount > 0 Then
+        Dim aggregateLevel As Long = 0
+        Dim aggregateIsUnionStack(0 To recordBinding.itemCount) As Long
+        aggregateIsUnionStack(0) = recordBinding.isUnion
         For itemIndex As Long = 0 To recordBinding.itemCount - 1
             With recordBinding.items(itemIndex)
                 Select Case .kind
@@ -405,30 +493,27 @@ Private Sub FormatC2fbRecordBinding( _
                     WriteC2fbOutputLine( _
                         outputFile, Space(indentLevel * 4) & nestedHeader)
                     indentLevel += 1
+                    aggregateLevel += 1
+                    aggregateIsUnionStack(aggregateLevel) = .isUnion
                 Case C2FB_RECORD_BINDING_ITEM_ANONYMOUS_END
                     If indentLevel > 1 Then indentLevel -= 1
                     Dim nestedName As String = "Type"
                     If .isUnion <> 0 Then nestedName = "Union"
                     WriteC2fbOutputLine( _
                         outputFile, Space(indentLevel * 4) & "End " & nestedName)
+                    If aggregateLevel > 0 Then aggregateLevel -= 1
                 Case C2FB_RECORD_BINDING_ITEM_FIELD
                     If .isArraySizeHinted <> 0 Then _
                         WriteC2fbOutputLine( _
                             outputFile, Space(indentLevel * 4) & _
                             "' C flexible array member size is expanded by --array-size: " & _
                             .name & "=" & Trim(Str(.arrayCount)))
-                    Dim fieldDeclaration As String = _
-                        Space(indentLevel * 4) & .name
-                    If .isBitField <> 0 Then _
-                        fieldDeclaration &= " : " & Trim(Str(.bitWidth))
-                    If .arrayBounds <> "" Then
-                        fieldDeclaration &= "(" & .arrayBounds & ")"
-                    ElseIf .arrayCount > 0 Then _
-                        fieldDeclaration &= "(0 To " & _
-                            Trim(Str(.arrayCount - 1)) & ")"
-                    End If
-                    fieldDeclaration &= " As " & .fieldType
-                    WriteC2fbOutputLine(outputFile, fieldDeclaration)
+                    WriteC2fbOutputTextLines( _
+                        outputFile, C2fbRecordBindingFieldDeclarationText( _
+                            recordBinding, itemIndex, .name, .fieldType, _
+                            .arrayCount, .arrayBounds, .alignmentStorageType, _
+                            .packValue, .isBitField, .bitWidth, _
+                            aggregateIsUnionStack(aggregateLevel), indentLevel))
                 Case C2FB_RECORD_BINDING_ITEM_ZERO_ARRAY
                     If .zeroArrayStorageName <> "" Then
                         WriteC2fbOutputLine( _
@@ -449,18 +534,11 @@ Private Sub FormatC2fbRecordBinding( _
     Else
         For fieldIndex As Long = 0 To recordBinding.fieldCount - 1
             With recordBinding.fields(fieldIndex)
-                Dim fieldIndent As String = Space(indentLevel * 4)
-                If .arrayBounds <> "" Then
-                    WriteC2fbOutputLine( _
-                        outputFile, fieldIndent & .name & "(" & .arrayBounds & ") As " & .fieldType)
-                ElseIf .arrayCount > 0 Then
-                    WriteC2fbOutputLine( _
-                        outputFile, fieldIndent & .name & _
-                        "(0 To " & Trim(Str(.arrayCount - 1)) & ") As " & .fieldType)
-                Else
-                    WriteC2fbOutputLine( _
-                        outputFile, fieldIndent & .name & " As " & .fieldType)
-                End If
+                WriteC2fbOutputTextLines( _
+                    outputFile, C2fbRecordBindingFieldDeclarationText( _
+                        recordBinding, fieldIndex, .name, .fieldType, _
+                        .arrayCount, .arrayBounds, .alignmentStorageType, _
+                        0, 0, 0, recordBinding.isUnion, indentLevel))
             End With
         Next
     End If

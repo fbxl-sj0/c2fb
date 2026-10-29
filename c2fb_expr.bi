@@ -187,6 +187,9 @@ Private Type SimpleExpressionValue
     isIncompleteArray As Long
     layoutType As String
     isLayoutArray As Long
+    ' Some C array typedefs are represented by an ABI-compatible FreeBASIC
+    ' record, such as jmp_buf, rather than by a FreeBASIC array declaration.
+    isArrayStorageAlias As Long
     arrayElementType As String
     arrayBound As String
     ' Local C arrays flatten to row-major storage but keep dimension bounds
@@ -194,6 +197,8 @@ Private Type SimpleExpressionValue
     arrayDimensions As String
     arraySourceName As String
     isArrayElementZero As Long
+    isPointerToArray As Long
+    pointerToArrayElementCount As Long
     sizeOfArraySourceName As String
     sizeOfArrayElementSourceName As String
     sizeOfArrayCount As Long
@@ -229,6 +234,8 @@ Private Type SimpleExpressionParser
     hasRuntimeValue As Long
     unevaluated As Long
     targetType As String
+    ' Avoid rescanning source text at each recursive parser step.
+    simpleGnuExpressionsNormalized As Long
     translation As C2fbTranslationContext Ptr
     catalog As C2fbProjectCatalog Ptr
     context As SimpleBodyContext Ptr
@@ -249,6 +256,10 @@ Declare Function ParseSimpleExpressionValue( _
     callableNames() As String, ByVal callableCount As Long, _
     parameterNames() As String, parameterAliases() As String, _
     parameterTypes() As String, ByVal parameterCount As Long _
+) As Long
+
+Declare Function NormalizeSimpleGnuStatementExpressions( _
+    ByVal sourceText As String, ByRef normalizedText As String _
 ) As Long
 
 Declare Function ParseSimpleUnaryValue( _
@@ -341,6 +352,7 @@ Private Function SimpleArithmeticKind( _
 #endif
     Case "Single": Return 5
     Case "Double": Return 6
+    Case "CLongDouble": Return 7
     End Select
     Return 0
 End Function
@@ -353,8 +365,31 @@ Private Function SimpleArithmeticType(ByVal kind As Long) As String
     Case 4: Return "c2fb_uint64"
     Case 5: Return "Single"
     Case 6: Return "Double"
+    Case 7: Return "CLongDouble"
     End Select
     Return ""
+End Function
+
+Private Function SimpleArithmeticTypeIsUnsigned( _
+    ByRef catalog As C2fbProjectCatalog, ByVal typeName As String _
+) As Long
+    typeName = NormalizeFbBodyType(catalog, typeName)
+    If Left(typeName, 6) = "Const " Then typeName = Mid(typeName, 7)
+    Select Case typeName
+    Case "UByte", "UShort", "ULong", "ULongInt", "UInteger", _
+         "c2fb_c_uchar", "c2fb_c_ushort", _
+         "CULong", "SQLITE_C_UINT", "SQLITE_C_ULONG", "SQLITE_SIZE_T", _
+         "c2fb_c_uint", "c2fb_c_ulong", "c2fb_size_t", _
+         "sqlite3_uint64", "c2fb_uint64"
+        Return -1
+    End Select
+    Return 0
+End Function
+
+Private Function SimpleFloatingCastNeedsFix(ByVal arithmeticKind As Long) As Long
+    ' C floating-to-integer casts truncate. FreeBASIC's native floating casts
+    ' round; the CLongDouble cast operators already truncate in their runtime.
+    Return CInt(arithmeticKind = 5 OrElse arithmeticKind = 6)
 End Function
 
 Private Function SimpleCommonArithmeticType( _
@@ -372,6 +407,13 @@ Private Function SimpleValueCast( _
     ByRef catalog As C2fbProjectCatalog, _
     ByRef value As SimpleExpressionValue, ByVal typeName As String _
 ) As String
+    If value.isPointerToArray <> 0 Then
+        If typeName = "Any Ptr" OrElse typeName = "Const Any Ptr" Then _
+            Return "CPtr(" & typeName & ", " & value.text & ")"
+        If NormalizeFbBodyType(catalog, typeName) = _
+           NormalizeFbBodyType(catalog, value.typeName) Then Return value.text
+        Return ""
+    End If
     If IsCBodyCallbackTypeInContext(translation, typeName) <> 0 Then
         If Left(Trim(value.text), Len("ProcPtr(")) = "ProcPtr(" Then Return value.text
         If SimpleIsNullValue(value) <> 0 Then Return "CPtr(" & typeName & ", 0)"
@@ -387,6 +429,27 @@ Private Function SimpleValueCast( _
         Dim kind As Long = SimpleArithmeticKind(catalog, value.typeName)
         If kind > 0 AndAlso kind <= 4 Then sourceText = "Cast(ULongInt, " & sourceText & ")"
         Return "CPtr(" & typeName & ", " & sourceText & ")"
+    End If
+    Dim normalizedTargetType As String = NormalizeFbBodyType(catalog, typeName)
+    Dim normalizedSourceType As String = NormalizeFbBodyType(catalog, value.typeName)
+    If Left(normalizedTargetType, 6) = "Const " Then _
+        normalizedTargetType = Mid(normalizedTargetType, 7)
+    If Left(normalizedSourceType, 6) = "Const " Then _
+        normalizedSourceType = Mid(normalizedSourceType, 7)
+    If normalizedTargetType = "CLongDouble" Then
+        If normalizedSourceType = "CLongDouble" Then Return value.text
+        Dim sourceKind As Long = SimpleArithmeticKind(catalog, value.typeName)
+        Select Case sourceKind
+        Case 1, 2, 3, 4
+            If SimpleArithmeticTypeIsUnsigned(catalog, value.typeName) <> 0 Then
+                Return "CLongDoubleFromUnsignedValue(Cast(ULongInt, " & value.text & "))"
+            End If
+            Return "CLongDoubleFromSignedValue(Cast(LongInt, " & value.text & "))"
+        Case 5, 6
+            Return "CLongDoubleFromDoubleValue(Cast(Double, " & value.text & "))"
+        Case Else
+            Return ""
+        End Select
     End If
     Return "Cast(" & typeName & ", " & value.text & ")"
 End Function
@@ -538,21 +601,55 @@ End Function
 
 
 
+Declare Function CBodyProcedureCallbackTypeInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, ByVal procedureName As String _
+) As String
+
 Private Function SimpleConditionalType( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
     ByRef trueValue As SimpleExpressionValue, ByRef falseValue As SimpleExpressionValue _
 ) As String
+    If trueValue.isFunctionDesignator <> 0 AndAlso _
+       falseValue.isFunctionDesignator <> 0 Then
+        Dim trueCallbackType As String = CBodyProcedureCallbackTypeInContext( _
+            translation, catalog, trueValue.lValueText)
+        Dim falseCallbackType As String = CBodyProcedureCallbackTypeInContext( _
+            translation, catalog, falseValue.lValueText)
+        If trueCallbackType <> "" AndAlso falseCallbackType <> "" AndAlso _
+           CBodyCallbackTypesCompatibleInContext( _
+               translation, catalog, trueCallbackType, falseCallbackType, 0) <> 0 Then _
+            Return trueCallbackType
+        Return ""
+    End If
     If trueValue.typeName = falseValue.typeName Then Return trueValue.typeName
     Dim commonType As String = SimpleCommonArithmeticType( _
         catalog, trueValue.typeName, falseValue.typeName)
     If commonType <> "" Then Return commonType
-    If SimplePointeeType(trueValue.typeName) <> "" AndAlso SimplePointeeType(falseValue.typeName) <> "" Then
+    Dim truePointeeType As String = SimplePointeeType(trueValue.typeName)
+    Dim falsePointeeType As String = SimplePointeeType(falseValue.typeName)
+    If truePointeeType <> "" AndAlso falsePointeeType <> "" Then
         If trueValue.typeName = "Any Ptr" OrElse falseValue.typeName = "Any Ptr" Then
             Dim isConstPointee As Long = CInt( _
                 Left(trueValue.typeName, 6) = "Const " OrElse _
                 Left(falseValue.typeName, 6) = "Const ")
             Return IIf(isConstPointee <> 0, "Const Any Ptr", "Any Ptr")
+        End If
+        If truePointeeType = "Byte" AndAlso falsePointeeType = "Byte" AndAlso _
+           (trueValue.typeName = "ZString Ptr" OrElse _
+            trueValue.typeName = "Const ZString Ptr" OrElse _
+            falseValue.typeName = "ZString Ptr" OrElse _
+            falseValue.typeName = "Const ZString Ptr") AndAlso _
+           (trueValue.typeName = "Byte Ptr" OrElse _
+            trueValue.typeName = "Const Byte Ptr" OrElse _
+            falseValue.typeName = "Byte Ptr" OrElse _
+            falseValue.typeName = "Const Byte Ptr") Then
+            Dim isConstCharacterPointer As Long = CInt( _
+                Left(trueValue.typeName, 6) = "Const " OrElse _
+                Left(falseValue.typeName, 6) = "Const ")
+            Return IIf(isConstCharacterPointer <> 0, _
+                "Const ZString Ptr", "ZString Ptr")
         End If
         If trueValue.typeName = "Const " & falseValue.typeName Then Return trueValue.typeName
         If falseValue.typeName = "Const " & trueValue.typeName Then Return falseValue.typeName
@@ -564,6 +661,80 @@ Private Function SimpleConditionalType( _
        (SimplePointeeType(falseValue.typeName) <> "" OrElse _
         IsCBodyCallbackTypeInContext(translation, falseValue.typeName) <> 0) Then Return falseValue.typeName
     Return ""
+End Function
+
+Private Function CBodyProcedureCallbackTypeInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, ByVal procedureName As String _
+) As String
+    If procedureName = "" Then Return ""
+    Dim procedureIndex As Long = _
+        CBodyProcedureIndex(translation, procedureName)
+    Dim returnType As String
+    Dim parameterCount As Long
+    Dim isVariadic As Long
+    If procedureIndex >= 0 Then
+        With translation.symbolTable.symbols(procedureIndex)
+            If .ambiguous <> 0 OrElse .body.isAmbiguous <> 0 OrElse _
+               .body.isDeclared = 0 Then Return ""
+            returnType = .body.returnType
+            parameterCount = .body.parameterCount
+            isVariadic = .body.isVariadic
+        End With
+    Else
+        procedureIndex = FbBodyCallSignatureIndex(catalog, procedureName)
+        If procedureIndex < 0 OrElse _
+           catalog.bodyCallSignatures(procedureIndex).parameterCount < 0 Then _
+            Return ""
+        With catalog.bodyCallSignatures(procedureIndex)
+            returnType = .returnType
+            parameterCount = .parameterCount
+            isVariadic = .isVariadic
+        End With
+    End If
+    If returnType = "" OrElse parameterCount < 0 OrElse _
+       isVariadic <> 0 Then Return ""
+
+    For callbackIndex As Long = 0 To translation.body.callbackCount - 1
+        With translation.body.callbacks(callbackIndex)
+            If .parameterCount <> parameterCount OrElse _
+               .isVariadic <> isVariadic OrElse _
+               CBodyCallbackTypesCompatibleInContext( _
+                   translation, catalog, .returnType, returnType, 0) = 0 Then _
+                Continue For
+            Dim signaturesMatch As Long = -1
+            For parameterIndex As Long = 0 To parameterCount - 1
+                If CBodyCallbackTypesCompatibleInContext( _
+                    translation, catalog, _
+                    CBodyCallbackParameterTypeInContext( _
+                        translation, .fbType, parameterIndex), _
+                    CBodyParameterType( _
+                        translation, catalog, procedureName, parameterIndex), 0) = 0 Then
+                    signaturesMatch = 0
+                    Exit For
+                End If
+            Next
+            If signaturesMatch <> 0 Then Return .fbType
+        End With
+    Next
+
+    Dim declaration As String = "Function CDecl("
+    If returnType = "void" Then declaration = "Sub CDecl("
+    Dim parameterTypes As String
+    For parameterIndex As Long = 0 To parameterCount - 1
+        Dim parameterType As String = CBodyParameterType( _
+            translation, catalog, procedureName, parameterIndex)
+        If parameterType = "" Then Return ""
+        If parameterIndex > 0 Then declaration &= ", "
+        declaration &= "ByVal arg" & Trim(Str(parameterIndex)) & _
+                       " As " & parameterType
+        parameterTypes &= parameterType & "|"
+    Next
+    declaration &= ")"
+    If returnType <> "void" Then declaration &= " As " & returnType
+    Return RegisterCBodyCallbackTypeInContext( _
+        translation, catalog, declaration, returnType, parameterTypes, _
+        parameterCount, isVariadic)
 End Function
 
 Private Function ScanSimpleGenericDelimiter( _
@@ -917,6 +1088,162 @@ Private Function CBodyBuiltinInfinityExpression( _
     Return ""
 End Function
 
+Private Function CBodyBuiltinCheckedOverflowKind( _
+    ByVal procedureName As String _
+) As Long
+    Select Case procedureName
+    Case "__builtin_add_overflow": Return 1
+    Case "__builtin_sub_overflow": Return 2
+    Case "__builtin_mul_overflow": Return 3
+    End Select
+    Return 0
+End Function
+
+Private Function SimpleIntegerWidthInBits( _
+    ByRef catalog As C2fbProjectCatalog, ByVal typeName As String _
+) As Long
+    typeName = NormalizeFbBodyType(catalog, typeName)
+    If Left(typeName, 6) = "Const " Then typeName = Mid(typeName, 7)
+    Select Case typeName
+    Case "Byte", "UByte", "c2fb_c_char", "c2fb_c_uchar": Return 8
+    Case "Short", "UShort", "c2fb_c_short", "c2fb_c_ushort": Return 16
+    End Select
+    Dim arithmeticKind As Long = SimpleArithmeticKind(catalog, typeName)
+    Select Case arithmeticKind
+    Case 1, 2: Return 32
+    Case 3, 4: Return 64
+    End Select
+    Return 0
+End Function
+
+Private Function LowerCBodyCheckedOverflowCall( _
+    ByRef parser As SimpleExpressionParser, _
+    ByRef value As SimpleExpressionValue, arguments() As SimpleExpressionValue, _
+    ByVal argumentCount As Long, ByVal operationKind As Long _
+) As Long
+    If argumentCount <> 3 OrElse parser.context = 0 Then Return 0
+    Dim resultType As String = SimplePointeeType(arguments(2).typeName)
+    Dim resultWidth As Long = _
+        SimpleIntegerWidthInBits(parser.catalog[0], resultType)
+    If resultType = "" OrElse resultWidth = 0 OrElse _
+       SimpleIntegerWidthInBits( _
+           parser.catalog[0], arguments(0).typeName) = 0 OrElse _
+       SimpleIntegerWidthInBits( _
+           parser.catalog[0], arguments(1).typeName) = 0 Then Return 0
+    If Left(resultType, 6) = "Const " Then Return 0
+
+    If parser.unevaluated <> 0 Then
+        value.text = "0"
+        value.typeName = "c2fb_c_int"
+        value.layoutType = value.typeName
+        value.storageType = value.typeName
+        value.isLValue = 0
+        value.isFunctionDesignator = 0
+        Return -1
+    End If
+
+    For argumentIndex As Long = 0 To 2
+        If FreezeSimpleValue(parser, arguments(argumentIndex)) = 0 Then Return 0
+        value.prelude &= arguments(argumentIndex).prelude
+    Next
+
+    Dim overflowIsUnsigned As Long = CInt( _
+        SimpleArithmeticTypeIsUnsigned(parser.catalog[0], resultType) <> 0)
+    Dim minimumValue As String = _
+        "CLongDoubleFromUnsignedValue(Cast(ULongInt, 0))"
+    Dim maximumValue As String
+    If overflowIsUnsigned <> 0 Then
+        Select Case resultWidth
+        Case 8: maximumValue = "CLongDoubleFromUnsignedValue(Cast(ULongInt, 255))"
+        Case 16: maximumValue = "CLongDoubleFromUnsignedValue(Cast(ULongInt, 65535))"
+        Case 32
+            maximumValue = _
+                "CLongDoubleFromUnsignedValue(Cast(ULongInt, 4294967295ULL))"
+        Case 64
+            maximumValue = _
+                "CLongDoubleFromUnsignedValue(Cast(ULongInt, 18446744073709551615ULL))"
+        Case Else: Return 0
+        End Select
+    Else
+        Select Case resultWidth
+        Case 8
+            minimumValue = "CLongDoubleFromSignedValue(Cast(LongInt, -128))"
+            maximumValue = "CLongDoubleFromSignedValue(Cast(LongInt, 127))"
+        Case 16
+            minimumValue = "CLongDoubleFromSignedValue(Cast(LongInt, -32768))"
+            maximumValue = "CLongDoubleFromSignedValue(Cast(LongInt, 32767))"
+        Case 32
+            minimumValue = _
+                "-CLongDoubleFromSignedValue(Cast(LongInt, 2147483647)) - " & _
+                "CLongDoubleFromSignedValue(Cast(LongInt, 1))"
+            maximumValue = _
+                "CLongDoubleFromSignedValue(Cast(LongInt, 2147483647))"
+        Case 64
+            minimumValue = _
+                "-CLongDoubleFromSignedValue(Cast(LongInt, 9223372036854775807LL)) - " & _
+                "CLongDoubleFromSignedValue(Cast(LongInt, 1))"
+            maximumValue = _
+                "CLongDoubleFromSignedValue(Cast(LongInt, 9223372036854775807LL))"
+        Case Else
+            Return 0
+        End Select
+    End If
+
+    Dim operationText As String = "+"
+    Select Case operationKind
+    Case 1: operationText = "+"
+    Case 2: operationText = "-"
+    Case 3: operationText = "*"
+    Case Else: Return 0
+    End Select
+
+    Dim wideValue As String = NewSimpleTemporary(parser, "CLongDouble")
+    Dim overflowFlag As String = NewSimpleTemporary(parser, "c2fb_c_int")
+    Dim convertedValue As String = NewSimpleTemporary(parser, resultType)
+    If wideValue = "" OrElse overflowFlag = "" OrElse convertedValue = "" Then Return 0
+
+    ' Compare in extended precision; perform the stored result through unsigned
+    ' bits so signed overflow is never evaluated by the BASIC backend.
+    Dim wideLeft As String = SimpleValueCast( _
+        parser.translation[0], parser.catalog[0], arguments(0), "CLongDouble")
+    Dim wideRight As String = SimpleValueCast( _
+        parser.translation[0], parser.catalog[0], arguments(1), "CLongDouble")
+    If wideLeft = "" OrElse wideRight = "" Then Return 0
+    value.prelude &= wideValue & " = (" & wideLeft & " " & operationText & _
+                     " " & wideRight & ")" & Chr(10)
+    value.prelude &= overflowFlag & " = 0" & Chr(10)
+    value.prelude &= "If " & wideValue & " < (" & minimumValue & ") OrElse " & _
+                     wideValue & " > (" & maximumValue & ") Then" & Chr(10) & _
+                     "    " & overflowFlag & " = 1" & Chr(10) & "End If" & Chr(10)
+
+    Dim leftBits As String = "Cast(ULongInt, " & arguments(0).text & ")"
+    Dim rightBits As String = "Cast(ULongInt, " & arguments(1).text & ")"
+    Dim resultBits As String = "(" & leftBits & " " & operationText & _
+                               " " & rightBits & ")"
+    Select Case resultWidth
+    Case 8: resultBits = "(" & resultBits & " And 255ULL)"
+    Case 16: resultBits = "(" & resultBits & " And 65535ULL)"
+    Case 32: resultBits = "(" & resultBits & " And 4294967295ULL)"
+    End Select
+    value.prelude &= convertedValue & " = Cast(" & resultType & ", " & _
+                     resultBits & ")" & Chr(10)
+    value.prelude &= "CPtr(" & resultType & " Ptr, " & arguments(2).text & _
+                     ")[0] = " & convertedValue & Chr(10)
+    value.text = overflowFlag
+    value.typeName = "c2fb_c_int"
+    value.layoutType = value.typeName
+    value.storageType = value.typeName
+    value.cRecord = ""
+    value.isLValue = 0
+    value.isFunctionDesignator = 0
+    value.lValueText = ""
+    value.isWholeCall = 0
+    value.arrayCount = 0
+    value.arrayBound = ""
+    value.arrayElementType = ""
+    Return -1
+End Function
+
 Private Function ParseSimpleCallValue( _
     ByRef parser As SimpleExpressionParser, ByRef value As SimpleExpressionValue, _
     ByVal procedureName As String, ByVal depth As Long, _
@@ -945,6 +1272,8 @@ Private Function ParseSimpleCallValue( _
         CInt(procedureName = "__atomic_thread_fence")
     Dim isAtomicIsLockFree As Long = _
         CInt(procedureName = "__atomic_is_lock_free")
+    Dim checkedOverflowKind As Long = _
+        CBodyBuiltinCheckedOverflowKind(procedureName)
     Dim isFiniteBuiltin As Long = CBodyFiniteTestBuiltin(procedureName)
     Dim builtinExpectKind As Long = CBodyBuiltinExpectKind(procedureName)
     Dim builtinInfinityType As String = _
@@ -968,6 +1297,9 @@ Private Function ParseSimpleCallValue( _
     If builtinInfinityType <> "" Then
         expectedCount = 0
         returnType = builtinInfinityType
+    ElseIf checkedOverflowKind <> 0 Then
+        expectedCount = 3
+        returnType = "c2fb_c_int"
     ElseIf builtinExpectKind <> 0 Then
         expectedCount = 2
         If builtinExpectKind = 2 Then expectedCount = 3
@@ -1048,12 +1380,6 @@ Private Function ParseSimpleCallValue( _
                 ReDim Preserve arguments(0 To UBound(arguments) * 2 + 1)
                 ReDim Preserve targetTypes(0 To UBound(targetTypes) * 2 + 1)
             End If
-            ' C call separators are not comma operators. A parenthesized comma
-            ' expression still enters the full expression parser from unary.
-            If ParseSimpleExpressionValue(parser, arguments(argumentCount), 2, depth + 1, callableNames(), callableCount, _
-                                          parameterNames(), parameterAliases(), parameterTypes(), parameterCount) = 0 Then
-                Return 0
-            End If
             Dim targetType As String
             If callbackIndex >= 0 Then
                 targetType = CBodyCallbackParameterTypeInContext( _
@@ -1063,7 +1389,46 @@ Private Function ParseSimpleCallValue( _
                     parser.translation[0], parser.catalog[0], _
                     procedureName, argumentCount)
             End If
+            ' An address-of-array expression passed to void * has the same
+            ' address as its first element; lower it with the parameter type.
+            Dim previousTargetType As String = parser.targetType
+            If targetType <> "" Then parser.targetType = targetType
+            ' C call separators are not comma operators. A parenthesized comma
+            ' expression still enters the full expression parser from unary.
+            Dim argumentParseStatus As Long = ParseSimpleExpressionValue( _
+                parser, arguments(argumentCount), 2, depth + 1, _
+                callableNames(), callableCount, parameterNames(), _
+                parameterAliases(), parameterTypes(), parameterCount)
+            parser.targetType = previousTargetType
+            If argumentParseStatus = 0 Then Return 0
             targetTypes(argumentCount) = targetType
+            If arguments(argumentCount).isArrayStorageAlias <> 0 Then
+                If targetType = "" OrElse InStr(targetType, " Ptr") = 0 Then _
+                    Return 0
+                arguments(argumentCount).text = _
+                    "CPtr(" & targetType & ", @(" & _
+                    arguments(argumentCount).text & "))"
+                arguments(argumentCount).typeName = targetType
+                arguments(argumentCount).layoutType = targetType
+                arguments(argumentCount).storageType = targetType
+                arguments(argumentCount).arrayBound = ""
+                arguments(argumentCount).arrayElementType = ""
+                arguments(argumentCount).isArrayStorageAlias = 0
+            End If
+            Dim pointerArrayFormalIndex As Long = _
+                CBodyPointerToArrayParameterIndexByPositionInContext( _
+                    parser.translation[0], procedureName, argumentCount)
+            If arguments(argumentCount).isPointerToArray <> 0 Then
+                If pointerArrayFormalIndex >= 0 Then
+                    If parser.translation[0].body.pointerToArrayParameters( _
+                        pointerArrayFormalIndex).arrayElementCount <> _
+                       arguments(argumentCount).pointerToArrayElementCount Then _
+                        Return 0
+                ElseIf targetType <> "Any Ptr" AndAlso _
+                       targetType <> "Const Any Ptr" Then
+                    Return 0
+                End If
+            End If
             If (InStr(arguments(argumentCount).typeName, " Ptr") <> 0 OrElse IsCBodyCallbackTypeInContext(parser.translation[0], arguments(argumentCount).typeName) <> 0) AndAlso _
                SimpleArithmeticKind(parser.catalog[0], targetType) > 0 Then Return 0
             If arguments(argumentCount).typeName = "void" Then Return 0
@@ -1140,6 +1505,9 @@ Private Function ParseSimpleCallValue( _
     End If
     If Mid(parser.sourceText, parser.position, 1) <> ")" Then Return 0
     parser.position += 1
+    If checkedOverflowKind <> 0 Then _
+        Return LowerCBodyCheckedOverflowCall( _
+            parser, value, arguments(), argumentCount, checkedOverflowKind)
     If builtinInfinityType <> "" Then
         If argumentCount <> 0 Then Return 0
         value.text = CBodyBuiltinInfinityExpression(procedureName)
@@ -1599,9 +1967,16 @@ Private Function ParseSimpleCallValue( _
         End If
         If i > 0 Then value.text &= ", "
         Dim argumentText As String = arguments(i).text
-        If SimpleArithmeticKind(parser.catalog[0], arguments(i).typeName) > 4 AndAlso _
+        If SimpleFloatingCastNeedsFix( _
+            SimpleArithmeticKind(parser.catalog[0], arguments(i).typeName)) <> 0 AndAlso _
            SimpleArithmeticKind(parser.catalog[0], targetTypes(i)) > 0 AndAlso SimpleArithmeticKind(parser.catalog[0], targetTypes(i)) <= 4 Then
             argumentText = "Cast(" & targetTypes(i) & ", Fix(" & argumentText & "))"
+        ElseIf targetTypes(i) <> "" AndAlso _
+               (SimpleArithmeticKind(parser.catalog[0], arguments(i).typeName) = 7 OrElse _
+                SimpleArithmeticKind(parser.catalog[0], targetTypes(i)) = 7) Then
+            argumentText = SimpleValueCast( _
+                parser.translation[0], parser.catalog[0], arguments(i), targetTypes(i))
+            If argumentText = "" Then Return 0
         ElseIf targetTypes(i) <> "" AndAlso _
                (InStr(targetTypes(i), " Ptr") <> 0 OrElse _
                 IsCBodyCallbackTypeInContext( _
@@ -1757,11 +2132,14 @@ Private Function ParseSimpleUnaryValue( _
     value.isIncompleteArray = 0
     value.layoutType = ""
     value.isLayoutArray = 0
+    value.isArrayStorageAlias = 0
     value.arrayElementType = ""
     value.arrayBound = ""
     value.arrayDimensions = ""
     value.arraySourceName = ""
     value.isArrayElementZero = 0
+    value.isPointerToArray = 0
+    value.pointerToArrayElementCount = 0
     value.sizeOfArraySourceName = ""
     value.sizeOfArrayElementSourceName = ""
     value.sizeOfArrayCount = 0
@@ -1816,6 +2194,24 @@ Private Function ParseSimpleUnaryValue( _
             parser.hasBooleanOperator = -1
         Case Asc("&")
             If operand.isIncompleteArray <> 0 Then Return 0
+            If operand.isArrayStorageAlias <> 0 Then
+                If parser.targetType <> "Any Ptr" AndAlso _
+                   parser.targetType <> "Const Any Ptr" Then Return 0
+                value = operand
+                value.text = "CPtr(" & parser.targetType & ", @(" & _
+                    operand.text & "))"
+                value.typeName = parser.targetType
+                value.layoutType = parser.targetType
+                value.storageType = parser.targetType
+                value.cRecord = ""
+                value.isLValue = 0
+                value.isArrayStorageAlias = 0
+                value.arrayBound = ""
+                value.arrayElementType = ""
+                value.isLayoutArray = 0
+                value.lValueText = ""
+                Return -1
+            End If
             If operand.isAddressAccessor <> 0 Then
                 value = operand
                 value.isAddressAccessor = 0
@@ -1825,6 +2221,31 @@ Private Function ParseSimpleUnaryValue( _
             If operand.isFunctionDesignator <> 0 Then
                 value = operand
                 value.isFunctionDesignator = 0
+                Return -1
+            End If
+            If operand.isLayoutArray = 0 AndAlso _
+               (operand.arrayCount > 0 OrElse operand.arrayBound <> "") Then
+                If parser.targetType <> "Any Ptr" AndAlso _
+                   parser.targetType <> "Const Any Ptr" Then Return 0
+                value = operand
+                value.text = "CPtr(" & parser.targetType & ", " & operand.text & ")"
+                value.typeName = parser.targetType
+                value.layoutType = parser.targetType
+                value.storageType = parser.targetType
+                value.cRecord = ""
+                value.isLValue = 0
+                value.isAddressAccessor = 0
+                value.isWholeCall = 0
+                value.arrayCount = 0
+                value.arrayRank = 0
+                value.arrayBound = ""
+                value.isIncompleteArray = 0
+                value.isLayoutArray = 0
+                value.arrayElementType = ""
+                value.arrayDimensions = ""
+                value.arraySourceName = ""
+                value.isArrayElementZero = 0
+                value.lValueText = ""
                 Return -1
             End If
             If operand.isLValue = 0 OrElse operand.bitWidth >= 0 Then Return 0
@@ -1866,7 +2287,8 @@ Private Function ParseSimpleUnaryValue( _
             Dim operatorText As String = IIf(c = Asc("~"), "Not ", Chr(c))
             value.text = "(" & operatorText & SimpleValueCast(parser.translation[0], parser.catalog[0], operand, promotedType) & ")"
             value.typeName = promotedType
-            If Len(promotedType) <> 0 Then value.text = "Cast(" & promotedType & ", " & value.text & ")"
+            If Len(promotedType) <> 0 AndAlso promotedType <> "CLongDouble" Then _
+                value.text = "Cast(" & promotedType & ", " & value.text & ")"
             value.text = SimpleFloatingValue(value.text, promotedType)
         End Select
         Return -1
@@ -1899,6 +2321,62 @@ Private Function ParseSimpleUnaryValue( _
            ReadSimpleCTypeCast(parser.translation[0], parser.catalog[0], _
                parser.sourceText, castPosition, castType, isPointer) <> 0 Then
             parser.position = castPosition
+            SkipCSpaces(parser.sourceText, parser.position)
+            If parser.unevaluated <> 0 AndAlso _
+               Mid(parser.sourceText, parser.position, 1) = "{" AndAlso _
+               SimpleArithmeticKind(parser.catalog[0], castType) <> 0 Then
+                Dim literalEnd As Long = parser.position
+                If ScanSimpleExpressionGroup( _
+                    parser.sourceText, literalEnd, Asc("{"), Asc("}")) = 0 Then _
+                    Return 0
+                ' Generic selection and sizeof need only the compound literal's
+                ' scalar type; C has already checked its initializer.
+                parser.position = literalEnd
+                value.text = "0"
+                value.typeName = castType
+                value.layoutType = NormalizeFbBodyType( _
+                    parser.catalog[0], castType)
+                value.storageType = castType
+                value.cRecord = CBodyRecordName( _
+                    parser.translation[0], parser.catalog[0], value.layoutType)
+                value.isLValue = 0
+                value.isFunctionDesignator = 0
+                value.arrayCount = 0
+                value.arrayBound = ""
+                Return -1
+            End If
+            If parser.unevaluated = 0 AndAlso _
+               Mid(parser.sourceText, parser.position, 1) = "{" AndAlso _
+               SimpleArithmeticKind(parser.catalog[0], castType) <> 0 Then
+                parser.position += 1
+                SkipCSpaces(parser.sourceText, parser.position)
+                Dim literalOperand As SimpleExpressionValue
+                If ParseSimpleExpressionValue( _
+                    parser, literalOperand, 2, depth + 1, callableNames(), _
+                    callableCount, parameterNames(), parameterAliases(), _
+                    parameterTypes(), parameterCount) = 0 Then Return 0
+                SkipCSpaces(parser.sourceText, parser.position)
+                If Mid(parser.sourceText, parser.position, 1) = "," Then
+                    parser.position += 1
+                    SkipCSpaces(parser.sourceText, parser.position)
+                End If
+                If Mid(parser.sourceText, parser.position, 1) <> "}" Then Return 0
+                parser.position += 1
+                value.text = SimpleValueCast( _
+                    parser.translation[0], parser.catalog[0], _
+                    literalOperand, castType)
+                If value.text = "" Then Return 0
+                value.typeName = castType
+                value.layoutType = NormalizeFbBodyType( _
+                    parser.catalog[0], castType)
+                value.storageType = castType
+                value.cRecord = CBodyRecordName( _
+                    parser.translation[0], parser.catalog[0], value.layoutType)
+                value.isLValue = 0
+                value.isFunctionDesignator = 0
+                value.prelude = literalOperand.prelude
+                Return -1
+            End If
             Dim operand As SimpleExpressionValue
             If ParseSimpleUnaryValue(parser, operand, depth + 1, callableNames(), callableCount, _
                                      parameterNames(), parameterAliases(), parameterTypes(), parameterCount) = 0 Then Return 0
@@ -1944,8 +2422,17 @@ Private Function ParseSimpleUnaryValue( _
                 If operandKind = 0 OrElse castKind = 0 Then Return 0
                 ' FreeBASIC float-to-integer casts round. C discards the fraction
                 ' for in-range values, so Fix must precede an integer cast.
-                If operandKind > 4 AndAlso castKind <= 4 Then operandText = "Fix(" & operandText & ")"
-                value.text = "Cast(" & castType & ", " & operandText & ")"
+                If SimpleFloatingCastNeedsFix(operandKind) <> 0 AndAlso _
+                   castKind <= 4 Then operandText = "Fix(" & operandText & ")"
+                If NormalizeFbBodyType( _
+                    parser.catalog[0], castType) = "CLongDouble" OrElse _
+                   operandKind = 7 Then
+                    value.text = SimpleValueCast( _
+                        parser.translation[0], parser.catalog[0], operand, castType)
+                    If value.text = "" Then Return 0
+                Else
+                    value.text = "Cast(" & castType & ", " & operandText & ")"
+                End If
                 value.text = SimpleFloatingValue(value.text, castType)
             End If
             value.typeName = castType
@@ -2099,8 +2586,11 @@ Private Function ParseSimpleUnaryValue( _
             If cMemberIsArray <> fbMemberIsArray Then Return 0
             If cMemberIsArray = 0 OrElse _
                (cMemberArrayBound <> "" AndAlso cMemberArrayBound <> "0") Then
+                Dim offsetFieldName As String = _
+                    parser.catalog[0].bodyFields(fbField).name
+                If fbMemberIsArray <> 0 Then offsetFieldName &= "(0)"
                 value.text = "Cast(c2fb_size_t, OffsetOf(" & fbRecord & ", " & _
-                    parser.catalog[0].bodyFields(fbField).name & "))"
+                    offsetFieldName & "))"
                 value.typeName = "c2fb_size_t"
                 value.layoutType = value.typeName
                 value.isLValue = 0
@@ -2199,6 +2689,7 @@ Private Function ParseSimpleUnaryValue( _
                 Return -1
             Else
                 Dim visibleValueIdentifier As Long = 0
+                Dim localRecordType As String = ""
                 Dim operandGroupEnd As Long = typePosition
                 If ScanSimpleExpressionGroup( _
                     parser.sourceText, operandGroupEnd, Asc("("), Asc(")")) <> 0 Then
@@ -2219,10 +2710,22 @@ Private Function ParseSimpleUnaryValue( _
                             ' precedence over a case-folded FreeBASIC type name.
                             visibleValueIdentifier = -1
                         End If
+                        If parser.context <> 0 Then _
+                            localRecordType = SimpleBodyLocalRecordType( _
+                                parser.context[0], operandName)
                     End If
                 End If
 
-                If visibleValueIdentifier <> 0 Then
+                If localRecordType <> "" Then
+                    parser.position = operandGroupEnd
+                    operand.typeName = localRecordType
+                    operand.layoutType = localRecordType
+                    operand.storageType = localRecordType
+                    operand.cRecord = CBodyRecordName( _
+                        parser.translation[0], parser.catalog[0], localRecordType)
+                    operand.isLValue = 0
+                    operandType = localRecordType
+                ElseIf visibleValueIdentifier <> 0 Then
                     ' Parse the identifier inside the group directly. Passing
                     ' `(event)` back through unary parsing would try the same
                     ' ambiguous type-name interpretation again.
@@ -2375,7 +2878,9 @@ Private Function ParseSimpleUnaryValue( _
                         CBodyBuiltinExpectKind(identifier)
                     Dim isBuiltinCall As Long = CInt( _
                         CBodyBuiltinType(identifier) <> "" OrElse _
+                        CBodyBuiltinCallTarget(identifier) <> "" OrElse _
                         CBodyBuiltinInfinityType(identifier) <> "" OrElse _
+                        CBodyBuiltinCheckedOverflowKind(identifier) <> 0 OrElse _
                         builtinExpectKind <> 0 OrElse _
                         isVaStart <> 0 OrElse isVaEnd <> 0 OrElse _
                         identifier = "__builtin_alloca" OrElse _
@@ -2433,8 +2938,13 @@ Private Function ParseSimpleUnaryValue( _
                     If genericEnumIndex >= 0 Then
                         With parser.translation[0].genericC.header.enumMembers( _
                             genericEnumIndex)
-                            If .integerValueKnown = 0 Then Return 0
-                            value.text = Trim(Str(.integerValue))
+                            If .integerValueKnown <> 0 Then
+                                value.text = Trim(Str(.integerValue))
+                            ElseIf .isEmitted <> 0 AndAlso .freeBasicName <> "" Then
+                                value.text = .freeBasicName
+                            Else
+                                Return 0
+                            End If
                             value.typeName = "c2fb_c_int"
                             value.layoutType = value.typeName
                             value.storageType = value.typeName
@@ -2482,6 +2992,7 @@ Private Function ParseSimpleUnaryValue( _
                             value.text = "ProcPtr(" & CBodyCallName( _
                                 parser.translation[0], parser.catalog[0], identifier) & ")"
                             value.typeName = "Any Ptr"
+                            value.lValueText = identifier
                             value.isFunctionDesignator = -1
                         Else
                             If IsSQLiteConstantIdentifierInContext( _
@@ -2490,8 +3001,10 @@ Private Function ParseSimpleUnaryValue( _
                         End If
                     End If
                 Else
+                    Dim parameterPosition As Long = -1
                     For symbolIndex As Long = parameterCount - 1 To 0 Step -1
                         If parameterNames(symbolIndex) = identifier Then
+                            parameterPosition = symbolIndex
                             value.typeName = parameterTypes(symbolIndex)
                             Dim arrayMarker As Long = InStr(value.typeName, "[]")
                             If arrayMarker > 0 Then
@@ -2521,6 +3034,24 @@ Private Function ParseSimpleUnaryValue( _
                             Exit For
                         End If
                     Next
+                    If parser.context <> 0 Then
+                        Dim pointerArrayParameterIndex As Long = _
+                            CBodyPointerToArrayParameterIndexByPositionInContext( _
+                                parser.translation[0], _
+                                parser.context->functionName, parameterPosition)
+                        If pointerArrayParameterIndex >= 0 Then
+                            With parser.translation[0].body.pointerToArrayParameters( _
+                                pointerArrayParameterIndex)
+                                value.typeName = .arrayElementType & " Ptr"
+                                value.layoutType = value.typeName
+                                value.storageType = value.typeName
+                                value.isPointerToArray = -1
+                                value.pointerToArrayElementCount = _
+                                    .arrayElementCount
+                                value.isReadOnly = .isConst
+                            End With
+                        End If
+                    End If
                     value.isLValue = -1
                     value.storageType = value.typeName
                     If parser.context <> 0 Then
@@ -2923,6 +3454,8 @@ Private Function ParseSimpleUnaryValue( _
                     parser.translation[0].body.recordFields(cField).arrayBound, _
                     boundCount, MAX_GENERIC_ARRAY_COUNT) <> 0 Then _
                     value.arrayBound = Trim(Str(boundCount)) & "ULL"
+                If fieldIndex >= 0 AndAlso value.isLayoutArray = 0 Then _
+                    value.isArrayStorageAlias = -1
             End If
             value.isWholeCall = 0
         ElseIf Left(suffix, 1) = "[" Then
@@ -2930,6 +3463,9 @@ Private Function ParseSimpleUnaryValue( _
             Dim sourceStorageType As String = value.storageType
             Dim sourceArrayName As String = value.arraySourceName
             Dim sourceArrayIsReadOnly As Long = value.isReadOnly
+            Dim sourceIsPointerToArray As Long = value.isPointerToArray
+            Dim sourcePointerToArrayElementCount As Long = _
+                value.pointerToArrayElementCount
             Dim sourcePointerDepth As Long = 0
             Dim sourcePointerBase As String = sourcePointerType
             While Right(sourcePointerBase, 4) = " Ptr"
@@ -2976,10 +3512,12 @@ Private Function ParseSimpleUnaryValue( _
                 Wend
 
                 Dim flattenedIndex As String = indexExpressions(0)
+                Dim indexedDimensions As String = indexExpressions(0)
                 For dimensionIndex As Long = 1 To indexCount - 1
                     flattenedIndex = "(" & flattenedIndex & " * (" & _
                         dimensionBounds(dimensionIndex) & ") + (" & _
                         indexExpressions(dimensionIndex) & "))"
+                    indexedDimensions &= ", " & indexExpressions(dimensionIndex)
                 Next
                 Dim remainingElementCount As String = "1ULL"
                 Dim remainingDimensions As String
@@ -2992,11 +3530,29 @@ Private Function ParseSimpleUnaryValue( _
                 Next
                 Dim arrayName As String = value.text
                 Dim elementType As String = value.arrayElementType
+                Dim usesMultidimensionalStorage As Long = 0
+                If value.arraySourceName <> "" Then
+                    Dim sourceArrayObjectIndex As Long = _
+                        CBodyExternalObjectIndex( _
+                            parser.translation[0], value.arraySourceName)
+                    If sourceArrayObjectIndex >= 0 Then
+                        ' Reused static arrays live in the type context with
+                        ' their original rank. Body-owned and local arrays use
+                        ' the row-major flat storage emitted by the body pass.
+                        If parser.translation[0].body.externalObjects( _
+                            sourceArrayObjectIndex).isReused <> 0 Then _
+                            usesMultidimensionalStorage = -1
+                    End If
+                End If
                 If indexCount < value.arrayRank AndAlso _
                    value.arrayRank - indexCount > 1 AndAlso _
                    parser.unevaluated = 0 Then Return 0
                 If indexCount = value.arrayRank Then
-                    value.text = arrayName & "(" & flattenedIndex & ")"
+                    If usesMultidimensionalStorage <> 0 Then
+                        value.text = arrayName & "(" & indexedDimensions & ")"
+                    Else
+                        value.text = arrayName & "(" & flattenedIndex & ")"
+                    End If
                     value.typeName = elementType
                     value.layoutType = elementType
                     value.storageType = elementType
@@ -3013,11 +3569,22 @@ Private Function ParseSimpleUnaryValue( _
                     value.isLayoutArray = 0
                     value.isArrayElementZero = 0
                 Else
-                    Dim baseOffset As String = _
-                        "(" & flattenedIndex & " * " & _
-                        remainingElementCount & ")"
-                    value.text = "CPtr(" & elementType & " Ptr, @(" & _
-                        arrayName & "(" & baseOffset & ")))"
+                    If usesMultidimensionalStorage <> 0 Then
+                        ' Header-owned arrays retain their dimensions. Select
+                        ' the first element of the remaining row for C decay.
+                        For dimensionIndex As Long = indexCount To _
+                            value.arrayRank - 1
+                            indexedDimensions &= ", 0"
+                        Next
+                        value.text = "CPtr(" & elementType & " Ptr, @(" & _
+                            arrayName & "(" & indexedDimensions & ")))"
+                    Else
+                        Dim baseOffset As String = _
+                            "(" & flattenedIndex & " * " & _
+                            remainingElementCount & ")"
+                        value.text = "CPtr(" & elementType & " Ptr, @(" & _
+                            arrayName & "(" & baseOffset & ")))"
+                    End If
                     value.typeName = elementType & " Ptr"
                     value.layoutType = value.typeName
                     value.storageType = value.typeName
@@ -3060,6 +3627,17 @@ Private Function ParseSimpleUnaryValue( _
                 parser.hasFunctionCall = -1
             ElseIf value.isLayoutArray <> 0 Then
                 value.text &= "(" & indexValue.text & ")"
+            ElseIf sourceIsPointerToArray <> 0 Then
+                Dim elementPointerType As String = sourcePointerType
+                If Right(elementPointerType, 4) <> " Ptr" OrElse _
+                   sourcePointerToArrayElementCount <= 0 Then Return 0
+                Dim typedArrayPointer As String = _
+                    "CPtr(" & elementPointerType & ", " & _
+                    SimpleCharacterPointer(value) & ")"
+                Dim rowOffset As String = "(" & indexValue.text & " * " & _
+                    Trim(Str(sourcePointerToArrayElementCount)) & ")"
+                value.text = "CPtr(" & elementPointerType & ", @(" & _
+                    typedArrayPointer & "[" & rowOffset & "]))"
             Else
                 ' FreeBASIC uses [] for typed pointer indexing and () for
                 ' declared array indexing. Keep C pointer subscripting typed.
@@ -3082,18 +3660,55 @@ Private Function ParseSimpleUnaryValue( _
             If sourcePointerDepth = 1 Then _
                 value.isReadOnly = (Left(value.typeName, 6) = "Const ") OrElse value.isReadOnly
             value.isIncompleteArray = 0
-            value.typeName = SimplePointeeType(sourcePointerType)
-            value.layoutType = SimplePointeeType(value.layoutType)
-            value.cRecord = CBodyRecordName( _
-                parser.translation[0], parser.catalog[0], value.typeName)
-            value.storageType = SimpleArrayElementStorageType( _
-                sourceStorageType, sourcePointerType)
-            value.isLayoutArray = 0
-            If value.typeName = "Any" Then Return 0
-            value.isLValue = -1
-            value.lValueText = value.text
-            value.arrayCount = 0
-            value.arrayBound = ""
+            If sourceIsPointerToArray <> 0 Then
+                ' The C subscript selects one array row, which then decays to a
+                ' pointer to that row's first element in value context.
+                value.typeName = sourcePointerType
+                value.layoutType = sourcePointerType
+                value.storageType = sourcePointerType
+                value.cRecord = ""
+                value.isLValue = 0
+                value.lValueText = ""
+                value.arrayCount = 0
+                value.arrayBound = ""
+                value.arrayRank = 0
+                value.arrayDimensions = ""
+                value.arrayElementType = ""
+                value.isLayoutArray = 0
+                value.isPointerToArray = 0
+                value.pointerToArrayElementCount = 0
+            Else
+                Dim arrayElementType As String = _
+                    SimplePointeeType(sourcePointerType)
+                Dim arrayElementStorageType As String = _
+                    SimpleArrayElementStorageType( _
+                        sourceStorageType, sourcePointerType)
+                If value.isLayoutArray <> 0 AndAlso _
+                   value.arrayElementType <> "" Then
+                    ' A declared C array already records its element type.
+                    ' Its elements may be pointers, so peeling one level from
+                    ' the array's decayed pointer would lose that pointer.
+                    arrayElementType = value.arrayElementType
+                    arrayElementStorageType = value.arrayElementType
+                End If
+                value.typeName = arrayElementType
+                If value.typeName = "" AndAlso value.isLayoutArray <> 0 Then
+                    ' A C array typedef can hide its scalar element type from the
+                    ' body alias table while the generated layout still has the
+                    ' exact FreeBASIC storage type for this indexed element.
+                    value.typeName = SimplePointeeType(sourceStorageType)
+                End If
+                value.layoutType = SimplePointeeType(value.layoutType)
+                value.cRecord = CBodyRecordName( _
+                    parser.translation[0], parser.catalog[0], value.typeName)
+                value.storageType = arrayElementStorageType
+                value.isLayoutArray = 0
+                If value.typeName = "Any" Then Return 0
+                value.isLValue = -1
+                value.lValueText = value.text
+                value.arrayCount = 0
+                value.arrayBound = ""
+            End If
             value.arraySourceName = sourceArrayName
             value.isArrayElementZero = CInt( _
                 sourceArrayName <> "" AndAlso IsSimpleZeroArrayIndex(indexText) <> 0)
@@ -3111,10 +3726,46 @@ Private Function ParseSimpleUnaryValue( _
     Loop
     ' A C array used without an index decays to its first element's address.
     If value.isLayoutArray <> 0 Then
-        If value.arrayRank > 1 AndAlso parser.unevaluated = 0 Then Return 0
-        value.text = "(@" & value.text & "(0))"
-        If InStr(value.typeName, " Ptr") <> 0 Then value.text = "CPtr(" & value.typeName & ", " & value.text & ")"
-        value.isLayoutArray = 0
+        If value.arrayRank > 1 AndAlso parser.unevaluated = 0 Then
+            Dim dimensionBounds() As String
+            Dim dimensionBoundCount As Long
+            If SplitSimpleCList( _
+                value.arrayDimensions, dimensionBounds(), _
+                dimensionBoundCount) = 0 OrElse _
+               dimensionBoundCount <> value.arrayRank OrElse _
+               value.arrayElementType = "" Then Return 0
+            Dim rowElementCount As LongInt = 1
+            For dimensionIndex As Long = 1 To value.arrayRank - 1
+                Dim dimensionCount As Long
+                If EvaluateSimpleArrayBound( _
+                    dimensionBounds(dimensionIndex), dimensionCount, _
+                    MAX_GENERIC_ARRAY_COUNT) = 0 OrElse dimensionCount < 1 OrElse _
+                   rowElementCount > _
+                       (MAX_GENERIC_ARRAY_COUNT \ dimensionCount) Then Return 0
+                rowElementCount *= dimensionCount
+            Next
+            value.text = "CPtr(" & value.arrayElementType & " Ptr, @(" & _
+                value.text & "(0)))"
+            value.typeName = value.arrayElementType & " Ptr"
+            value.layoutType = value.typeName
+            value.storageType = value.typeName
+            value.isPointerToArray = -1
+            value.pointerToArrayElementCount = CLng(rowElementCount)
+            value.isLValue = 0
+            value.lValueText = ""
+            value.arrayCount = 0
+            value.arrayBound = ""
+            value.arrayRank = 0
+            value.arrayDimensions = ""
+            value.arrayElementType = ""
+            value.arraySourceName = ""
+            value.isLayoutArray = 0
+        Else
+            value.text = "(@" & value.text & "(0))"
+            If InStr(value.typeName, " Ptr") <> 0 Then _
+                value.text = "CPtr(" & value.typeName & ", " & value.text & ")"
+            value.isLayoutArray = 0
+        End If
     End If
     Return -1
 End Function
@@ -3241,6 +3892,11 @@ Private Function ApplySimpleBinaryValue( _
     End If
     Dim commonType As String = SimpleCommonArithmeticType( _
         parser.catalog[0], value.typeName, rightValue.typeName)
+    Dim commonKind As Long = SimpleArithmeticKind( _
+        parser.catalog[0], commonType)
+    If commonKind > 4 AndAlso _
+       (operatorText = "&" OrElse operatorText = "|" OrElse _
+        operatorText = "^" OrElse operatorText = "%") Then Return 0
     Dim leftText As String = SimpleValueCast(parser.translation[0], parser.catalog[0], value, commonType)
     Dim rightText As String = SimpleValueCast(parser.translation[0], parser.catalog[0], rightValue, commonType)
     Dim fbOperator As String = operatorText
@@ -3417,6 +4073,13 @@ Private Function ParseSimpleExpressionValue( _
     parameterTypes() As String, ByVal parameterCount As Long _
 ) As Long
     If depth > MAX_EXPRESSION_DEPTH Then Return 0
+    If parser.simpleGnuExpressionsNormalized = 0 Then
+        parser.simpleGnuExpressionsNormalized = -1
+        Dim statementExpressionText As String
+        If NormalizeSimpleGnuStatementExpressions( _
+            parser.sourceText, statementExpressionText) <> 0 Then _
+            parser.sourceText = statementExpressionText
+    End If
     If ParseSimpleUnaryValue(parser, value, depth, callableNames(), callableCount, _
                              parameterNames(), parameterAliases(), parameterTypes(), parameterCount) = 0 Then Return 0
     Do
@@ -3452,6 +4115,38 @@ Private Function ParseSimpleExpressionValue( _
                 (Left(Trim(falseValue.text), Len("ProcPtr(")) = "ProcPtr(" AndAlso _
                  SimpleIsNullValue(trueValue) <> 0)) Then
                 commonType = parser.targetType
+            End If
+            If IsCBodyCallbackTypeInContext( _
+                parser.translation[0], commonType) <> 0 AndAlso _
+               trueValue.isFunctionDesignator <> 0 AndAlso _
+               falseValue.isFunctionDesignator <> 0 Then
+                If parser.context = 0 Then Return 0
+                Dim callbackTemporary As String = _
+                    NewSimpleTemporary(parser, commonType)
+                Dim conditionText As String = SimpleScalarTruthCondition( _
+                    parser.translation[0], parser.catalog[0], value)
+                If callbackTemporary = "" OrElse conditionText = "" Then Return 0
+                value.prelude &= "If " & conditionText & " Then" & Chr(10) & _
+                    IndentSimpleBodyText( _
+                        trueValue.prelude & callbackTemporary & _
+                        " = CPtr(" & commonType & ", " & trueValue.text & ")", _
+                        "    ") & Chr(10) & "Else" & Chr(10) & _
+                    IndentSimpleBodyText( _
+                        falseValue.prelude & callbackTemporary & _
+                        " = CPtr(" & commonType & ", " & falseValue.text & ")", _
+                        "    ") & Chr(10) & "End If" & Chr(10)
+                value.text = callbackTemporary
+                value.typeName = commonType
+                value.layoutType = commonType
+                value.storageType = commonType
+                value.isLValue = 0
+                value.isFunctionDesignator = 0
+                value.lValueText = ""
+                value.cRecord = ""
+                value.isWholeCall = 0
+                value.arrayCount = 0
+                value.arrayBound = ""
+                Continue Do
             End If
             If commonType = "void" OrElse trueValue.prelude <> "" OrElse falseValue.prelude <> "" Then
                 If commonType = "void" Then
@@ -3552,6 +4247,364 @@ Private Function ParseSimpleExpressionValue( _
     Return -1
 End Function
 
+Private Function NormalizeGnulibCountofElementSizeof( _
+    ByVal sourceExpression As String, ByRef normalizedExpression As String _
+) As Long
+    normalizedExpression = sourceExpression
+    Dim position As Long = 1
+    While position <= Len(sourceExpression)
+        If LCase(Mid(sourceExpression, position, 6)) <> "sizeof" Then
+            position += 1
+            Continue While
+        End If
+        Dim nextByte As Long = position + 6
+        If nextByte <= Len(sourceExpression) AndAlso _
+           IsIdentifierPart(Asc(sourceExpression, nextByte)) <> 0 Then
+            position += 6
+            Continue While
+        End If
+        SkipCSpaces(sourceExpression, nextByte)
+        If nextByte > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, nextByte) <> Asc("(") Then
+            position += 6
+            Continue While
+        End If
+
+        Dim groupEnd As Long = nextByte
+        If ScanSimpleExpressionGroup( _
+            sourceExpression, groupEnd, Asc("("), Asc(")")) = 0 Then Return 0
+        Dim subscriptPosition As Long = groupEnd
+        SkipCSpaces(sourceExpression, subscriptPosition)
+        If subscriptPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, subscriptPosition) <> Asc("[") Then
+            position = groupEnd
+            Continue While
+        End If
+        subscriptPosition += 1
+        SkipCSpaces(sourceExpression, subscriptPosition)
+        If subscriptPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, subscriptPosition) <> Asc("0") Then
+            position = groupEnd
+            Continue While
+        End If
+        subscriptPosition += 1
+        SkipCSpaces(sourceExpression, subscriptPosition)
+        If subscriptPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, subscriptPosition) <> Asc("]") Then
+            position = groupEnd
+            Continue While
+        End If
+        subscriptPosition += 1
+
+        normalizedExpression = _
+            Left(sourceExpression, nextByte) & _
+            Mid(sourceExpression, nextByte + 1, groupEnd - nextByte - 2) & _
+            "[0])" & Mid(sourceExpression, subscriptPosition)
+        Return -1
+    Wend
+    Return 0
+End Function
+
+Private Function StripGnulibCountofArrayTypeCheck( _
+    ByVal sourceExpression As String, ByRef normalizedExpression As String _
+) As Long
+    normalizedExpression = sourceExpression
+    Dim plusPosition As Long = 1
+    While plusPosition <= Len(sourceExpression)
+        If Asc(sourceExpression, plusPosition) <> Asc("+") Then
+            plusPosition += 1
+            Continue While
+        End If
+
+        Dim checkPosition As Long = plusPosition + 1
+        SkipCSpaces(sourceExpression, checkPosition)
+        If checkPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, checkPosition) <> Asc("0") Then
+            plusPosition += 1
+            Continue While
+        End If
+        checkPosition += 1
+        SkipCSpaces(sourceExpression, checkPosition)
+        If checkPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, checkPosition) <> Asc("*") Then
+            plusPosition += 1
+            Continue While
+        End If
+        checkPosition += 1
+        SkipCSpaces(sourceExpression, checkPosition)
+        If LCase(Mid(sourceExpression, checkPosition, 6)) <> "sizeof" Then
+            plusPosition += 1
+            Continue While
+        End If
+        checkPosition += 6
+        If checkPosition <= Len(sourceExpression) AndAlso _
+           IsIdentifierPart(Asc(sourceExpression, checkPosition)) <> 0 Then
+            plusPosition += 1
+            Continue While
+        End If
+        SkipCSpaces(sourceExpression, checkPosition)
+        If checkPosition > Len(sourceExpression) OrElse _
+           Asc(sourceExpression, checkPosition) <> Asc("(") Then
+            plusPosition += 1
+            Continue While
+        End If
+
+        Dim groupEnd As Long = checkPosition
+        If ScanSimpleExpressionGroup( _
+            sourceExpression, groupEnd, Asc("("), Asc(")")) = 0 Then
+            plusPosition += 1
+            Continue While
+        End If
+        Dim typeCheck As String = Mid( _
+            sourceExpression, checkPosition + 1, groupEnd - checkPosition - 2)
+        If InStr(LCase(typeCheck), "_gl_verify_error_if_negative") = 0 OrElse _
+           InStr(typeCheck, ":") = 0 OrElse _
+           InStr(LCase(typeCheck), "struct") = 0 Then
+            plusPosition += 1
+            Continue While
+        End If
+
+        ' The C compiler has already checked the gnulib array guard. Its
+        ' zero-times-sizeof term contributes no value to the valid expression.
+        Dim withoutTypeCheck As String = _
+            Left(sourceExpression, plusPosition - 1) & _
+            Mid(sourceExpression, groupEnd)
+        Dim normalizedCount As String
+        If NormalizeGnulibCountofElementSizeof( _
+            withoutTypeCheck, normalizedCount) <> 0 Then
+            normalizedExpression = normalizedCount
+        Else
+            normalizedExpression = withoutTypeCheck
+        End If
+        Return -1
+    Wend
+    Return 0
+End Function
+
+Private Function IsSimpleGnuStatementExpressionAlias( _
+    ByVal sourceText As String, ByRef aliasName As String _
+) As Long
+    ' Obstack size macros use a single local pointer alias. Inline only a
+    ' plain object name or its address, so substitution cannot repeat a call
+    ' or another side effect that C would evaluate once.
+    sourceText = Trim(sourceText)
+    While Len(sourceText) >= 2 AndAlso Left(sourceText, 1) = "(" AndAlso _
+          Right(sourceText, 1) = ")"
+        Dim groupEnd As Long = 1
+        If ScanSimpleExpressionGroup( _
+            sourceText, groupEnd, Asc("("), Asc(")")) = 0 OrElse _
+           groupEnd <> Len(sourceText) + 1 Then Exit While
+        sourceText = Trim(Mid(sourceText, 2, Len(sourceText) - 2))
+    Wend
+
+    If Left(sourceText, 1) = "&" Then
+        sourceText = Trim(Mid(sourceText, 2))
+    End If
+    If sourceText = "" OrElse _
+       IsIdentifierStart(Asc(sourceText, 1)) = 0 Then Return 0
+    For position As Long = 2 To Len(sourceText)
+        If IsIdentifierPart(Asc(sourceText, position)) = 0 Then Return 0
+    Next
+    aliasName = sourceText
+    Return -1
+End Function
+
+Private Function ReplaceSimpleGnuStatementExpressionAlias( _
+    ByVal sourceText As String, ByVal aliasName As String, _
+    ByVal initializer As String, ByRef didReplace As Long _
+) As String
+    Dim result As String
+    Dim position As Long = 1
+    Dim quoteByte As Long = 0
+    Dim escaped As Long = 0
+    didReplace = 0
+    While position <= Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            result &= Chr(currentByte)
+            If escaped <> 0 Then
+                escaped = 0
+            ElseIf currentByte = Asc(Chr(92)) Then
+                escaped = -1
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+            position += 1
+        ElseIf currentByte = Asc("'") OrElse currentByte = Asc(Chr(34)) Then
+            quoteByte = currentByte
+            result &= Chr(currentByte)
+            position += 1
+        ElseIf IsIdentifierStart(currentByte) <> 0 Then
+            Dim tokenStart As Long = position
+            position += 1
+            While position <= Len(sourceText) AndAlso _
+                  IsIdentifierPart(Asc(sourceText, position)) <> 0
+                position += 1
+            Wend
+            Dim token As String = Mid(sourceText, tokenStart, position - tokenStart)
+            Dim priorPosition As Long = Len(result)
+            While priorPosition > 0 AndAlso _
+                  IsSpaceByte(Asc(result, priorPosition)) <> 0
+                priorPosition -= 1
+            Wend
+            If token = aliasName AndAlso _
+               (priorPosition = 0 OrElse _
+                Asc(result, priorPosition) <> Asc(".")) Then
+                result &= "(" & initializer & ")"
+                didReplace = -1
+            Else
+                result &= token
+            End If
+        Else
+            result &= Chr(currentByte)
+            position += 1
+        End If
+    Wend
+    Return result
+End Function
+
+Private Function NormalizeSimpleGnuStatementExpressionAt( _
+    ByVal sourceText As String, ByVal extensionPosition As Long, _
+    ByRef normalizedExpression As String, ByRef endPosition As Long _
+) As Long
+    normalizedExpression = ""
+    endPosition = extensionPosition
+    Const extensionToken As String = "__extension__"
+    If Mid(sourceText, extensionPosition, Len(extensionToken)) <> extensionToken Then _
+        Return 0
+    Dim afterToken As Long = extensionPosition + Len(extensionToken)
+    If afterToken <= Len(sourceText) AndAlso _
+       IsIdentifierPart(Asc(sourceText, afterToken)) <> 0 Then Return 0
+    SkipCSpaces(sourceText, afterToken)
+    If afterToken > Len(sourceText) OrElse _
+       Asc(sourceText, afterToken) <> Asc("(") Then Return 0
+
+    Dim expressionEnd As Long = afterToken
+    If ScanSimpleExpressionGroup( _
+        sourceText, expressionEnd, Asc("("), Asc(")")) = 0 Then Return 0
+    Dim statementBlock As String = Trim(Mid( _
+        sourceText, afterToken + 1, expressionEnd - afterToken - 2))
+    If Left(statementBlock, 1) <> "{" Then Return 0
+    Dim blockEnd As Long = 1
+    If ScanSimpleExpressionGroup( _
+        statementBlock, blockEnd, Asc("{"), Asc("}")) = 0 OrElse _
+       blockEnd <> Len(statementBlock) + 1 Then Return 0
+
+    Dim blockContents As String = Trim(Mid( _
+        statementBlock, 2, Len(statementBlock) - 2))
+    Dim declarationEnd As Long = InStr(blockContents, ";")
+    If declarationEnd <= 1 Then Return 0
+    Dim declaration As String = Trim(Left(blockContents, declarationEnd - 1))
+    Dim finalStatement As String = Trim(Mid(blockContents, declarationEnd + 1))
+    If Right(finalStatement, 1) <> ";" Then Return 0
+    finalStatement = Trim(Left(finalStatement, Len(finalStatement) - 1))
+    If finalStatement = "" OrElse InStr(finalStatement, ";") <> 0 Then Return 0
+
+    Dim assignmentPosition As Long = InStr(declaration, "=")
+    If assignmentPosition <= 1 OrElse _
+       Mid(declaration, assignmentPosition + 1, 1) = "=" OrElse _
+       (assignmentPosition > 1 AndAlso _
+        Mid(declaration, assignmentPosition - 1, 1) = "=") Then Return 0
+    Dim declaredTypeAndPointer As String = _
+        RTrim(Left(declaration, assignmentPosition - 1))
+    Dim initializer As String = Trim(Mid(declaration, assignmentPosition + 1))
+    Dim aliasEnd As Long = Len(declaredTypeAndPointer)
+    While aliasEnd > 0 AndAlso _
+          IsSpaceByte(Asc(declaredTypeAndPointer, aliasEnd)) <> 0
+        aliasEnd -= 1
+    Wend
+    Dim aliasStart As Long = aliasEnd
+    While aliasStart > 0 AndAlso _
+          IsIdentifierPart(Asc(declaredTypeAndPointer, aliasStart)) <> 0
+        aliasStart -= 1
+    Wend
+    aliasStart += 1
+    If aliasStart > aliasEnd OrElse _
+       IsIdentifierStart(Asc(declaredTypeAndPointer, aliasStart)) = 0 Then Return 0
+    Dim aliasName As String = Mid( _
+        declaredTypeAndPointer, aliasStart, aliasEnd - aliasStart + 1)
+    Dim typeAndPointer As String = RTrim( _
+        Left(declaredTypeAndPointer, aliasStart - 1))
+    If Right(typeAndPointer, 1) <> "*" OrElse _
+       Trim(Left(typeAndPointer, Len(typeAndPointer) - 1)) = "" Then Return 0
+    Dim aliasInitializer As String
+    If IsSimpleGnuStatementExpressionAlias(initializer, aliasInitializer) = 0 Then _
+        Return 0
+
+    Dim didReplace As Long
+    normalizedExpression = ReplaceSimpleGnuStatementExpressionAlias( _
+        finalStatement, aliasName, initializer, didReplace)
+    If didReplace = 0 Then
+        normalizedExpression = ""
+        Return 0
+    End If
+    endPosition = expressionEnd
+    Return -1
+End Function
+
+Private Function NormalizeSimpleGnuStatementExpressions( _
+    ByVal sourceText As String, ByRef normalizedText As String _
+) As Long
+    normalizedText = ""
+    Dim position As Long = 1
+    Dim quoteByte As Long = 0
+    Dim escaped As Long = 0
+    Dim changed As Long = 0
+    While position <= Len(sourceText)
+        Dim currentByte As Long = Asc(sourceText, position)
+        If quoteByte <> 0 Then
+            normalizedText &= Chr(currentByte)
+            If escaped <> 0 Then
+                escaped = 0
+            ElseIf currentByte = Asc(Chr(92)) Then
+                escaped = -1
+            ElseIf currentByte = quoteByte Then
+                quoteByte = 0
+            End If
+            position += 1
+        ElseIf currentByte = Asc("'") OrElse currentByte = Asc(Chr(34)) Then
+            quoteByte = currentByte
+            normalizedText &= Chr(currentByte)
+            position += 1
+        ElseIf Mid(sourceText, position, 2) = "/*" Then
+            Dim commentEnd As Long = InStr(position + 2, sourceText, "*/")
+            If commentEnd = 0 Then
+                normalizedText &= Mid(sourceText, position)
+                Exit While
+            End If
+            normalizedText &= Mid(sourceText, position, commentEnd + 2 - position)
+            position = commentEnd + 2
+        ElseIf Mid(sourceText, position, 2) = "//" Then
+            normalizedText &= Mid(sourceText, position)
+            Exit While
+        ElseIf IsIdentifierStart(currentByte) <> 0 Then
+            Dim tokenStart As Long = position
+            position += 1
+            While position <= Len(sourceText) AndAlso _
+                  IsIdentifierPart(Asc(sourceText, position)) <> 0
+                position += 1
+            Wend
+            Dim token As String = Mid(sourceText, tokenStart, position - tokenStart)
+            If token = "__extension__" Then
+                Dim expressionText As String
+                Dim endPosition As Long
+                If NormalizeSimpleGnuStatementExpressionAt( _
+                    sourceText, tokenStart, expressionText, endPosition) <> 0 Then
+                    normalizedText &= "(" & expressionText & ")"
+                    position = endPosition
+                    changed = -1
+                    Continue While
+                End If
+            End If
+            normalizedText &= token
+        Else
+            normalizedText &= Chr(currentByte)
+            position += 1
+        End If
+    Wend
+    Return changed
+End Function
+
 Private Function TranslateSimpleExpression( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -3569,6 +4622,10 @@ Private Function TranslateSimpleExpression( _
     outputExpression = ""
     hasBooleanOperator = 0
     hasFunctionCall = 0
+    Dim normalizedExpression As String
+    If StripGnulibCountofArrayTypeCheck( _
+        inputExpression, normalizedExpression) <> 0 Then _
+        inputExpression = normalizedExpression
     If translation.target.profile <> C2FB_TARGET_SQLITE AndAlso allowBodyReplacements <> 0 Then
         Dim replacementText As String
         Dim toFreeBasic As Long
@@ -3608,8 +4665,19 @@ Private Function TranslateSimpleExpression( _
        (requireConstant <> 0 AndAlso _
         (parser.hasRuntimeValue <> 0 OrElse parser.hasFunctionCall <> 0)) Then Return 0
     outputExpression = value.text
+    If requireConstant = 0 AndAlso _
+       NormalizeFbBodyType(catalog, targetType) = "CLongDouble" AndAlso _
+       NormalizeFbBodyType(catalog, value.typeName) <> "CLongDouble" Then
+        ' C aggregate members need the same explicit ABI-carrier conversion as
+        ' scalar declarations when their initializer has an integer type.
+        outputExpression = SimpleValueCast( _
+            translation, catalog, value, targetType)
+        If outputExpression = "" Then Return 0
+    End If
     Dim targetKind As Long = SimpleArithmeticKind(parser.catalog[0], targetType)
-    If targetKind > 0 AndAlso targetKind <= 4 AndAlso SimpleArithmeticKind(parser.catalog[0], value.typeName) > 4 Then
+    If targetKind > 0 AndAlso targetKind <= 4 AndAlso _
+       SimpleFloatingCastNeedsFix( _
+           SimpleArithmeticKind(parser.catalog[0], value.typeName)) <> 0 Then
         outputExpression = "Cast(" & targetType & ", Fix(" & outputExpression & "))"
     End If
     hasBooleanOperator = parser.hasBooleanOperator
@@ -3630,11 +4698,15 @@ Private Function TranslateSequencedExpression( _
     outputExpression = ""
     expressionPrelude = ""
     Dim sourceExpression As String = inputExpression
+    Dim normalizedExpression As String
+    If StripGnulibCountofArrayTypeCheck( _
+        sourceExpression, normalizedExpression) <> 0 Then _
+        sourceExpression = normalizedExpression
     If translation.target.profile <> C2FB_TARGET_SQLITE Then
         Dim replacementText As String
         Dim toFreeBasic As Long
         If C2fbReplacementRuleMatch( _
-            translation.genericC.policy, inputExpression, replacementText, toFreeBasic) <> 0 Then
+            translation.genericC.policy, sourceExpression, replacementText, toFreeBasic) <> 0 Then
             If toFreeBasic <> 0 Then
                 If C2fbReplacementRuleHasMultipleLines( _
                     translation.genericC.policy, inputExpression) <> 0 Then Return 0
@@ -3673,6 +4745,14 @@ Private Function TranslateSequencedExpression( _
         Return 0
     End If
     outputExpression = value.text
+    If NormalizeFbBodyType(catalog, targetType) = "CLongDouble" AndAlso _
+       NormalizeFbBodyType(catalog, value.typeName) <> "CLongDouble" Then
+        ' C permits arithmetic values to initialize a long double object. The
+        ' FreeBASIC ABI carrier is byte-backed, so make the conversion explicit.
+        outputExpression = SimpleValueCast( _
+            translation, catalog, value, targetType)
+        If outputExpression = "" Then Return 0
+    End If
     Dim targetPointeeType As String = SimplePointeeType(targetType)
     Dim valuePointeeType As String = SimplePointeeType(value.typeName)
     Dim targetHasConstPointee As Long = CInt(Left(targetType, 6) = "Const ")
@@ -3698,7 +4778,9 @@ Private Function TranslateSequencedExpression( _
         outputExpression = "CPtr(" & targetType & ", " & outputExpression & ")"
     End If
     Dim targetKind As Long = SimpleArithmeticKind(parser.catalog[0], targetType)
-    If targetKind > 0 AndAlso targetKind <= 4 AndAlso SimpleArithmeticKind(parser.catalog[0], value.typeName) > 4 Then
+    If targetKind > 0 AndAlso targetKind <= 4 AndAlso _
+       SimpleFloatingCastNeedsFix( _
+           SimpleArithmeticKind(parser.catalog[0], value.typeName)) <> 0 Then
         outputExpression = "Cast(" & targetType & ", Fix(" & outputExpression & "))"
     End If
     expressionPrelude = value.prelude

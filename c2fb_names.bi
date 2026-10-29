@@ -31,6 +31,14 @@ Private Function C2fbNameListContains( _
     Return 0
 End Function
 
+Private Function C2fbDelimitedNameListContains( _
+    ByVal delimitedNames As String, ByVal targetName As String _
+) As Long
+    If delimitedNames = "" OrElse targetName = "" Then Return 0
+    Return CInt(InStr( _
+        LCase(delimitedNames), "|" & LCase(targetName) & "|") <> 0) * -1
+End Function
+
 Private Sub ResetC2fbNameSet(ByRef nameSet As C2fbNameSetModel)
     nameSet.itemCount = 0
     nameSet.capacity = 256

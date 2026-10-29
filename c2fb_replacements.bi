@@ -383,10 +383,20 @@ Private Function IsSimpleFreeBasicBodyReplacement( _
             Select Case token
             Case "goto", "if", "then", "else", "for", "next", "while", _
                  "do", "loop", "select", "case", "break", "continue", _
-                 "end", "dim", "static", "redim", "erase", "type", _
+                 "end", "dim", "static", "redim", "erase", _
                  "union", "enum", "declare", "property", "constructor", _
                  "destructor", "class", "namespace", "exit", "function", "sub"
                 Return 0
+            Case "type"
+                ' Type<T>(...) is a FreeBASIC value constructor, not a block.
+                Dim constructorPosition As Long = position
+                While constructorPosition <= Len(replacementText) AndAlso _
+                      IsSpaceByte(Asc(replacementText, constructorPosition)) <> 0
+                    constructorPosition += 1
+                Wend
+                If constructorPosition > Len(replacementText) OrElse _
+                   Asc(replacementText, constructorPosition) <> Asc("<") Then _
+                    Return 0
             Case "return"
                 If sourceIsReturn = 0 OrElse wordCount <> 1 Then Return 0
             End Select

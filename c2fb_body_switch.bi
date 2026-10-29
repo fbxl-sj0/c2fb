@@ -181,8 +181,9 @@ Private Function ParseSimpleSwitchStatement( _
        Asc(sourceText, parsePosition) <> Asc("{") Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
     parsePosition += 1
     Dim breakLabel As String = NewSimpleFlowLabel(context)
-    If PushSimpleControlFrame(context, breakLabel, "") = 0 Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
+    If PushSimpleControlFrame(context, breakLabel, "", -1) = 0 Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
     If PushSimpleBodyScope(context, symbolCount, localCount) = 0 Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
+    Dim switchFrameIndex As Long = context.frameCount - 1
 
     Dim caseBodies() As String
     Dim branchValues() As String
@@ -244,6 +245,12 @@ Private Function ParseSimpleSwitchStatement( _
         SkipCSpaces(sourceText, parsePosition)
         If parsePosition > Len(sourceText) Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
         If Asc(sourceText, parsePosition) = Asc("}") Then
+            If context.frames(switchFrameIndex).nestedCaseBlockDepth > 0 Then
+                parsePosition += 1
+                context.frames(switchFrameIndex).nestedCaseBlockDepth -= 1
+                PopSimpleBodyScope(context, symbolCount, localCount)
+                Continue While
+            End If
             parsePosition += 1
             sawClosingBrace = -1
             Exit While
@@ -329,7 +336,6 @@ Private Function ParseSimpleSwitchStatement( _
             branchStatementCount += 1
             If statementTerminates <> 0 Then
                 branchReturns = -1
-                Exit While
             ElseIf context.branchJump <> 0 Then
                 branchBreaks = -1
                 Exit While
@@ -345,7 +351,77 @@ Private Function ParseSimpleSwitchStatement( _
         Wend
         If parsePosition <= Len(sourceText) AndAlso _
            Asc(sourceText, parsePosition) <> Asc("}") AndAlso _
-           IsSimpleSwitchLabel(sourceText, parsePosition) = 0 Then Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
+           IsSimpleSwitchLabel(sourceText, parsePosition) = 0 Then
+            If Asc(sourceText, parsePosition) <> Asc("{") OrElse _
+               SimpleBlockContainsSwitchLabel( _
+                   sourceText, parsePosition) = 0 Then _
+                Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
+
+            ' C permits case labels inside a compound block between switch
+            ' groups. Hoist only uninitialized declarations that precede the
+            ' first nested label; their storage is function-scoped in C2FB.
+            Dim preambleText As String
+            Dim preambleTerminates As Long = 0
+            If ParseSimpleCStatement( _
+                translation, catalog, sourceText, parsePosition, _
+                preambleText, indentText, returnType, context, _
+                callableNames(), callableCount, parameterNames(), _
+                parameterAliases(), parameterTypes(), symbolCount, locals(), _
+                localCount, preambleTerminates) = 0 OrElse _
+               preambleTerminates <> 0 OrElse context.branchJump <> 0 Then _
+                Return ReportSimpleSwitchFailure( _
+                    context, sourceText, parsePosition)
+            Dim preambleLine As String = Trim(preambleText)
+            If preambleLine <> "" Then
+                If preambleLine <> "' C nested switch-case scope" AndAlso _
+                   (preambleLine <> "' C automatic storage declaration" AndAlso _
+                    (Left(LCase(preambleLine), 4) <> "dim " OrElse _
+                     InStr(preambleLine, "=") <> 0 OrElse _
+                     InStr(preambleLine, "(") <> 0)) Then _
+                    Return ReportSimpleSwitchFailure( _
+                        context, sourceText, parsePosition)
+                If switchPreamble <> "" Then switchPreamble &= Chr(10)
+                switchPreamble &= indentText & preambleLine
+            End If
+
+            While parsePosition <= Len(sourceText)
+                SkipCSpaces(sourceText, parsePosition)
+                If parsePosition > Len(sourceText) OrElse _
+                   Asc(sourceText, parsePosition) = Asc("}") OrElse _
+                   IsSimpleSwitchLabel(sourceText, parsePosition) <> 0 Then _
+                    Exit While
+                If Asc(sourceText, parsePosition) = Asc(";") Then
+                    parsePosition += 1
+                    Continue While
+                End If
+                preambleText = ""
+                preambleTerminates = 0
+                If ParseSimpleCStatement( _
+                    translation, catalog, sourceText, parsePosition, _
+                    preambleText, indentText, returnType, context, _
+                    callableNames(), callableCount, parameterNames(), _
+                    parameterAliases(), parameterTypes(), symbolCount, locals(), _
+                    localCount, preambleTerminates) = 0 OrElse _
+                   preambleTerminates <> 0 OrElse context.branchJump <> 0 Then _
+                    Return ReportSimpleSwitchFailure( _
+                        context, sourceText, parsePosition)
+                preambleLine = Trim(preambleText)
+                If preambleLine <> "" Then
+                    If preambleLine <> "' C automatic storage declaration" AndAlso _
+                       (Left(LCase(preambleLine), 4) <> "dim " OrElse _
+                        InStr(preambleLine, "=") <> 0 OrElse _
+                        InStr(preambleLine, "(") <> 0) Then _
+                        Return ReportSimpleSwitchFailure( _
+                            context, sourceText, parsePosition)
+                    If switchPreamble <> "" Then switchPreamble &= Chr(10)
+                    switchPreamble &= indentText & preambleLine
+                End If
+            Wend
+        End If
+        If parsePosition <= Len(sourceText) AndAlso _
+           Asc(sourceText, parsePosition) <> Asc("}") AndAlso _
+           IsSimpleSwitchLabel(sourceText, parsePosition) = 0 Then _
+            Return ReportSimpleSwitchFailure(context, sourceText, parsePosition)
         Dim fallsThrough As Long = 0
         If IsSimpleSwitchLabel(sourceText, parsePosition) <> 0 AndAlso _
            branchReturns = 0 AndAlso branchBreaks = 0 Then

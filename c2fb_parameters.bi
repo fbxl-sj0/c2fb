@@ -212,6 +212,66 @@ Private Function CBodyArrayTypedefParameterTypeInContext( _
     Return ""
 End Function
 
+Private Function CBodyPointerToArrayTypedefParameterInContext( _
+    ByRef translation As C2fbTranslationContext, _
+    tokens() As String, ByVal firstToken As Long, ByVal lastToken As Long, _
+    ByRef arrayElementType As String, ByRef arrayElementCount As Long, _
+    ByRef arrayElementIsConst As Long _
+) As Long
+    arrayElementType = ""
+    arrayElementCount = 0
+    arrayElementIsConst = 0
+    Dim typeName As String = ""
+    Dim pointerDepth As Long = 0
+    For tokenIndex As Long = firstToken To lastToken
+        Select Case tokens(tokenIndex)
+        Case "const"
+            If pointerDepth = 0 Then arrayElementIsConst = -1
+        Case "volatile", "restrict", "__restrict", "__restrict__", "register"
+            Continue For
+        Case "*"
+            pointerDepth += 1
+        Case "[", "]", "(", ")"
+            Return 0
+        Case Else
+            If IsIdentifierToken(tokens(tokenIndex)) = 0 OrElse typeName <> "" Then _
+                Return 0
+            typeName = tokens(tokenIndex)
+        End Select
+    Next
+    If typeName = "" OrElse pointerDepth <> 1 Then Return 0
+    For aliasIndex As Long = 0 To translation.body.aliasCount - 1
+        With translation.body.aliases(aliasIndex)
+            If .name <> typeName OrElse .isArray = 0 OrElse _
+               .ambiguous <> 0 OrElse .arrayCount <= 0 OrElse _
+               .arrayElementType = "" Then Continue For
+            arrayElementType = .arrayElementType
+            arrayElementCount = .arrayCount
+            If .isConst <> 0 Then arrayElementIsConst = -1
+            If arrayElementIsConst <> 0 AndAlso _
+               Left(arrayElementType, 6) <> "Const " Then _
+                arrayElementType = "Const " & arrayElementType
+            Return -1
+        End With
+    Next
+    Dim headerAliasIndex As Long = GenericHeaderTypeAliasIndexInHeader( _
+        translation.genericC.header, typeName, 0)
+    If headerAliasIndex >= 0 Then
+        With translation.genericC.header.headerTypeAliases(headerAliasIndex)
+            If .isArray <> 0 AndAlso .arrayCount > 0 AndAlso _
+               .arrayElementType <> "" Then
+                arrayElementType = .arrayElementType
+                arrayElementCount = .arrayCount
+                If arrayElementIsConst <> 0 AndAlso _
+                   Left(arrayElementType, 6) <> "Const " Then _
+                    arrayElementType = "Const " & arrayElementType
+                Return -1
+            End If
+        End With
+    End If
+    Return 0
+End Function
+
 Private Sub SetC2fbParameterConversionResult( _
     ByRef result As C2fbParameterConversionResultModel, _
     ByVal argumentNumber As Long, _
@@ -324,6 +384,37 @@ Private Sub ConvertParameterInContext( _
             End If
         End If
     Next
+
+    If pointerMappingPolicy = C2FB_POINTER_MAPPING_PRESERVE OrElse _
+       typeMappingKind = C2FB_TYPE_MAPPING_GENERIC_HEADER Then
+        Dim callbackResult As C2fbCallbackTypeResultModel
+        ResolveCBodyCallbackTypeInContext( _
+            translation, catalog, tokens(), firstToken, lastToken, _
+            callbackResult, 0, typeMappingKind, 0, -1)
+        If callbackResult.status = C2FB_CALLBACK_TYPE_CONVERTED Then
+            parameterName = callbackResult.callbackName
+            If parameterName = "" Then parameterName = "arg" & Trim(Str(argumentNumber))
+            Dim callbackType As String = callbackResult.freeBasicType
+            If typeMappingKind = C2FB_TYPE_MAPPING_GENERIC_HEADER Then _
+                callbackType = CBodyCallbackDeclarationInContext( _
+                    translation, callbackType)
+            If callbackType = "" Then Exit Sub
+            If typeMappingKind = C2FB_TYPE_MAPPING_GENERIC_HEADER Then
+                Dim callbackStringMode As Long = _
+                    GenericStringOverrideModeForFieldInPolicy( _
+                        translation.genericC.policy, ownerName, "", _
+                        parameterName, argumentNumber)
+                callbackType = ApplyGenericStringOverrideModeInHeader( _
+                    translation.genericC.header, callbackStringMode, callbackType)
+            End If
+            SetC2fbParameterConversionResult( _
+                result, argumentNumber, parameterName, callbackType)
+            Exit Sub
+        ElseIf callbackResult.status = C2FB_CALLBACK_TYPE_UNSUPPORTED AndAlso _
+               callbackResult.callbackName <> "" Then
+            Exit Sub
+        End If
+    End If
 
     Dim nameIndex As Long = -1
     Dim arrayIndex As Long = -1
@@ -449,6 +540,51 @@ Private Sub ConvertParameterInContext( _
     End If
 
     If typeMappingKind = C2FB_TYPE_MAPPING_BODY AndAlso nameIndex >= firstToken Then
+        If arrayIndex > firstToken Then
+            Dim directArrayRank As Long = 0
+            Dim arrayPosition As Long = nameIndex + 1
+            While arrayPosition <= lastToken AndAlso tokens(arrayPosition) = "["
+                Dim arrayClose As Long = -1
+                Dim nestedDepth As Long = 0
+                For scanIndex As Long = arrayPosition + 1 To lastToken
+                    If tokens(scanIndex) = "[" Then
+                        nestedDepth += 1
+                    ElseIf tokens(scanIndex) = "]" Then
+                        If nestedDepth = 0 Then
+                            arrayClose = scanIndex
+                            Exit For
+                        End If
+                        nestedDepth -= 1
+                    End If
+                Next
+                If arrayClose < 0 Then Return
+                directArrayRank += 1
+                arrayPosition = arrayClose + 1
+            Wend
+            If directArrayRank >= 2 Then
+                ' A multidimensional C parameter decays to a pointer to its
+                ' first row. Preserve the scalar element ABI in that pointer
+                ' so body indexing can apply the inner row stride.
+                Dim resolvedArrayElementType As C2fbResolvedTypeModel
+                ResolveC2fbTypeModel( _
+                    translation, catalog, tokens(), firstToken, typeEnd, _
+                    resolvedArrayElementType, C2FB_POINTER_MAPPING_PRESERVE, _
+                    C2FB_TYPE_MAPPING_BODY)
+                If resolvedArrayElementType.status <> _
+                   C2FB_TYPE_RESOLUTION_RESOLVED OrElse _
+                   resolvedArrayElementType.freeBasicType = "" OrElse _
+                   resolvedArrayElementType.freeBasicType = "void" Then Return
+                Dim pointerArrayType As String = _
+                    resolvedArrayElementType.freeBasicType
+                If resolvedArrayElementType.isConst <> 0 AndAlso _
+                   Left(pointerArrayType, 6) <> "Const " Then _
+                    pointerArrayType = "Const " & pointerArrayType
+                pointerArrayType &= " Ptr"
+                SetC2fbParameterConversionResult( _
+                    result, argumentNumber, parameterName, pointerArrayType)
+                Exit Sub
+            End If
+        End If
         Dim arrayTypedefType As String = CBodyArrayTypedefParameterTypeInContext( _
             translation, tokens(), firstToken, typeEnd)
         If arrayTypedefType <> "" Then

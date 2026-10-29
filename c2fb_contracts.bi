@@ -160,7 +160,8 @@ Declare Sub ResolveCBodyCallbackTypeInContext( _
     ByVal firstToken As Long, ByVal lastToken As Long, _
     ByRef result As C2fbCallbackTypeResultModel, ByVal depth As Long, _
     ByVal typeMappingKind As C2fbTypeMappingKind, _
-    ByVal allowPointerLayers As Long = 0 _
+    ByVal allowPointerLayers As Long = 0, _
+    ByVal allowFunctionParameterDecay As Long = 0 _
 )
 Declare Function IsCBodyCallbackTypeInContext( _
     ByRef translation As C2fbTranslationContext, ByVal fbType As String _

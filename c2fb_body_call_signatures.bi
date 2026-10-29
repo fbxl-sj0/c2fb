@@ -94,6 +94,10 @@ Private Function CBodyBuiltinExpectKind(ByVal procedureName As String) As Long
     Return 0
 End Function
 
+Private Function CBodyBuiltinConstantP(ByVal procedureName As String) As Long
+    Return CInt(procedureName = "__builtin_constant_p")
+End Function
+
 Private Function CBodyBuiltinInfinityType( _
     ByVal procedureName As String _
 ) As String
@@ -142,15 +146,17 @@ Private Function CBodyCallParameterType( _
         If parameterIndex = 0 Then Return CBodyBuiltinType(procedureName)
         Return ""
     End If
+    Dim lookupName As String = CBodyBuiltinCallTarget(procedureName)
+    If lookupName = "" Then lookupName = procedureName
     Dim sourceType As String = CBodyParameterType( _
-        translation, catalog, procedureName, parameterIndex)
+        translation, catalog, lookupName, parameterIndex)
     Dim sourceIndex As Long = CBodyProcedureIndex( _
-        translation, procedureName)
+        translation, lookupName)
     If sourceIndex >= 0 AndAlso _
        translation.symbolTable.symbols(sourceIndex).body.needsDefinition <> 0 Then _
         Return sourceType
     Dim freeBasicType As String = FbBodyCallSignatureParameterType( _
-        catalog, procedureName, parameterIndex)
+        catalog, lookupName, parameterIndex)
     If sourceType = "" OrElse freeBasicType = "" Then Return sourceType
     Dim sourceIsPointer As Long = CInt( _
         InStr(sourceType, " Ptr") <> 0 OrElse _

@@ -488,7 +488,7 @@ Private Sub RecordGenericHeaderTypeAliasInHeader( _
     ByVal arrayCount As Long = 0, ByVal arrayElementType As String = "", _
     ByVal isFunction As Long = 0, ByVal isForward As Long = 0, _
     ByVal arrayBounds As String = "", ByVal characterKind As Long = _
-        C2FB_C_CHARACTER_NONE _
+        C2FB_C_CHARACTER_NONE, ByVal functionPointerDepth As Long = 0 _
 )
     If sourceName = "" OrElse freeBasicName = "" Then Exit Sub
     If GenericHeaderTypeAliasIndexInHeader( _
@@ -510,6 +510,7 @@ Private Sub RecordGenericHeaderTypeAliasInHeader( _
         .isArray = isArray
         .isFunction = isFunction
         .isForward = isForward
+        .functionPointerDepth = functionPointerDepth
     End With
     Dim indexKey As String = IIf(isTag <> 0, "T", "I") & sourceName
     If AddC2fbStringIndexMapEntry( _

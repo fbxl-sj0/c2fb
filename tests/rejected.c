@@ -41,7 +41,7 @@ int c2fbRejectOverflowLiteral(void){ return 18446744073709551616ULL; }
 int c2fbRejectOverflowDecimal(void){ return 9223372036854775808; }
 int c2fbRejectBrokenGroup(int a){ return (a + 1; }
 int c2fbRejectFloatSuffix(void){ return 1.0ff; }
-int c2fbRejectLongDouble(void){ return 1.0L; }
+int c2fbRejectHexFloat(void){ return 0x1.0p0L; }
 int c2fbRejectStringEscape(void){ return "\x100"[0]; }
 int c2fbRejectAggregateSize(Item *a){ return sizeof(*a); }
 int c2fbRejectDiscardedSideEffect(int a){ const int count = a; (void)(count++); return count; }

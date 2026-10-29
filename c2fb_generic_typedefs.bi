@@ -885,6 +885,8 @@ Private Sub EmitGenericTypedefSingleWithTokens( _
         ReportGenericTypedefSkipped(translation, outputFile, declaration, conversionSummary, passKind)
         Exit Sub
     End If
+    Dim functionPointerDepth As Long = 0
+    If isFunctionAlias <> 0 Then functionPointerDepth = callbackResult.pointerDepth
     Dim aliasIndex As Long = GenericHeaderTypeAliasIndexInHeader(translation.genericC.header, aliasName)
     Dim freeBasicName As String
     If canExpandAlias <> 0 AndAlso isFunctionAlias = 0 AndAlso _
@@ -914,6 +916,11 @@ Private Sub EmitGenericTypedefSingleWithTokens( _
            translation.genericC.header.headerTypeAliases(aliasIndex).emitted <> 0 Then Exit Sub
         freeBasicName = translation.genericC.header.headerTypeAliases(aliasIndex).freeBasicName
         translation.genericC.header.headerTypeAliases(aliasIndex).baseType = freeBasicType
+        If isFunctionAlias <> 0 Then
+            translation.genericC.header.headerTypeAliases(aliasIndex).isFunction = -1
+            translation.genericC.header.headerTypeAliases(aliasIndex).functionPointerDepth = _
+                functionPointerDepth
+        End If
         If characterKind <> C2FB_C_CHARACTER_NONE Then _
             translation.genericC.header.headerTypeAliases(aliasIndex).characterKind = characterKind
     Else
@@ -932,7 +939,7 @@ Private Sub EmitGenericTypedefSingleWithTokens( _
         outputNameCount += 1
         RecordGenericHeaderTypeAliasInHeader( _
             translation.genericC.header, aliasName, freeBasicName, freeBasicType, 0, 0, 0, 0, "", _
-            isFunctionAlias, 0, "", characterKind)
+            isFunctionAlias, 0, "", characterKind, functionPointerDepth)
         aliasIndex = GenericHeaderTypeAliasIndexInHeader(translation.genericC.header, aliasName)
     End If
     If passKind = C2FB_GENERIC_HEADER_PASS_EMIT_TYPEDEFS OrElse _

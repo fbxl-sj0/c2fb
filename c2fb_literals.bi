@@ -9,7 +9,8 @@
 
     Responsibilities:
 
-        - Validate bounded integer and floating constants.
+        - Validate bounded integer and floating constants, including exact
+          decimal C long-double literals.
         - Decode C character and string escapes.
         - Emit string storage with static lifetime and a trailing NUL byte.
 
@@ -57,20 +58,29 @@ Private Function ReadSimpleFloatingValue( _
     value.typeName = "Double"
     ' lex.bas accepts # after a floating token; D is an exponent marker there.
     Dim suffix As String = "#"
-    If LCase(Mid(parser.sourceText, position, 1)) = "f" Then
+    If LCase(Mid(parser.sourceText, position, 1)) = "l" Then
+        value.typeName = "CLongDouble"
+        suffix = ""
+        position += 1
+    ElseIf LCase(Mid(parser.sourceText, position, 1)) = "f" Then
         value.typeName = "Single"
         suffix = "f"
         position += 1
     End If
-    ' FreeBASIC has no C long double type. Leave those constants for review.
     If position <= Len(parser.sourceText) AndAlso IsIdentifierPart(Asc(parser.sourceText, position)) <> 0 Then Return 0
-    Dim magnitude As Double = Val(literal)
-    If magnitude > 1.7976931348623157e308 Then Return 0
-    If value.typeName = "Single" AndAlso magnitude > 3.4028234663852886e38 Then Return 0
     If Left(literal, 1) = "." Then literal = "0" & literal
     If Right(literal, 1) = "." Then literal &= "0"
-    value.text = literal & suffix
-    If value.typeName = "Single" Then value.text = "__c2fb_single_value(" & value.text & ")"
+    If value.typeName = "CLongDouble" Then
+        ' Keep the source decimal spelling until the CRT parses it as native
+        ' long double; routing through Double would discard C's extra precision.
+        value.text = "CLongDoubleFromStringValue(StrPtr(!""" & literal & """))"
+    Else
+        Dim magnitude As Double = Val(literal)
+        If magnitude > 1.7976931348623157e308 Then Return 0
+        If value.typeName = "Single" AndAlso magnitude > 3.4028234663852886e38 Then Return 0
+        value.text = literal & suffix
+        If value.typeName = "Single" Then value.text = "__c2fb_single_value(" & value.text & ")"
+    End If
     value.isLValue = 0
     parser.position = position
     Return -1

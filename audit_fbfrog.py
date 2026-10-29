@@ -10,6 +10,7 @@ This file intentionally does NOT contain: fbfrog code or copied test fixtures.
 
 import argparse
 import functools
+from fnmatch import fnmatchcase
 import importlib.util
 import itertools
 import json
@@ -3264,6 +3265,11 @@ def expected_declaration_names(
     return expected
 
 
+def fbfrog_fixture_matches(path: str, patterns: list[str]) -> bool:
+    """Select fixture paths by POSIX-style glob without changing the tree."""
+    return not patterns or any(fnmatchcase(path, pattern) for pattern in patterns)
+
+
 def fbfrog_fixture_uses_cpp(source: Path, tests_root: Path) -> bool:
     """Match C++ fixtures from their path, suffix, or declaration syntax."""
     try:
@@ -4273,8 +4279,10 @@ def audit(args: argparse.Namespace) -> int:
             baseline = source.with_suffix(".bi")
             if not baseline.is_file():
                 continue
-            paired_count += 1
             relative_name = source.relative_to(tests_root).as_posix()
+            if not fbfrog_fixture_matches(relative_name, args.fixture_pattern):
+                continue
+            paired_count += 1
             if args.compile_bindings:
                 baseline_compile_status[relative_name] = compile_output(
                     baseline, relative_name, "fbfrog baseline")
@@ -4817,6 +4825,8 @@ def audit(args: argparse.Namespace) -> int:
 
     percent = 100.0 if expected_count == 0 else 100.0 * matched_count / expected_count
     print(f"paired fbfrog fixtures: {paired_count}")
+    if args.fixture_pattern:
+        print("fixture patterns: " + ", ".join(args.fixture_pattern))
     print(f"fixture scope: {args.scope}")
     print(f"fixtures audited: {audited_fixture_count}")
     print(f"version-matrix script fixtures audited: {version_matrix_fixture_count}")
@@ -4918,6 +4928,21 @@ def audit(args: argparse.Namespace) -> int:
             print(
                 f"C2FB layout skip with compilable FBFrog baseline {fixture} "
                 f"({type_name}, {profile_label}): {reason}"
+            )
+        c2fb_skips_with_failed_profile_baseline = [
+            skip for skip in record_layout_skips
+            if skip[3].startswith((
+                "C2FB output has no matching record type",
+                "C2FB layout probe failed:",
+            )) and baseline_compile_status.get(skip[0]) is True and
+            (skip[0], skip[1], skip[2]) in fbfrog_profile_probe_failures
+        ]
+        for fixture, type_name, profile_label, reason in \
+                c2fb_skips_with_failed_profile_baseline[:20]:
+            print(
+                "C2FB layout skip with compilable FBFrog baseline but failed "
+                f"FBFrog profile probe {fixture} ({type_name}, "
+                f"{profile_label}): {reason}"
             )
         print(
             f"record layout probes skipped: {len(record_layout_skips)}"
@@ -5236,6 +5261,10 @@ def main() -> int:
     parser.add_argument("--fbc", default="fbc")
     parser.add_argument("--prefix", default="c2fb_")
     parser.add_argument(
+        "--fixture-pattern", action="append", default=[], metavar="GLOB",
+        help="audit only paired fixture paths matching this POSIX glob; repeat to add patterns",
+    )
+    parser.add_argument(
         "--compile-bindings", action="store_true",
         help="compile fbfrog baselines and generated C2FB headers with FreeBASIC",
     )
@@ -5277,6 +5306,12 @@ def main() -> int:
         parser.error("--compare-record-layouts requires --compile-bindings")
     if args.compare_record_layouts and args.scope != "declarations":
         parser.error("--compare-record-layouts requires --scope declarations")
+    if args.fixture_pattern and not any(
+        fbfrog_fixture_matches(path.relative_to(args.fbfrog_tests.resolve()).as_posix(), args.fixture_pattern)
+        for path in args.fbfrog_tests.resolve().rglob("*.h")
+        if path.with_suffix(".bi").is_file()
+    ):
+        parser.error("--fixture-pattern did not match any paired header/binding fixtures")
     return audit(args)
 
 

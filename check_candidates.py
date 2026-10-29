@@ -166,14 +166,16 @@ class CandidateCompileResultModel:
 
 def compile_candidate(compiler_command, fb_source, threadsafe, input_path,
                       output_path, candidate_file, function_name="", source=None,
-                      helper_names=()):
+                      helper_names=(), candidate_directory=None):
     if source is None:
         source = ("", "", "")
     command = compiler_command + [
         "-w", "all", "-d", f"SQLITE_THREADSAFE={threadsafe}",
-        "-i", str(fb_source), "-c", str(input_path),
-        "-o", str(output_path),
+        "-i", str(fb_source),
     ]
+    if candidate_directory is not None:
+        command.extend(("-i", str(candidate_directory)))
+    command.extend(("-c", str(input_path), "-o", str(output_path)))
     try:
         result = subprocess.run(command, capture_output=True, text=True)
     except OSError as error:
@@ -192,8 +194,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--fb-source", type=Path,
-                        default=(Path(__file__).resolve().parent.parent
-                                 / "freebasic-sqlite" / "fb_src"))
+                        default=Path(__file__).resolve().parents[2] / "fb_src")
     parser.add_argument("--fbc", default="fbc")
     parser.add_argument("--threadsafe", choices=("0", "1"), default="1")
     parser.add_argument("--report", type=Path)
@@ -269,7 +270,7 @@ def main():
                         Path(directory) / f"candidate-{index}-{target_index}.o",
                         candidate.name, target or "",
                         source_location(procedures[target]) if target is not None else None,
-                        helpers)
+                        helpers, candidate.resolve().parent)
                     if target is not None:
                         writer.writerow((result.candidate_file, result.function_name,
                                          result.source_path, result.source_line,

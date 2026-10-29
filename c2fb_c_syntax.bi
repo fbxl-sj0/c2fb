@@ -88,6 +88,9 @@ Private Type SimpleArrayBoundParser
     position As Long
 End Type
 
+' Expanded C macros nest several precedence levels around one expression.
+Private Const MAX_SIMPLE_ARRAY_BOUND_DEPTH As Long = 128
+
 Private Function SimpleDigitValue(ByVal c As Long) As Long
     If c >= Asc("0") AndAlso c <= Asc("9") Then Return c - Asc("0")
     If c >= Asc("a") AndAlso c <= Asc("f") Then Return c - Asc("a") + 10
@@ -161,6 +164,46 @@ Declare Function ReadSimpleArrayBoundTerm( _
     ByVal depth As Long _
 ) As Long
 Declare Function ReadSimpleArrayBoundShift( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundRelational( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundEquality( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundBitwiseAnd( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundBitwiseXor( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundBitwiseOr( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundLogicalAnd( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundLogicalOr( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+Declare Function ReadSimpleArrayBoundConditional( _
     ByRef parser As SimpleArrayBoundParser, _
     ByRef value As LongInt, _
     ByVal depth As Long _
@@ -464,7 +507,7 @@ Private Function ReadSimpleArrayBoundPrimary( _
     ByRef value As LongInt, _
     ByVal depth As Long _
 ) As Long
-    If depth > 64 Then Return 0
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH Then Return 0
     SkipCSpaces(parser.sourceText, parser.position)
     If parser.position > Len(parser.sourceText) Then Return 0
 
@@ -478,7 +521,7 @@ Private Function ReadSimpleArrayBoundPrimary( _
 
     If nextByte = Asc("(") Then
         parser.position += 1
-        If ReadSimpleArrayBoundShift(parser, value, depth + 1) = 0 Then Return 0
+        If ReadSimpleArrayBoundConditional(parser, value, depth + 1) = 0 Then Return 0
         SkipCSpaces(parser.sourceText, parser.position)
         If parser.position > Len(parser.sourceText) OrElse _
            Asc(parser.sourceText, parser.position) <> Asc(")") Then Return 0
@@ -563,6 +606,210 @@ Private Function ReadSimpleArrayBoundShift( _
     Return -1
 End Function
 
+Private Function ReadSimpleArrayBoundRelational( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH OrElse _
+       ReadSimpleArrayBoundShift(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) Then Exit While
+        Dim operation As String = Mid(parser.sourceText, parser.position, 2)
+        Dim operatorWidth As Long = 2
+        If operation <> "<=" AndAlso operation <> ">=" Then
+            If Asc(parser.sourceText, parser.position) = Asc("<") AndAlso _
+               Mid(parser.sourceText, parser.position, 2) <> "<<" Then
+                operation = "<"
+                operatorWidth = 1
+            ElseIf Asc(parser.sourceText, parser.position) = Asc(">") AndAlso _
+                   Mid(parser.sourceText, parser.position, 2) <> ">>" Then
+                operation = ">"
+                operatorWidth = 1
+            Else
+                Exit While
+            End If
+        End If
+        parser.position += operatorWidth
+
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundShift(parser, rightValue, depth + 1) = 0 Then Return 0
+        Dim comparisonResult As Long = 0
+        Select Case operation
+        Case "<": If value < rightValue Then comparisonResult = 1
+        Case "<=": If value <= rightValue Then comparisonResult = 1
+        Case ">": If value > rightValue Then comparisonResult = 1
+        Case ">=": If value >= rightValue Then comparisonResult = 1
+        End Select
+        value = comparisonResult
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundEquality( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH OrElse _
+       ReadSimpleArrayBoundRelational(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) Then Exit While
+        Dim operation As String = Mid(parser.sourceText, parser.position, 2)
+        If operation <> "==" AndAlso operation <> "!=" Then Exit While
+        parser.position += 2
+
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundRelational(parser, rightValue, depth + 1) = 0 Then Return 0
+        If operation = "==" Then
+            value = CInt(value = rightValue)
+        Else
+            value = CInt(value <> rightValue)
+        End If
+        If value <> 0 Then value = 1
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundBitwiseAnd( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If ReadSimpleArrayBoundEquality(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) OrElse _
+           Mid(parser.sourceText, parser.position, 2) = "&&" OrElse _
+           Asc(parser.sourceText, parser.position) <> Asc("&") Then Exit While
+        parser.position += 1
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundEquality(parser, rightValue, depth + 1) = 0 Then Return 0
+        value = value And rightValue
+        If value < -MAX_GENERIC_ARRAY_BOUND_VALUE OrElse _
+           value > MAX_GENERIC_ARRAY_BOUND_VALUE Then Return 0
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundBitwiseXor( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If ReadSimpleArrayBoundBitwiseAnd(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) OrElse _
+           Asc(parser.sourceText, parser.position) <> Asc("^") Then Exit While
+        parser.position += 1
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundBitwiseAnd(parser, rightValue, depth + 1) = 0 Then Return 0
+        value = value Xor rightValue
+        If value < -MAX_GENERIC_ARRAY_BOUND_VALUE OrElse _
+           value > MAX_GENERIC_ARRAY_BOUND_VALUE Then Return 0
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundBitwiseOr( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If ReadSimpleArrayBoundBitwiseXor(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) OrElse _
+           Mid(parser.sourceText, parser.position, 2) = "||" OrElse _
+           Asc(parser.sourceText, parser.position) <> Asc("|") Then Exit While
+        parser.position += 1
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundBitwiseXor(parser, rightValue, depth + 1) = 0 Then Return 0
+        value = value Or rightValue
+        If value < -MAX_GENERIC_ARRAY_BOUND_VALUE OrElse _
+           value > MAX_GENERIC_ARRAY_BOUND_VALUE Then Return 0
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundLogicalAnd( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH OrElse _
+       ReadSimpleArrayBoundBitwiseOr(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) OrElse _
+           Mid(parser.sourceText, parser.position, 2) <> "&&" Then Exit While
+        parser.position += 2
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundBitwiseOr(parser, rightValue, depth + 1) = 0 Then Return 0
+        If value <> 0 AndAlso rightValue <> 0 Then
+            value = 1
+        Else
+            value = 0
+        End If
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundLogicalOr( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH OrElse _
+       ReadSimpleArrayBoundLogicalAnd(parser, value, depth + 1) = 0 Then Return 0
+    While 1
+        SkipCSpaces(parser.sourceText, parser.position)
+        If parser.position > Len(parser.sourceText) OrElse _
+           Mid(parser.sourceText, parser.position, 2) <> "||" Then Exit While
+        parser.position += 2
+        Dim rightValue As LongInt
+        If ReadSimpleArrayBoundLogicalAnd(parser, rightValue, depth + 1) = 0 Then Return 0
+        If value <> 0 OrElse rightValue <> 0 Then
+            value = 1
+        Else
+            value = 0
+        End If
+    Wend
+    Return -1
+End Function
+
+Private Function ReadSimpleArrayBoundConditional( _
+    ByRef parser As SimpleArrayBoundParser, _
+    ByRef value As LongInt, _
+    ByVal depth As Long _
+) As Long
+    If depth > MAX_SIMPLE_ARRAY_BOUND_DEPTH OrElse _
+       ReadSimpleArrayBoundLogicalOr(parser, value, depth + 1) = 0 Then Return 0
+    SkipCSpaces(parser.sourceText, parser.position)
+    If parser.position > Len(parser.sourceText) OrElse _
+       Asc(parser.sourceText, parser.position) <> Asc("?") Then Return -1
+    parser.position += 1
+
+    Dim trueValue As LongInt
+    If ReadSimpleArrayBoundConditional(parser, trueValue, depth + 1) = 0 Then Return 0
+    SkipCSpaces(parser.sourceText, parser.position)
+    If parser.position > Len(parser.sourceText) OrElse _
+       Asc(parser.sourceText, parser.position) <> Asc(":") Then Return 0
+    parser.position += 1
+
+    Dim falseValue As LongInt
+    If ReadSimpleArrayBoundConditional(parser, falseValue, depth + 1) = 0 Then Return 0
+    If value <> 0 Then
+        value = trueValue
+    Else
+        value = falseValue
+    End If
+    Return -1
+End Function
+
 Private Function ReadSimpleArrayBoundExpression( _
     ByRef parser As SimpleArrayBoundParser, _
     ByRef value As LongInt, _
@@ -601,7 +848,7 @@ Private Function EvaluateSimpleArrayBound( _
     parser.sourceText = expression
     parser.position = 1
     Dim value As LongInt
-    If ReadSimpleArrayBoundShift(parser, value, 0) = 0 Then Return 0
+    If ReadSimpleArrayBoundConditional(parser, value, 0) = 0 Then Return 0
     SkipCSpaces(parser.sourceText, parser.position)
     If parser.position <= Len(parser.sourceText) OrElse value < 0 OrElse _
        (value = 0 AndAlso allowZero = 0) OrElse _

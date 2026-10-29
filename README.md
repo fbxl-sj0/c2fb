@@ -26,11 +26,14 @@ cd ../c2fb
 make test
 ```
 
+The Makefile test target defaults to the sibling `../freebasic-sqlite` checkout.
 For another checkout location, use
-`make test SQLITE_SOURCE_DIR=/path/to/freebasic-sqlite`. The Python test runner
-accepts the same location through `--sqlite-source-directory`. Candidate
-compilation checks use `FB_SOURCE_DIR`, which defaults to that checkout's
-`fb_src` directory.
+`make test SQLITE_SOURCE_DIR=/path/to/freebasic-sqlite`. Set
+`FBC_SOURCE_DIR=/path/to/fbc/src` to enable the optional compiler-source
+probes. The Python test runner accepts these locations through
+`--sqlite-source-directory` and `--fbc-source-directory`. Candidate
+compilation checks use `FB_SOURCE_DIR`, which defaults to the selected
+checkout's `fb_src` directory.
 
 The detailed examples below retain paths from the original SQLite workspace.
 In this standalone checkout, use `build/c2fb` for
@@ -308,6 +311,11 @@ file comment. The long form is `--title="Library 1.0"`,
 C2FB emits one output per invocation, so
 the positional output path selects the destination. Title text files are limited
 to 1 MiB; comment terminators inside them are made inert before emission.
+Generic body conversions also accept --exclude-proc=Pattern to leave selected
+C implementations in the linked library while generating candidates for their
+peers. The exclusion keeps the procedure declaration available to other
+candidates and records why its body was skipped. Use this for platform or ABI
+bridges that cannot be represented faithfully in FreeBASIC.
 For FreeBASIC on Linux x86-64 with glibc, the opt-in
 [`freebasic-linux-glibc-x86_64.rsp`](profiles/freebasic-linux-glibc-x86_64.rsp)
 profile supplies CRT includes and mappings for common glibc typedefs, including
@@ -428,9 +436,10 @@ forward expansion does not create invalid FreeBASIC constants. Simple
 object-like C type macros become `Type` aliases. Generic fixed array bounds can
 also fold `sizeof` of scalar, pointer, or fixed-array typedef types when the
 active C ABI provides their sizes. Record `sizeof` bounds remain unsupported.
-Direct decimal floating literals become `Single` constants with an `f` suffix
-and `Double` constants without one. Hexadecimal floating literals, long double,
-and floating arithmetic expressions remain skipped.
+Direct decimal floating literals become `Single`, `Double`, or `CLongDouble`
+values. Long-double literals retain their decimal spelling until the CRT parses
+them, preserving the target's available precision. Hexadecimal floating
+literals and floating arithmetic expressions remain skipped.
 Simple casts of decimal floating literals to integer targets use C's
 truncation-toward-zero conversion.
 Quoted string macros become
@@ -1148,9 +1157,12 @@ file below the input directory. `--jobs=N` runs up to N independent source units
 at once (1 to 32, default 1). Each unit publishes its type context and body
 candidate only after both passes succeed. If candidate publication fails, the
 prior type context is restored or the new one is removed. Reports remain in
-source order. When the type pass rejects an external C++ thread-local object,
-the runner lists its name so dependent body rejections can be traced to the
-missing binding.
+source order. The final summary includes the selected C-file count, failed-unit
+count, translated simple-procedure count, and unsupported or duplicate
+candidate count. These counts describe generated candidates; tree mode does not
+compile or link the resulting FreeBASIC files. When the type pass rejects an
+external C++ thread-local object, the runner lists its name so dependent body
+rejections can be traced to the missing binding.
 
 ```sh
 python3 fb_tools/c2fb/c2fb_source_unit.py \
@@ -1184,10 +1196,38 @@ all matching profiles append their options in manifest order:
 }
 ```
 
+Unit profiles can also set `fb_source_patterns` to choose the `.bi` and `.bas`
+files indexed for that C source, plus `fb_source_recursive` and
+`fb_source_include_closure` to scan nested paths and follow their local quoted
+includes. These fields require `--fb-source-directory`, and keep each source
+unit's binding catalog independent in larger projects.
+
 Pass `--fb-source-recursive` to index nested `.bi` and `.bas` files while
 preserving their relative include paths, for source trees such as the compiler's
 `inc/crt` bindings. Recursive scans omit common generated directories such as
 `build`, `out`, `.git`, and `node_modules`.
+
+When a project already has many FreeBASIC bindings, repeat
+`--fb-source-pattern=GLOB` to index only matching `.bi` and `.bas` paths
+relative to `--fb-source-directory`. Patterns form a union. Add
+`--fb-source-include-closure` to follow local quoted includes transitively;
+when an included `.bi` is owned by a sibling `.bas` that includes it, that
+implementation is staged too. This keeps unrelated bindings out of each C
+source unit while retaining the declarations and implementations it needs.
+Use `--fb-source-recursive` when the selected files are in subdirectories. The
+selected files and their closure share a 32,768-file limit.
+Indexed files must resolve inside `--fb-source-directory`; symlinks whose
+targets escape that tree are ignored. Copy generated bindings into the indexed
+directory when they are produced elsewhere.
+
+```sh
+python3 fb_tools/c2fb/c2fb_source_unit.py \
+  src/platform.c build/candidates/platform_candidates.bas \
+  --converter=fb_tools/c2fb/build/c2fb --compiler=cc \
+  --fb-source-directory=fb_src \
+  --fb-source-pattern='sqlite3_os_*.bi' \
+  --fb-source-include-closure
+```
 
 The optional FreeBASIC source check also sweeps every root `sfx_*.c` module with
 [`freebasic-sfxlib-linux-x86_64-units.json`](profiles/freebasic-sfxlib-linux-x86_64-units.json).
@@ -1215,6 +1255,15 @@ python3 fb_tools/c2fb/c2fb_source_unit.py \
   --body-compiler-option="-I$source_root/sfxlib/unix" \
   --body-compiler-option=@fb_tools/c2fb/profiles/freebasic-linux-glibc-x86_64-body.rsp
 ```
+The Linux RTLIB host sweep also uses
+[freebasic-rtlib-linux-x86_64-units.json](profiles/freebasic-rtlib-linux-x86_64-units.json).
+It supplies crt/setjmp.bi for the jmp_buf users, includes the GPM and Linux
+termios layouts for the two Linux console drivers, and routes file-scope device
+callback tables through the body pass, where their function declarations are
+available. This manifest adjusts per-source options only; select the C input
+files with patterns matching the target RTLIB_SRC selection in FreeBASIC's
+mk/rtlib-sources.mk.
+
 Type mappings match exact C names. When a source uses both a record tag and a
 typedef alias for that record, map each name to the same FreeBASIC type.
 With the default `c2fb_` prefix, generic body conversion also matches C record
@@ -1318,8 +1367,14 @@ and candidate are staged and published together. Use repeat `--header-option`
 arguments for generic-header settings such as `--type-map`; `--c2fb-option`
 continues to supply body settings. `--fb-source-directory` and
 `--fb-source-recursive` passed through `--c2fb-option` select existing
-FreeBASIC bindings for the per-unit overlay. The map includes the generated
-context filename and whether source-unit mode was selected.
+FreeBASIC bindings for the per-unit overlay. Repeat
+`--c2fb-option=--fb-source-pattern=GLOB` to filter those bindings, and add
+`--c2fb-option=--fb-source-include-closure` to stage their local quoted include
+dependencies and matching `.bas` owners. These source-index options require
+`--source-unit-context`. Pass repeat `--body-compiler-option` arguments for
+defines or include paths needed only while converting bodies; the map records
+these options. It also includes the generated context filename and whether
+source-unit mode was selected.
 
 Raw body modes also accept repeat `--replacement-file=Rules.rpl` options. The
 files use fbfrog's `convert c:` / `to c:` or `to fb:` pairs. C patterns are
@@ -1415,7 +1470,7 @@ bounded type-token buffer; local tables with hundreds of values can be translate
 without raising that limit for unrelated type parsing. A regression exercises
 126-element automatic and 406-element static arrays on native and GCC backends.
 Member access and `sizeof` preserve the complete array extent; runtime-bound and
-multidimensional record arrays remain unsupported. Generic body translation uses
+multidimensional record arrays remain unsupported. When C takes the address of a local array and passes it to a void pointer parameter, C2FB uses the array's first-element address. Other pointer-to-array contexts remain unsupported. Generic body translation uses
 the generated tail accessor for direct reads, writes, and
 `__builtin_offsetof` on omitted flexible byte-array members. One-dimensional and
 multidimensional VLAs with non-const scalar or pointer elements use managed
@@ -1854,8 +1909,11 @@ elements with brace initializers are flattened into row-major module storage;
 direct and chained indexing preserve C row decay and trailing-dimension strides.
 One-dimensional file-scope `static` callback arrays with a supported signature
 accept fixed bounds or bounds inferred from a brace initializer. Function
-designators are checked against the callback signature, null entries are
-zero-filled, and const-qualified callback pointers use read-only storage.
+designators are checked against the callback signature, and null entries use
+a context-typed `0` so included records can supply the callback type without
+requiring a generated alias. Since FreeBASIC cannot const-qualify a
+procedure-pointer alias, const callback arrays stay private to the generated
+module and candidate writes to those slots are rejected.
 When an initializer targets an existing FreeBASIC procedure, its declaring
 header is included in the candidate module.
 Multidimensional and non-static file-scope callback arrays remain manual.
@@ -1884,7 +1942,8 @@ untyped function-pointer calls, unsupported types, switches with unsupported
 case expressions or control flow, and preprocessor-controlled function bodies.
 Division and scalar casts are rejected
 when their operand types are unknown, including undeclared call results and
-structure fields. Hexadecimal floating constants, long double, unsupported
+structure fields. Hexadecimal floating constants, by-value long-double record
+fields whose target alignment cannot be represented, unsupported
 array-bound operators and multidimensional VLA bounds with calls or side effects,
 structure inference beyond supported scalar/pointer fields, fixed
 one-dimensional arrays, and known nested layouts, plus implicit conversions

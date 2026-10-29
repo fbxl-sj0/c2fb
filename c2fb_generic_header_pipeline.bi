@@ -747,7 +747,8 @@ Private Sub ConvertGenericHeaderFile( _
     ReDim translation.genericC.header.enumMembers(0 To 255)
     translation.genericC.header.enumMemberCount = 0
     WriteGenericHeaderEnumConstants( _
-        translation, fileOutput, outputNames(), outputNameCount, conversionSummary)
+        translation, catalog, fileOutput, outputNames(), outputNameCount, _
+        conversionSummary)
     ' Enum values from filtered headers still size and initialize selected C objects.
     IndexGenericBodyEnumConstants(translation, 0)
     WriteGenericHeaderRecords(translation, fileOutput, conversionSummary)
@@ -800,6 +801,12 @@ Private Sub ConvertGenericHeaderFile( _
         translation.genericC.policy, fileOutput)
     WriteGenericSymbolRenameReportInPolicy(translation.genericC.policy, fileOutput)
     WriteGenericTypedefExpansionReportInPolicy(translation.genericC.policy, fileOutput)
+    If translation.body.generatedStaticDeclarations <> "" Then
+        ' File-scope compound literals keep private static byte storage for
+        ' module-static pointer initializers emitted earlier in this include.
+        WriteC2fbOutputText( _
+            fileOutput, translation.body.generatedStaticDeclarations)
+    End If
     WriteC2fbGeneratedFileEndMarker(fileOutput)
     CloseC2fbGeneratedFileOutput(fileOutput)
     If C2fbGeneratedFileOutputHasFailed(fileOutput) <> 0 Then _

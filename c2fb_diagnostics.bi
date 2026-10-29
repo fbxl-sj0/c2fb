@@ -63,6 +63,7 @@ Private Sub InitializeC2fbTranslationSession( _
 )
     ResetC2fbTranslationTarget(translation)
     ResetC2fbSourceUnitState(translation.sourceUnit)
+    translation.genericC.header.recordPlanCount = 0
 End Sub
 
 Private Sub AddC2fbDiagnostic( _

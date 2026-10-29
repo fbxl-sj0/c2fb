@@ -444,6 +444,9 @@ Private Type C2fbFunctionScanner
     lineText As String
     linePosition As Long
     braceDepth As Long
+    declarationParenDepth As Long
+    declarationBracketDepth As Long
+    declarationBraceDepth As Long
     insideFunction As Long
     skipDeclarationTail As Long
     recordOpen As Long
@@ -473,6 +476,23 @@ Private Type C2fbFunctionScanner
     currentSourceIsRoot As Long
 End Type
 
+Private Sub UpdateC2fbDeclarationGroupDepth( _
+    ByRef scanner As C2fbFunctionScanner, ByVal currentByte As Long _
+)
+    Select Case currentByte
+    Case Asc("(")
+        scanner.declarationParenDepth += 1
+    Case Asc(")")
+        If scanner.declarationParenDepth > 0 Then _
+            scanner.declarationParenDepth -= 1
+    Case Asc("[")
+        scanner.declarationBracketDepth += 1
+    Case Asc("]")
+        If scanner.declarationBracketDepth > 0 Then _
+            scanner.declarationBracketDepth -= 1
+    End Select
+End Sub
+
 Private Sub InitializeC2fbDeclarationScanRequest( _
     ByRef request As C2fbDeclarationScanRequestModel, _
     ByVal inputPath As String, ByVal rootSourcePath As String _
@@ -484,6 +504,7 @@ Private Sub InitializeC2fbDeclarationScanRequest( _
     request.options.sourceOriginPrecision = C2FB_SOURCE_ORIGIN_LINES_AVAILABLE
     request.options.collectLibraryPragmas = C2FB_LIBRARY_PRAGMAS_IGNORE
     request.options.collectHeaderInlineBodies = 0
+    request.options.includeHeaderInlineBodyNames = ""
     request.options.collectIncludedCSourceBodies = 0
 End Sub
 
@@ -539,6 +560,8 @@ Private Function ConfigureC2fbFunctionScannerSettings( _
     settings.retainFunctionBodies = 0
     settings.collectHeaderInlineBodies = _
         request.options.collectHeaderInlineBodies
+    settings.includeHeaderInlineBodyNames = _
+        request.options.includeHeaderInlineBodyNames
     settings.collectIncludedCSourceBodies = _
         request.options.collectIncludedCSourceBodies
     settings.recognizeCLinkageBlocks = 0
@@ -588,6 +611,9 @@ Private Function OpenC2fbFunctionScanner( _
     scanner.declarationOriginCaptured = 0
     scanner.linePosition = 0
     scanner.braceDepth = 0
+    scanner.declarationParenDepth = 0
+    scanner.declarationBracketDepth = 0
+    scanner.declarationBraceDepth = 0
     scanner.insideFunction = 0
     scanner.skipDeclarationTail = 0
     scanner.recordOpen = 0
@@ -1096,6 +1122,17 @@ Private Function NextC2fbSourceItem( _
                 scanner.declaration &= Chr(currentByte)
             End If
         ElseIf scanner.braceDepth = 0 Then
+            If scanner.declarationBraceDepth > 0 Then
+                UpdateC2fbDeclarationGroupDepth(scanner, currentByte)
+                If currentByte = Asc("{") Then
+                    scanner.declarationBraceDepth += 1
+                ElseIf currentByte = Asc("}") Then
+                    scanner.declarationBraceDepth -= 1
+                End If
+                scanner.declaration &= Chr(currentByte)
+                Continue While
+            End If
+            UpdateC2fbDeclarationGroupDepth(scanner, currentByte)
             If scanner.recordClosed <> 0 Then
                 If currentByte = Asc(";") Then
                     SetC2fbScannedRecordModel( _
@@ -1106,6 +1143,9 @@ Private Function NextC2fbSourceItem( _
                     scanner.declarationStartLocation.path = ""
                     scanner.declarationStartLocation.column = 0
                     scanner.declarationOriginCaptured = 0
+                    scanner.declarationParenDepth = 0
+                    scanner.declarationBracketDepth = 0
+                    scanner.declarationBraceDepth = 0
                     Return -1
                 End If
                 scanner.recordTail &= Chr(currentByte)
@@ -1121,10 +1161,20 @@ Private Function NextC2fbSourceItem( _
                     scanner.declarationStartLocation.path = ""
                     scanner.declarationStartLocation.column = 0
                     scanner.declarationOriginCaptured = 0
+                    scanner.declarationParenDepth = 0
+                    scanner.declarationBracketDepth = 0
+                    scanner.declarationBraceDepth = 0
                 End If
                 Continue While
             End If
             If currentByte = Asc("{") Then
+                If scanner.declarationParenDepth > 0 OrElse _
+                   scanner.declarationBracketDepth > 0 Then
+                    ' Compound literals inside declarators are not function bodies.
+                    scanner.declarationBraceDepth = 1
+                    scanner.declaration &= Chr(currentByte)
+                    Continue While
+                End If
                 Dim declarationTokens() As String
                 Dim declarationTokenCount As Long
                 Dim normalizedDeclaration As String = _
@@ -1146,13 +1196,29 @@ Private Function NextC2fbSourceItem( _
                     scanner.currentSourceIsRoot = 0 AndAlso _
                     scanner.options.collectIncludedCSourceBodies <> 0 AndAlso _
                     Right(LCase(scanner.currentSourcePath), 2) = ".c") * -1
+                Dim selectedHeaderInlineBody As Long = 0
+                If scanner.options.includeHeaderInlineBodyNames <> "" AndAlso _
+                   scanner.options.sourceMapMode <> C2FB_SOURCE_MAP_DISABLED AndAlso _
+                   scanner.currentSourceIsRoot = 0 AndAlso _
+                   isIncludedCSourceBody = 0 AndAlso _
+                   declarationIsInline <> 0 AndAlso declarationIsStatic = 0 Then
+                    Dim headerInlinePrototype As C2fbSourceItemModel
+                    If ParseScannedCFunctionDeclaration( _
+                        sourceUnit, scanner, headerInlinePrototype, _
+                        scanner.declaration, 0) <> 0 Then
+                        selectedHeaderInlineBody = C2fbDelimitedNameListContains( _
+                            scanner.options.includeHeaderInlineBodyNames, _
+                            headerInlinePrototype.declaration.sourceName)
+                    End If
+                End If
                 Dim sourceDefinesBody As Long = CInt( _
                     scanner.options.sourceMapMode = C2FB_SOURCE_MAP_DISABLED OrElse _
                     scanner.currentSourceIsRoot <> 0 OrElse _
                     isIncludedCSourceBody <> 0 OrElse _
                     declarationIsStatic <> 0 OrElse _
                     (scanner.options.collectHeaderInlineBodies <> 0 AndAlso _
-                     declarationIsInline <> 0))
+                     declarationIsInline <> 0) OrElse _
+                    selectedHeaderInlineBody <> 0)
                 Dim functionFound As Long = 0
                 Dim headerPrototypeFound As Long = 0
                 If scanner.options.collectFunctionDefinitions <> 0 AndAlso _
@@ -1218,6 +1284,9 @@ Private Function NextC2fbSourceItem( _
                     End If
                 End If
                 scanner.braceDepth = 1
+                scanner.declarationParenDepth = 0
+                scanner.declarationBracketDepth = 0
+                scanner.declarationBraceDepth = 0
                 If scanner.skipDeclarationTail <> 2 Then
                     scanner.declaration = ""
                     scanner.declarationStartLocation.line = 0
@@ -1227,6 +1296,11 @@ Private Function NextC2fbSourceItem( _
                 End If
                 If headerPrototypeFound <> 0 Then Return -1
             ElseIf currentByte = Asc(";") Then
+                If scanner.declarationParenDepth <> 0 OrElse _
+                   scanner.declarationBracketDepth <> 0 Then
+                    scanner.declaration &= Chr(currentByte)
+                    Continue While
+                End If
                 Dim declarationText As String = Trim(scanner.declaration)
                 Dim declarationStartLocation As C2fbSourceLocationModel
                 declarationStartLocation = scanner.declarationStartLocation
@@ -1238,6 +1312,9 @@ Private Function NextC2fbSourceItem( _
                 scanner.declarationStartLocation.path = ""
                 scanner.declarationStartLocation.column = 0
                 scanner.declarationOriginCaptured = 0
+                scanner.declarationParenDepth = 0
+                scanner.declarationBracketDepth = 0
+                scanner.declarationBraceDepth = 0
                 If isFunctionPrototype <> 0 Then Return -1
                 If declarationText <> "" Then
                     sourceItem.declaration.text = declarationText

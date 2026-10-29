@@ -1925,7 +1925,62 @@ Private Function TranslateCBodyModuleStaticInitializer( _
 ) As Long
     translatedText = initializerText
     initializerText = Trim(initializerText)
-    If initializerText = "" OrElse isArray <> 0 Then Return -1
+    If initializerText = "" Then Return -1
+
+    If isArray <> 0 Then
+        If Left(initializerText, 1) <> "{" Then Return -1
+        Dim closingBrace As Long = 1
+        Dim groupStatus As Long = ScanSimpleExpressionGroup( _
+            initializerText, closingBrace, Asc("{"), Asc("}"))
+        If groupStatus = 0 OrElse _
+           Trim(Mid(initializerText, closingBrace)) <> "" Then Return -1
+        Dim initializerBody As String = Trim(Mid( _
+            initializerText, 2, closingBrace - 3))
+        If initializerBody = "" Then Return -1
+        If Right(initializerBody, 1) = "," Then _
+            initializerBody = RTrim(Left( _
+                initializerBody, Len(initializerBody) - 1))
+
+        Dim values() As String
+        Dim valueCount As Long
+        Dim splitStatus As Long = SplitSimpleCList( _
+            initializerBody, values(), valueCount, 0, _
+            MAX_GENERIC_STATIC_INITIALIZER_VALUES)
+        If splitStatus = 0 OrElse valueCount <= 0 Then Return -1
+
+        Dim context As SimpleBodyContext
+        Dim callableNames(0 To 0) As String
+        Dim parameterNames(0 To 0) As String
+        Dim parameterAliases(0 To 0) As String
+        Dim parameterTypes(0 To 0) As String
+        Dim translatedValues As String
+        For valueIndex As Long = 0 To valueCount - 1
+            Dim sourceValue As String = Trim(values(valueIndex))
+            Dim translatedValue As String = sourceValue
+            If Left(sourceValue, 1) = "{" AndAlso _
+               CBodyRecordName(translation, catalog, freeBasicType) <> "" Then
+                Dim recordInitializerStatus As Long = _
+                    TranslateSimpleRecordInitializer( _
+                    translation, catalog, sourceValue, freeBasicType, _
+                    translatedValue, context, callableNames(), 0, _
+                    parameterNames(), parameterAliases(), parameterTypes(), 0)
+                If recordInitializerStatus = 0 Then Return -1
+            Else
+                Dim hasBooleanOperator As Long
+                Dim hasFunctionCall As Long
+                If TranslateSimpleExpression( _
+                    translation, catalog, sourceValue, translatedValue, _
+                    hasBooleanOperator, hasFunctionCall, callableNames(), 0, _
+                    parameterNames(), parameterAliases(), parameterTypes(), 0, _
+                    freeBasicType, -1, -1) = 0 OrElse _
+                   hasFunctionCall <> 0 Then Return -1
+            End If
+            If valueIndex > 0 Then translatedValues &= ", "
+            translatedValues &= translatedValue
+        Next
+        translatedText = "{" & translatedValues & "}"
+        Return -1
+    End If
 
     If Left(initializerText, 1) = "{" AndAlso _
        CBodyRecordName(translation, catalog, freeBasicType) <> "" Then

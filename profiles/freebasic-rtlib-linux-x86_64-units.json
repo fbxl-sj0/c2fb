@@ -73,7 +73,8 @@
         "--include-global-definitions"
       ],
       "header_options": [
-        "--emit-source=*gpm.h"
+        "--emit-source=*gpm.h",
+        "--emit-source=*termios-struct.h"
       ]
     },
     {
@@ -89,6 +90,9 @@
       "pattern": "drivers/unix/io_inkey.c",
       "body_options": [
         "--include-global-definitions"
+      ],
+      "header_options": [
+        "--emit-source=*termios-struct.h"
       ]
     },
     {

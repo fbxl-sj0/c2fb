@@ -5354,15 +5354,12 @@ def check_generic_body_source_unit_private_header_helper(
     ])
     assert "translated 2 simple functions; skipped 0" in summary, summary
     generated = candidate.read_text()
-    assert (
-        "Private Declare Function c2fbHeaderHelper CDecl "
-        in generated
-    ), generated
-    assert "Private Function c2fbHeaderHelper CDecl " in generated
-    assert not any(
-        line.startswith("Declare Function c2fbHeaderHelper CDecl ")
-        for line in generated.splitlines()
-    ), generated
+    # FBC accepts a forward declaration followed by a private definition;
+    # "Private Declare" is not valid FreeBASIC syntax.
+    assert "Declare Function c2fbHeaderHelper CDecl " in generated, generated
+    assert "Private Function c2fbHeaderHelper CDecl " in generated, generated
+    assert "Private Declare " not in generated, generated
+    assert 'Alias "c2fbHeaderHelper"' not in generated, generated
 
     wrapper = source_directory / "check.bas"
     wrapper.write_text(
@@ -7439,6 +7436,62 @@ def check_generic_body_static_string_pointer_arrays(converter, fbc, cc, work):
         for index in (-1, 0, 1):
             assert reference.c2fbStaticStringPointerArray(index) == \
                 converted.c2fbStaticStringPointerArray(index)
+
+
+def check_generic_body_static_record_array_initializers(
+    converter, fbc, cc, work
+):
+    # Static record arrays lower each C constant expression through the body
+    # expression parser, including nested unsigned casts.
+    source_directory = work / "generic-body-static-record-array-initializers"
+    source_directory.mkdir()
+    source = source_directory / "record_array.c"
+    source.write_text(
+        "typedef struct KEY_DATA { const char *cap; int code; } KEY_DATA;\n"
+        "static const KEY_DATA key_data[] = {\n"
+        '    { "k1", ((unsigned)(unsigned char)59 << 8) + '
+        "(unsigned)(unsigned char)((char)255) },\n"
+        '    { "k2", ((unsigned)(unsigned char)60 << 8) + '
+        "(unsigned)(unsigned char)((char)255) }\n"
+        "};\n"
+        "int key_data_code(int index) { return key_data[index].code; }\n"
+    )
+    candidate = source_directory / "record_array_candidates.bas"
+    source_unit_tool = Path(__file__).resolve().parents[1] / "c2fb_source_unit.py"
+    summary = run([
+        sys.executable, str(source_unit_tool), str(source), str(candidate),
+        "--converter", converter, "--compiler", cc[0],
+        "--body-option=--include-global-definitions",
+        "--body-option=--rename-proc-prefix=c2fbKeyData_",
+        "--body-option=--keep-unresolved",
+        "--header-compiler-option=" + f"-I{source_directory}",
+        "--body-compiler-option=" + f"-I{source_directory}",
+    ])
+    assert "translated 1 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    assert "c2fb_global_key_data" in generated, generated
+    assert "(unsigned)" not in generated, generated
+
+    reference_path = source_directory / "reference.so"
+    run(cc + [
+        "-std=c99", "-O2", "-shared", "-fPIC", str(source),
+        "-o", str(reference_path),
+    ])
+    converted_path = source_directory / "converted.so"
+    run(fbc + [
+        "-w", "all", "-dll", str(candidate), "-x", str(converted_path),
+        "-i", str(source_directory),
+    ], cwd=source_directory)
+
+    reference = ctypes.CDLL(str(reference_path))
+    converted = ctypes.CDLL(str(converted_path))
+    reference_function = reference.key_data_code
+    converted_function = converted.key_data_code
+    for function in (reference_function, converted_function):
+        function.argtypes = [ctypes.c_int]
+        function.restype = ctypes.c_int
+    for index in (0, 1):
+        assert converted_function(index) == reference_function(index)
 
 
 def check_generic_body_anonymous_local_records(converter, fbc, cc, work):
@@ -17390,6 +17443,50 @@ def check_generic_body_external_callback_declaration(converter, fbc, cc, work):
         cwd=source_directory)
 
 
+def check_generic_body_callback_parameter_shadows_procedure(
+    converter, fbc, work
+):
+    # A callback parameter shadows a global C procedure with the same name.
+    source_directory = work / "generic-body-callback-parameter-shadowing"
+    source_directory.mkdir()
+    source = source_directory / "callback_shadow.c"
+    source.write_text(
+        "typedef int (*XFREE)(void *);\n"
+        "int Free(void *data) { return 99; }\n"
+        "int apply(XFREE Free, void *data) {\n"
+        "    Free(data);\n"
+        "    return Free(data);\n"
+        "}\n"
+    )
+    candidate = source_directory / "callback_shadow_candidates.bas"
+    summary = run([
+        converter, "translate-simple-generic-c", str(source),
+        str(candidate), "--rename-proc-prefix=c2fbShadow_", "cc",
+    ])
+    assert "translated 2 simple functions; skipped 0" in summary, summary
+    generated = candidate.read_text()
+    apply_body = generated.split(
+        'Function c2fbShadow_apply CDecl Alias "apply"', 1
+    )[1]
+    assert "arg0(arg1)" in apply_body, apply_body
+    assert "Return arg0(arg1)" in apply_body, apply_body
+    assert "c2fbShadow_Free(arg1)" not in apply_body, apply_body
+
+    wrapper = source_directory / "check.bas"
+    wrapper.write_text(
+        '#include once "callback_shadow_candidates.bas"\n'
+        "Function callbackResult CDecl (ByVal value As Any Ptr) "
+        "As c2fb_c_int\n"
+        "    Return 17\n"
+        "End Function\n"
+        "If c2fbShadow_apply(ProcPtr(callbackResult), 0) <> 17 Then End 1\n"
+    )
+    executable = source_directory / "check"
+    run(fbc + ["-w", "all", str(wrapper), "-x", str(executable)],
+        cwd=source_directory)
+    run([str(executable)], cwd=source_directory)
+
+
 def check_generic_body_function_returning_callback(converter, fbc, cc, work):
     # A direct function's arguments use its signature even when it returns a callback.
     source_directory = work / "generic-body-function-returning-callback"
@@ -20894,10 +20991,6 @@ def check_freebasic_rtlib_longdouble_ops(
         "--body-compiler-option=" + f"-I{source_root / 'rtlib'}",
     ])
     assert "processed 1 C files; failed 0" in summary, summary
-    assert (
-        "totals: 11 translated simple functions; 4 unsupported or duplicate "
-        "candidates skipped" in summary
-    ), summary
     candidate = output / "math/longdouble_ops_candidates.bas"
     generated = candidate.read_text()
     assert (
@@ -20905,6 +20998,17 @@ def check_freebasic_rtlib_longdouble_ops(
         in generated
     ), generated
     assert "Function c2fbRtl_fb_LongDoubleToNative" not in generated, generated
+    # Compiler checkouts can add helpers. Keep coverage of the known scalar
+    # operations without fixing the total number of translated bodies.
+    required_operations = {
+        "Bop", "Uop", "Compare", "FromSigned", "FromUnsigned",
+        "FromDouble", "FromString", "ToDouble",
+    }
+    required_names = {
+        "c2fbRtl_fb_LongDouble" + operation
+        for operation in required_operations
+    }
+    assert required_names <= procedure_names(generated), generated
     object_path = candidate.with_suffix(".o")
     run(fbc + ["-w", "all", "-c", str(candidate), "-o", str(object_path),
                "-i", str(candidate.parent), "-i", str(source_root / "rtlib")],
@@ -22720,6 +22824,8 @@ def main():
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_static_string_pointer_arrays(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_static_record_array_initializers(
+            converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_anonymous_local_records(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_designated_record_initializers(
@@ -22977,6 +23083,8 @@ def main():
             converter, shlex.split(args.fbc), work)
         check_generic_body_external_callback_declaration(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
+        check_generic_body_callback_parameter_shadows_procedure(
+            converter, shlex.split(args.fbc), work)
         check_generic_body_function_returning_callback(
             converter, shlex.split(args.fbc), shlex.split(args.cc), work)
         check_generic_body_static_callback_tables(

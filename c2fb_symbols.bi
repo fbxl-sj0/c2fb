@@ -964,6 +964,56 @@ Private Function TranslateCBodyStaticCallbackArrayInitializer( _
     Return -1
 End Function
 
+Private Function TranslateCBodyStaticRecordArrayInitializer( _
+    ByRef translation As C2fbTranslationContext, _
+    ByRef catalog As C2fbProjectCatalog, _
+    ByVal sourceText As String, ByVal freeBasicType As String, _
+    ByVal arrayCount As Long, ByRef initialValue As String _
+) As Long
+    sourceText = Trim(sourceText)
+    If Left(sourceText, 1) <> "{" OrElse arrayCount <= 0 Then Return 0
+    If CBodyRecordName(translation, catalog, freeBasicType) = "" Then Return 0
+
+    Dim closingBrace As Long = 1
+    If ScanSimpleExpressionGroup( _
+        sourceText, closingBrace, Asc("{"), Asc("}")) = 0 OrElse _
+       Trim(Mid(sourceText, closingBrace)) <> "" Then Return 0
+    Dim initializerBody As String = Trim(Mid( _
+        sourceText, 2, closingBrace - 3))
+    If initializerBody = "" Then Return 0
+    If Right(initializerBody, 1) = "," Then _
+        initializerBody = RTrim(Left( _
+            initializerBody, Len(initializerBody) - 1))
+
+    Dim values() As String
+    Dim valueCount As Long
+    If SplitSimpleCList( _
+        initializerBody, values(), valueCount, 0, _
+        MAX_GENERIC_STATIC_INITIALIZER_VALUES) = 0 OrElse _
+       valueCount <= 0 OrElse valueCount > arrayCount Then Return 0
+
+    Dim context As SimpleBodyContext
+    Dim callableNames(0 To 0) As String
+    Dim parameterNames(0 To 0) As String
+    Dim parameterAliases(0 To 0) As String
+    Dim parameterTypes(0 To 0) As String
+    Dim translatedValues As String
+    For valueIndex As Long = 0 To valueCount - 1
+        Dim sourceValue As String = Trim(values(valueIndex))
+        If Left(sourceValue, 1) <> "{" Then Return 0
+        Dim translatedValue As String
+        If TranslateSimpleRecordInitializer( _
+            translation, catalog, sourceValue, freeBasicType, _
+            translatedValue, context, callableNames(), 0, _
+            parameterNames(), parameterAliases(), parameterTypes(), 0, -1) = 0 Then _
+            Return 0
+        If valueIndex > 0 Then translatedValues &= ", "
+        translatedValues &= translatedValue
+    Next
+    initialValue = "{" & translatedValues & "}"
+    Return -1
+End Function
+
 Private Sub RecordCBodyExternalObjectInContext( _
     ByRef translation As C2fbTranslationContext, _
     ByRef catalog As C2fbProjectCatalog, _
@@ -2651,21 +2701,29 @@ Private Sub IndexCBodyExternalObjectsFromDeclarations( _
                         Continue For
                     If arrayDepth <> 0 Then
                         If arrayCount <= 0 Then Continue For
-                        If arrayRank > 1 Then
-                            If TranslateCBodyMultidimensionalStaticArrayInitializer( _
-                                translation, sourceInitializer, freeBasicType, _
-                                arrayDimensionCounts(), arrayRank, arrayCount, _
-                                CInt(pointerDepth > 0) * -1, initializerText) = 0 Then _
-                                Continue For
-                        Else
-                            Dim staticInitializerStatus As Long = _
-                                TranslateGenericModuleStaticInitializer( _
-                                translation, sourceInitializer, freeBasicType, -1, _
-                                CInt(pointerDepth > 0) * -1, 0, _
-                                CInt(IsGenericCharacterArrayType( _
-                                    translation, itemCommonType, freeBasicType, 0) <> 0) * -1, _
-                                0, 0, arrayCount, initializerText)
-                            If staticInitializerStatus = 0 Then Continue For
+                        Dim staticRecordArrayStatus As Long = 0
+                        If arrayRank = 1 AndAlso pointerDepth = 0 Then _
+                            staticRecordArrayStatus = _
+                                TranslateCBodyStaticRecordArrayInitializer( _
+                                    translation, catalog, sourceInitializer, _
+                                    freeBasicType, arrayCount, initializerText)
+                        If staticRecordArrayStatus = 0 Then
+                            If arrayRank > 1 Then
+                                If TranslateCBodyMultidimensionalStaticArrayInitializer( _
+                                    translation, sourceInitializer, freeBasicType, _
+                                    arrayDimensionCounts(), arrayRank, arrayCount, _
+                                    CInt(pointerDepth > 0) * -1, initializerText) = 0 Then _
+                                    Continue For
+                            Else
+                                Dim staticInitializerStatus As Long = _
+                                    TranslateGenericModuleStaticInitializer( _
+                                    translation, sourceInitializer, freeBasicType, -1, _
+                                    CInt(pointerDepth > 0) * -1, 0, _
+                                    CInt(IsGenericCharacterArrayType( _
+                                        translation, itemCommonType, freeBasicType, 0) <> 0) * -1, _
+                                    0, 0, arrayCount, initializerText)
+                                If staticInitializerStatus = 0 Then Continue For
+                            End If
                         End If
                     Else
                         Dim sourceRecord As String = CBodyRecordName( _

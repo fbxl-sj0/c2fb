@@ -1280,7 +1280,16 @@ Private Function ParseSimpleCallValue( _
         CBodyBuiltinInfinityType(procedureName)
     Dim callbackType As String = value.typeName
     Dim isDirectProcedureCall As Long = 0
-    If procedureName <> "" AndAlso value.isLValue = 0 AndAlso _
+    Dim isParameterCall As Long = 0
+    For parameterIndex As Long = 0 To parameterCount - 1
+        If procedureName = parameterNames(parameterIndex) OrElse _
+           procedureName = parameterAliases(parameterIndex) Then
+            isParameterCall = -1
+            Exit For
+        End If
+    Next
+    If isParameterCall = 0 AndAlso procedureName <> "" AndAlso _
+       value.isLValue = 0 AndAlso _
        value.isFunctionDesignator = 0 AndAlso _
        (CBodyProcedureIndex( _
             parser.translation[0], procedureName) >= 0 OrElse _
